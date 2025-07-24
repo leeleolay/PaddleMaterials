@@ -5,6 +5,7 @@ from rdkit import Chem
 from tqdm import tqdm
 import copy
 from typing import List, Dict, Tuple, Union
+import numpy as np
 
 from ppmat.utils import logger
 
@@ -15,7 +16,7 @@ from . import diffgraphformer_utils as utils
 # -------------------------
 # Noise & Q
 # -------------------------
-def apply_noise(model, X, E, y, node_mask):
+def apply_noise(model, X, E, y, node_mask, flag_use_formula = None):
     """
     Sample noise and apply it to the data.
     """
@@ -43,6 +44,8 @@ def apply_noise(model, X, E, y, node_mask):
     )
 
     X_t = F.one_hot(sampled_t.X, num_classes=model.Xdim_output).astype("int64")
+    if flag_use_formula == True:
+        X_t = X
     E_t = F.one_hot(sampled_t.E, num_classes=model.Edim_output).astype("int64")
     assert (X.shape == X_t.shape) and (E.shape == E_t.shape)
 
@@ -363,6 +366,10 @@ def sample_batch(
     num_nodes: Union[int, paddle.Tensor] = None,
     flag_useformula: bool = False,
     return_onehot: bool = False,
+    retrival_initilization: bool = False,
+    clip: paddle.nn.Layer = None,
+    molecular_vectors: paddle.Tensor = None, 
+    smiles_list: List = None,
 ) -> Union[
     Tuple[List, List],
     Tuple[List, List, paddle.Tensor, paddle.Tensor],
@@ -402,6 +409,18 @@ def sample_batch(
     return_onehot : bool
         Whether to return the *padded* one‑hot tensors (`X_hot`, `E_hot`) in
         addition to discrete index lists – required by molVec retrieval.
+    retrival_initilization : bool, default False
+        Whether to enable **retrieval‑based initialization**.  
+        If True, the model will fetch the closest reference molecules
+        (using `molecular_vectors`) and use them as the first step of
+        the diffusion / sampling chain instead of pure noise.
+    clip : paddle.nn.Layer | None, default None
+        optional projection/clipping layer applied to latent features before 
+        retrieval.
+    molecular_vectors : paddle.Tensor | None, default None
+        2‑D tensor [N, D] containing embeddings of the reference molecule library
+    smiles_list : list[str] | None, default None
+        list of SMILES strings corresponding to those reference embeddings
 
     Returns
     -------
@@ -442,7 +461,46 @@ def sample_batch(
         [number_chain_steps, keep_chain, n_max, n_max], dtype="int64"
     )
 
-    # 3. Main reverse‑diffusion loop: t = T → 1 (s = t‑1)
+    # 3. Retrieval Initialization(Optional)
+    if retrival_initilization:
+        output = clip.text_encoder(batch_condition)
+
+        similarities = batched_cosine_similarity(output, molecular_vectors, batch_size_cut=128)
+        top_k = 1
+        top_k_values, top_k_indices = paddle.topk(similarities, k=top_k, axis=1)
+
+        if iter_idx == 0:
+            cols = 8
+            lines = []
+            for start in range(0, len(top_k_values), cols):
+                chunk = top_k_values[start:start + cols]
+                line = " | ".join(f"{start+j} : {v.item():.3f}"
+                                for j, v in enumerate(chunk))
+                lines.append(line)
+            logger.info("Highest Similarities (SampleID:Value)\n" + "\n".join(lines))
+
+        result_smiles = []
+        for i in range(batch_size):
+            idx = top_k_indices[i].item()
+            result_smiles.append(smiles_list[idx])
+
+        node_list = []
+        adj_matrix_list = []
+
+        for i in range(batch_size):
+            smiles = result_smiles[i]
+            current_node_mask = node_mask[i]
+            node_tensor_onehot, adjacency_matrix_onehot = graphs_from_mol(smiles, current_node_mask, i, X_t, E_t)
+            node_list.append(node_tensor_onehot)
+            adj_matrix_list.append(adjacency_matrix_onehot)
+
+        X_t = paddle.stack(node_list, axis=0)
+        E_t = paddle.stack(adj_matrix_list, axis=0)
+
+        assert (E_t == paddle.transpose(E_t, [0, 2, 1])).all()
+        assert number_chain_steps < model.T
+
+    # 4. Main reverse‑diffusion loop: t = T → 1 (s = t‑1)
     for s_int in tqdm(
         range(model.T - 1, -1, -1),
         desc=f"Batch {batch_id} RepeatIter {iter_idx} sampling {model.T}→0",
@@ -476,19 +534,19 @@ def sample_batch(
         chain_X[write_index] = discrete_sampled_s.X[:keep_chain]
         chain_E[write_index] = discrete_sampled_s.E[:keep_chain]
 
-    # 4. Collapse padding → obtain discrete indices; optionally keep one‑hot 
+    # 5. Collapse padding → obtain discrete indices; optionally keep one‑hot 
     # Make a *clone* of `sampled_s` so that collapsing will not overwrite the
     # one‑hot information we still need for molVec retrieval.
     sampled_copy = copy.deepcopy(sampled_s)
     
-    # 4‑a. Get discrete indices from the cloned tensor (padding removed)
+    # 5‑a. Get discrete indices from the cloned tensor (padding removed)
     sampled_collapse = sampled_copy.mask(node_mask, collapse=True)
     X_idx, E_idx = sampled_collapse.X, sampled_collapse.E                # [B, …]
     if flag_useformula:
         # Ensure indices follow the oracle molecular formula when required
         X_idx = paddle.argmax(batch_X, axis=-1)
 
-    # 4‑b. Optionally obtain **un‑collapsed** one‑hot tensors for retrieval.
+    # 5‑b. Optionally obtain **un‑collapsed** one‑hot tensors for retrieval.
     if return_onehot:
         # Call mask *without* collapse on the ORIGINAL `sampled_s`, which still
         # contains one‑hot embeddings; shape stays [B, n_max, feat]
@@ -503,7 +561,7 @@ def sample_batch(
     else:
         X_hot = E_hot = None
 
-    # 5. Assemble Python lists for downstream RDKit / metrics 
+    # 6. Assemble Python lists for downstream RDKit / metrics 
     mol_list, mol_true = [], []
     n_nodes_np = n_nodes.numpy()
     batch_X_idx = paddle.argmax(batch_X, axis=-1).numpy()
@@ -519,9 +577,9 @@ def sample_batch(
             batch_E_idx[i, :n, :n],
         ])
 
-    # 6. Optional visualisation via model.visualization_tools
+    # 7. Optional visualisation via model.visualization_tools
     if model.visualization_tools is not None:
-        # 6.a Prepare the chain for visualization and saving
+        # 7.a Prepare the chain for visualization and saving
         if keep_chain > 0:
             # pick the last frame of the chain add the top index of chain_X/E(index 0)
             final_X_chain = X_idx[:keep_chain]
@@ -538,7 +596,7 @@ def sample_batch(
             chain_E = paddle.concat([chain_E, chain_E[-1:].tile([10, 1, 1, 1])], axis=0)
             assert chain_X.shape[0] == (number_chain_steps + 10)
 
-        # 6.b use visulize tools
+        # 7.b use visulize tools
         num_mols = chain_X.shape[1]
         # draw animation of diffusion process of generated molecules
         for i in range(num_mols):
@@ -739,3 +797,121 @@ def mol_from_graphs(atom_decoder, node_list, adjacency_matrix):
         print("Can't kekulize molecule")
         mol = None
     return mol
+
+def graphs_from_mol(smiles, node_mask, i, X, E):
+        """
+        Convert an SMILES string into graph presentation (node features & adjacency).
+        
+        Parameters
+        ----------
+        smiles : str
+            The molecule in SMILES format.
+
+        node_mask : paddle.Tensor, shape [max_nodes]
+            Boolean / 0‑1 mask telling how many node slots are valid
+            for *this* molecule inside the batch tensor.
+
+        i : int
+            Index of the current sample in the mini‑batch (1st dimension of X/E).
+
+        X : paddle.Tensor, shape [B, max_nodes, n_atom_types]
+            Pre‑allocated batch buffer for node one‑hot features.
+            Will be updated in‑place at index `i`.
+
+        E : paddle.Tensor, shape [B, max_nodes, max_nodes, n_bond_types]
+            Pre‑allocated batch buffer for adjacency one‑hot tensors.
+            Will be updated in‑place at index `i`.
+        
+
+        Returns:
+            node_list: A one-hot encoded list representing atom types.
+            adjacency_matrix: A 3D numpy array (one-hot encoded) representing the adjacency matrix of the molecule.
+        """
+
+        num_trueAtoms = paddle.sum(node_mask)
+
+        # dictionary to map atom symbols to integer values
+        atom_encoder = {'C': 0, 'N': 1, 'O': 2, 'F': 3, 'P': 4, 'S': 5, 'Cl': 6, 'Br': 7, 'I': 8}
+        atom_encoder_len = len(atom_encoder)  # Number of distinct atom types
+        # print(f'graphs_from_mol_smiles{smiles}')
+        # initialize the node list
+        node_list = []
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            print(f"Invalid SMILES or parsing failed: {smiles}")
+            return X[i], E[i]
+
+        for atom in mol.GetAtoms():
+            symbol = atom.GetSymbol()
+            # print(f'symbol{symbol}')
+            if symbol in atom_encoder:
+                node_list.append(atom_encoder[symbol])
+            else:
+                raise ValueError(f"Atom symbol {symbol} not in atom_encoder")
+
+        # initialize adjacency matrix
+        num_atoms = len(node_list)
+        node_tensor = paddle.to_tensor(node_list, dtype="int64")
+        node_mask_len = node_mask.shape[0]
+        padding = paddle.full((node_mask_len - num_atoms,), fill_value=-1, dtype="int64")
+        node_tensor = paddle.concat((node_tensor, padding))
+        num_atoms_max = len(node_tensor)
+
+        # Convert node_tensor to one-hot
+        node_tensor_onehot = F.one_hot(node_tensor.clip(min=0),
+                                       num_classes=atom_encoder_len).astype("float32")  # Ignore -1 for num_classes
+        node_tensor_onehot[node_tensor == -1] = 0  # Set -1 positions to all-zero vectors
+        if num_atoms >= num_trueAtoms:
+            X[i][:num_trueAtoms]=node_tensor_onehot[:num_trueAtoms]
+            node_tensor_onehot = X[i]
+        else:
+            X[i][:num_atoms] = node_tensor_onehot[:num_atoms]
+            node_tensor_onehot = X[i]
+
+        adjacency_matrix = np.full((num_atoms_max, num_atoms_max), -1, dtype="int")
+        adjacency_matrix[:num_atoms, :num_atoms] = 0
+
+        for bond in mol.GetBonds():
+            start_idx = bond.GetBeginAtomIdx()
+            end_idx = bond.GetEndAtomIdx()
+
+            # determine bond type
+            bond_type = bond.GetBondType()
+            if bond_type == Chem.rdchem.BondType.SINGLE:
+                bond_value = 1
+            elif bond_type == Chem.rdchem.BondType.DOUBLE:
+                bond_value = 2
+            elif bond_type == Chem.rdchem.BondType.TRIPLE:
+                bond_value = 3
+            elif bond_type == Chem.rdchem.BondType.AROMATIC:
+                bond_value = 4
+            else:
+                bond_value = 0
+
+            # populate adjacency matrix (symmetric)
+            adjacency_matrix[start_idx, end_idx] = bond_value
+            adjacency_matrix[end_idx, start_idx] = bond_value
+
+        # Convert adjacency_matrix to one-hot
+        max_bond_type = 4  # Maximum bond type value (single, double, triple, aromatic)
+        adjacency_matrix_tensor = paddle.to_tensor(adjacency_matrix, dtype="int64")
+        adjacency_matrix_onehot = F.one_hot(adjacency_matrix_tensor.clip(min=0),
+                                            num_classes=max_bond_type + 1).astype("float32")
+        adjacency_matrix_onehot[adjacency_matrix_tensor == -1] = 0  # Set -1 positions to all-zero vectors
+
+        if num_atoms >= num_trueAtoms:
+            E[i][:num_trueAtoms,:num_trueAtoms]=adjacency_matrix_onehot[:num_trueAtoms,:num_trueAtoms]
+            adjacency_matrix_onehot = E[i]
+        else:
+            E[i][:num_atoms,:num_atoms] = adjacency_matrix_onehot[:num_atoms,:num_atoms]
+            adjacency_matrix_onehot = E[i]
+
+        return node_tensor_onehot, adjacency_matrix_onehot
+
+def batched_cosine_similarity(output, molecular_vectors, batch_size_cut):
+            similarities = []
+            for i in range(0, molecular_vectors.shape[0], batch_size_cut):
+                batch_vectors = molecular_vectors[i:i + batch_size_cut]
+                sim = F.cosine_similarity(output.unsqueeze(1), batch_vectors.unsqueeze(0), axis=-1)  # [batch_size, batch_size_cut]
+                similarities.append(sim)
+            return paddle.concat(similarities, axis=1)  # [batch_size, N]

@@ -156,6 +156,9 @@ class MolecularGraphTransformer(nn.Layer):
 
         self.seq_len_H1 = config["seq_len_H1"]  # TODO remove later
         self.seq_len_C13 = config["seq_len_C13"]  # TODO remove later
+        
+        # set use formula for training and sample or not
+        self.flag_use_formula = config.get("flag_use_formula", False)
 
     def forward(self, batch, mode="train"):
         batch_graph, other_data = batch
@@ -175,7 +178,7 @@ class MolecularGraphTransformer(nn.Layer):
         y = other_data["y"]
 
         # add noise to the inputs (X, E)
-        noisy_data = m_utils.apply_noise(self, X, E, y, node_mask)
+        noisy_data = m_utils.apply_noise(self, X, E, y, node_mask, self.flag_use_formula)
         extra_data = m_utils.compute_extra_data(self, noisy_data)
 
         # input_X for decoder
@@ -1054,6 +1057,9 @@ class MultiModalDecoder(nn.Layer):
         self.seq_len_H1 = config["nmr_encoder"]["seq_len_H1"]  # TODO remove later
         self.seq_len_C13 = config["nmr_encoder"]["seq_len_C13"]  # TODO remove later
         self.tem = 2  # TODO remove later
+        
+        # set use formula for training and sample or not
+        self.flag_use_formula = config.get("flag_use_formula", False)
 
     def preprocess_data(self, batch_graph, other_data):
         dense_data, node_mask = utils.to_dense(
@@ -1066,7 +1072,7 @@ class MultiModalDecoder(nn.Layer):
 
         # add noise to the inputs (X, E)
         noisy_data = m_utils.apply_noise(
-            self, dense_data.X, dense_data.E, other_data["y"], node_mask
+            self, dense_data.X, dense_data.E, other_data["y"], node_mask, self.flag_use_formula
         )
         extra_data = m_utils.compute_extra_data(self, noisy_data)
 

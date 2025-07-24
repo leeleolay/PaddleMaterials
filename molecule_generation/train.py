@@ -119,19 +119,19 @@ if __name__ == "__main__":
     train_metrics = TrainMolecularMetricsDiscrete(dataset_infos)
     # custom sampling metrics
     enable_CLIP = config.get("Sampler",  {}).get("enable_CLIP", False)
+    CLIP = ContrastiveModel(
+        dataset_infos = dataset_infos, 
+        extra_features = extra_features, 
+        domain_features = domain_features,
+        **config["Sampler"]["CLIP"], 
+    )
+    for param in CLIP.graph_encoder.parameters():
+        param.stop_gradient = True
+    CLIP.graph_encoder.eval()
+    for param in CLIP.text_encoder.parameters():
+        param.stop_gradient = True
+    CLIP.text_encoder.eval()
     if enable_CLIP:
-        CLIP = ContrastiveModel(
-            dataset_infos = dataset_infos, 
-            extra_features = extra_features, 
-            domain_features = domain_features,
-            **config["Sampler"]["CLIP"], 
-        )
-        for param in CLIP.graph_encoder.parameters():
-            param.stop_gradient = True
-        CLIP.graph_encoder.eval()
-        for param in CLIP.text_encoder.parameters():
-            param.stop_gradient = True
-        CLIP.text_encoder.eval()
         sampling_metrics = SamplingMolecularMetrics(dataset_infos, train_smiles, CLIP)
     else:
         sampling_metrics = SamplingMolecularMetrics(dataset_infos, train_smiles)
@@ -168,7 +168,6 @@ if __name__ == "__main__":
             model,
             train_dataloader=train_loader,
             val_dataloader=val_loader,
-            sample_dataloader=sample_loader,
             test_dataloader=test_loader,
             optimizer=optimizer,
             lr_scheduler=lr_scheduler,
@@ -233,7 +232,7 @@ if __name__ == "__main__":
             lr_scheduler=lr_scheduler,
         )
 
-    elif args.step == 4:
+    elif args.step == 4:    
         # build model from config
         model = MultiModalDecoder(config["Model"], **model_kwargs)
         # build optimizer and learning rate scheduler from config
@@ -244,16 +243,29 @@ if __name__ == "__main__":
             len(train_loader),
         )
         # build trainer
-        trainer = TrainerMMDecoder(
-            config,
-            model,
-            train_dataloader=train_loader,
-            val_dataloader=val_loader,
-            test_dataloader=test_loader,
-            optimizer=optimizer,
-            lr_scheduler=lr_scheduler,
-            metric_class=train_metrics,
-        )
+        if config["Sampler"].get("retrival_initialization", False) and enable_CLIP:
+            trainer = TrainerMMDecoder(
+                config,
+                model,
+                train_dataloader=train_loader,
+                val_dataloader=val_loader,
+                test_dataloader=test_loader,
+                optimizer=optimizer,
+                lr_scheduler=lr_scheduler,
+                metric_class=train_metrics,
+                clip = CLIP,
+            )
+        else:
+            trainer = TrainerMMDecoder(
+                config,
+                model,
+                train_dataloader=train_loader,
+                val_dataloader=val_loader,
+                test_dataloader=test_loader,
+                optimizer=optimizer,
+                lr_scheduler=lr_scheduler,
+                metric_class=train_metrics,
+            )
 
     # begin to train or eval or test
     if args.mode == "train":

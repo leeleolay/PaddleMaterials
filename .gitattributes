@@ -1,0 +1,2 @@
+molecule_generation/retrival_database/mol_rep_20.csv filter=lfs diff=lfs merge=lfs -text
+molecule_generation/retrival_database/mol_rep_15.csv filter=lfs diff=lfs merge=lfs -text

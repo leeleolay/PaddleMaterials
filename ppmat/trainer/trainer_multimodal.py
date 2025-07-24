@@ -17,6 +17,7 @@ from collections import defaultdict
 from typing import Callable, Dict, Union
 from typing import Optional
 import numpy as np
+import pandas as pd
 
 import paddle
 import paddle.distributed as dist
@@ -64,6 +65,7 @@ class TrainerDiffGraphFormer:
         optimizer: Optional[optim.Optimizer] = None,
         metric_class: Optional[Callable] = None,
         lr_scheduler: Optional[optim.lr.LRScheduler] = None,
+        clip: Optional[nn.Layer] = None,
     ):
         self.config = config
         self.model = model
@@ -189,6 +191,19 @@ class TrainerDiffGraphFormer:
         self.flag_use_formula = self.config["Trainer"].get("flag_use_formula", False)
         self.flag_keep_onehot = self.config["Trainer"].get("flag_keep_onehot", False)
         self.num_candidate: int = self.config["Trainer"].get("num_candidate", 1)
+        
+        # clip for retrival initialization
+        self.retrival_initialization = False
+        if clip is not None:
+            self.retrival_initialization = True
+            self.clip = clip
+            
+            csv_path = config["Sampler"].get("retrival_database_path", False)
+            data = pd.read_csv(csv_path)
+            data["molecularRep"] = data["molecularRep"].apply(lambda x: np.fromstring(x.strip("[]"), sep=" "))
+            # to paddle tensor
+            self.molecular_vectors = paddle.to_tensor(np.stack(data["molecularRep"].values), dtype="float32")
+            self.smiles_list = data["smiles"].tolist()
 
     def train(self) -> None:
         """Training."""
@@ -688,22 +703,30 @@ class TrainerDiffGraphFormer:
 
             # 2.c call `sample_batch` `num_candidate` times
             for c_idx in range(num_candidate):
-                res = m_utils.sample_batch(
-                    self.model._layers if isinstance(self.model, DP) else self.model,
-                    batch_id=iter_id,
-                    num_nodes=batch_atomCount,
-                    batch_condition=batch_nmr,
-                    batch_X=batch_X,
-                    batch_E=batch_E,
-                    batch_y=batch_y,
-                    batch_size=bs,
-                    visual_num=self.visual_num,
-                    keep_chain=self.chains_left_to_save,
-                    number_chain_steps=self.number_chain_steps,
-                    return_onehot=keep_onehot,
-                    flag_useformula=self.flag_use_formula,
-                    iter_idx = c_idx,
+                kwargs = dict(
+                    model          = self.model._layers if isinstance(self.model, DP) else self.model,
+                    batch_id       = iter_id,
+                    num_nodes      = batch_atomCount,
+                    batch_condition= batch_nmr,
+                    batch_X        = batch_X,
+                    batch_E        = batch_E,
+                    batch_y        = batch_y,
+                    batch_size     = bs,
+                    visual_num     = self.visual_num,
+                    keep_chain     = self.chains_left_to_save,
+                    number_chain_steps = self.number_chain_steps,
+                    return_onehot  = keep_onehot,
+                    flag_useformula= self.flag_use_formula,
+                    iter_idx       = c_idx,
                 )
+                if self.retrival_initialization:
+                    kwargs.update(
+                        retrival_initilization = self.retrival_initialization,
+                        clip            = self.clip,
+                        molecular_vectors = self.molecular_vectors,
+                        smiles_list     = self.smiles_list,
+                    )
+                res = m_utils.sample_batch(**kwargs)
                 
                 if keep_onehot:
                     mol_pred, mol_true, X_hot, E_hot= res
@@ -735,6 +758,8 @@ class TrainerDiffGraphFormer:
             # `max_iters`, unless the caller has explicitly set `flag_sample=True`
             # to force a full‑dataset sweep.
             if (not flag_sample) and (iter_id + 1 >= max_iters):
+                break
+            if iter_id == 1:
                 break
 
         # 3. Pass everything to SamplingMolecularMetrics (single call)
@@ -1341,6 +1366,7 @@ class TrainerMMDecoder(TrainerDiffGraphFormer):
         optimizer: Optional[optim.Optimizer] = None,
         metric_class: Optional[Callable] = None,
         lr_scheduler: Optional[optim.lr.LRScheduler] = None,
+        clip: Optional[nn.Layer] = None,
     ):
         super().__init__(
             config,
@@ -1352,4 +1378,5 @@ class TrainerMMDecoder(TrainerDiffGraphFormer):
             optimizer,
             metric_class,
             lr_scheduler,
+            clip,
         )
