@@ -1,4 +1,4 @@
-# Copyright (c) 2023 PaddlePaddle Authors. All Rights Reserved.
+# Copyright (c) 2025 PaddlePaddle Authors. All Rights Reserved.
 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,9 +21,7 @@ import sys
 import time
 from collections import OrderedDict
 from collections import defaultdict
-from typing import Dict
-from typing import Literal
-from typing import Optional
+from typing import Dict, Set, Literal, Optional
 
 import paddle
 import paddle.distributed as dist
@@ -215,6 +213,13 @@ class BaseTrainer:
 
         # 10. log paddle version
         log_paddle_version()
+        
+        # 11. initialize metric modules (optional null)
+        self.metric_modules: Dict[str, object] = {}
+        
+        # 12. read out_dict (prefer Trainer.out_dict; fallback to Trainer.log.out_dict)
+        log_cfg = self.config.get("log", {}) if isinstance(self.config.get("log", {}), dict) else {}
+        self.out_dict_cfg = self.config.get("out_dict", log_cfg.get("out_dict", None))  # None → print all
 
     def get_num_trainable_parameters(self):
         """
@@ -350,37 +355,87 @@ class BaseTrainer:
                     loss_info[key] = AverageMeter(key)
                 loss_info[key].update(float(loss_dict[key]), batch_size)
 
-            # get prediction
-            pred_dict = result.get("pred_dict", {})
+            # stream metric lightweight hook
+            self._update_streaming_metrics(result=result, batch=batch_data, stage="eval")
 
             # compute metric during evaluation or gathering all predictions and labels
             if self.compute_metric_func_dict is not None:
+                # Step strategy: compute metric each step
                 if self.metric_strategy_during_eval == "step":
                     # compute metric for each step
-                    for (
-                        key,
-                        compute_metric_func,
-                    ) in self.compute_metric_func_dict.items():
-                        pred = pred_dict[key]
-                        label = batch_data[key]
-                        metric = compute_metric_func(pred, label)
-                        if key not in metric_info:
-                            metric_info[key] = AverageMeter(key)
-                        metric_info[key].update(float(metric), batch_size)
+                    pred_dict = result.get("pred_dict", {}) or {}
+                    is_batch_dict = isinstance(batch_data, dict)
+                    for name, spec in self.compute_metric_func_dict.items():
+                        # support two styles:
+                        # 1) legacy: {"name": callable}
+                        # 2) mapped: {"name": {"fn": callable, "pred_key": "...", "label_key": "..." } }
+                        if callable(spec):
+                            fn = spec
+                            pred_key = name
+                            label_key = name
+                        elif isinstance(spec, dict):
+                            fn = spec.get("fn") or spec.get("callable")
+                            pred_key = spec.get("pred_key", name)
+                            label_key = spec.get("label_key", name)
+                            if fn is None:
+                                continue
+                        else:
+                            continue
+                        
+                        pred = pred_dict.get(pred_key, None)
+                        label = (batch_data.get(label_key, None) if is_batch_dict else None)
+                        if pred is None or label is None:
+                            # skip keys that are not present (e.g., 'train_discrete' from streaming metrics)
+                            logger.debug(f"[metric(skip-eval-step)] name={name}, pred_key={pred_key}, label_key={label_key}")
+                            continue
+
+                        val = fn(pred, label)
+                        if isinstance(val, dict):  # allow multi-scalar output
+                            for k, v in val.items():
+                                if k not in metric_info:
+                                    metric_info[k] = AverageMeter(k)
+                                metric_info[k].update(float(v), batch_size)
+                        else:
+                            if name not in metric_info:
+                                metric_info[name] = AverageMeter(name)
+                            metric_info[name].update(float(val), batch_size)
+
+                # Epoch strategy: gather and compute once
                 else:
-                    # gather all predictions and labels
-                    for key, pred in pred_dict.items():
+                    # only gather the keys that metrics actually need
+                    mapping = []
+                    for name, spec in self.compute_metric_func_dict.items():
+                        if callable(spec):
+                            mapping.append((name, spec, name, name))
+                        elif isinstance(spec, dict):
+                            fn = spec.get("fn") or spec.get("callable")
+                            if fn is None:
+                                continue
+                            mapping.append((name, fn, spec.get("pred_key", name), spec.get("label_key", name)))
+
+                    # gather preds
+                    pred_dict = result.get("pred_dict", {}) or {}
+                    for _, _, pred_key, _ in mapping:
+                        if pred_key not in pred_dict:
+                            logger.debug(f"[metric(gather-skip-pred-eval)] pred_key={pred_key}")
+                            continue
+                        pred = pred_dict[pred_key]
                         pred = pred.detach() if hasattr(pred, "detach") else pred
                         if self.world_size > 1:
                             pred = misc.all_gather(pred)
-                        all_pred_dict[key].append(pred)
-                    label_keys = self.compute_metric_func_dict.keys()
-                    for key in label_keys:
-                        label = batch_data[key]
+                        all_pred_dict[pred_key].append(pred)
+
+                    # gather labels
+                    is_batch_dict = isinstance(batch_data, dict)
+                    for _, _, _, label_key in mapping:
+                        if not is_batch_dict or label_key not in batch_data:
+                            logger.debug(f"[metric(gather-skip-label-eval)] label_key={label_key}")
+                            continue
+                        label = batch_data[label_key]
                         label = label.detach() if hasattr(label, "detach") else label
                         if self.world_size > 1:
                             label = misc.all_gather(label)
-                        all_label_dict[key].append(label)
+                        all_label_dict[label_key].append(label)
 
             batch_cost = time.perf_counter() - batch_tic
             time_info["batch_cost"].update(batch_cost)
@@ -400,13 +455,15 @@ class BaseTrainer:
                 for name, average_meter in metric_info.items():
                     logs[name + "(metric)"] = average_meter.val
 
+                display_logs = self._filter_out_dict(logs, stage="eval")
+
                 msg = f"Eval: Epoch [{self.state.epoch}/{self.config['max_epochs']}]"
                 msg += (
                     f" | Step: [{self.state.step_in_eval_epoch}/"
                     + f"{self.state.max_steps_in_eval_epoch}]"
                 )
                 if logs is not None:
-                    for key, val in logs.items():
+                    for key, val in display_logs.items():
                         msg += f" | {key}: {val:.6f}"
                 logger.info(msg)
             batch_tic = time.perf_counter()
@@ -417,13 +474,46 @@ class BaseTrainer:
             self.metric_strategy_during_eval == "epoch"
             and self.compute_metric_func_dict is not None
         ):
-            for key, compute_metric_func in self.compute_metric_func_dict.items():
-                pred = paddle.concat(all_pred_dict[key])[:num_eval_samples]
-                label = paddle.concat(all_label_dict[key])[:num_eval_samples]
-                metric = compute_metric_func(pred, label)
-                if key not in metric_info:
-                    metric_info[key] = AverageMeter(key)
-                metric_info[key].update(float(metric), num_eval_samples)
+            # concatenate gathered tensors and compute
+            for name, spec in self.compute_metric_func_dict.items():
+                if callable(spec):
+                    fn = spec
+                    pred_key = name
+                    label_key = name
+                elif isinstance(spec, dict):
+                    fn = spec.get("fn") or spec.get("callable")
+                    pred_key = spec.get("pred_key", name)
+                    label_key = spec.get("label_key", name)
+                    if fn is None:
+                        continue
+                else:
+                    continue
+
+                if pred_key not in all_pred_dict or label_key not in all_label_dict:
+                    logger.debug(f"[metric(epoch-skip-eval)] name={name} pred_key={pred_key} label_key={label_key}")
+                    continue
+
+                pred = paddle.concat(all_pred_dict[pred_key])[:num_eval_samples]
+                label = paddle.concat(all_label_dict[label_key])[:num_eval_samples]
+                val = fn(pred, label)
+
+                if isinstance(val, dict):
+                    for k, v in val.items():
+                        if k not in metric_info:
+                            metric_info[k] = AverageMeter(k)
+                        metric_info[k].update(float(v), num_eval_samples)
+                else:
+                    if name not in metric_info:
+                        metric_info[name] = AverageMeter(name)
+                    metric_info[name].update(float(val), num_eval_samples)
+        
+        # stream metric lightweight hook
+        _extra_stream = self._compute_streaming_metrics(stage="eval")
+        for k, v in _extra_stream.items():
+            if k not in metric_info:
+                metric_info[k] = AverageMeter(k)
+            metric_info[k].update(float(v), 1)
+
         return time_info, loss_info, metric_info
 
     def guess_batch_size(self, input_data, dataloader):
@@ -513,8 +603,12 @@ class BaseTrainer:
             if self.use_amp:
                 self.scaler.minimize(self.optimizer, loss_scaled)
             else:
+
                 self.optimizer.step()
             self.optimizer.clear_grad()
+
+            # stream metric lightweight hook
+            self._update_streaming_metrics(result=result, batch=batch_data, stage="train")
 
             # update loss and metric for log
             for key in loss_dict:
@@ -524,14 +618,34 @@ class BaseTrainer:
 
             if self.compute_metric_during_train:
                 pred_dict = result.get("pred_dict", {})
-                for key, compute_metric_func in self.compute_metric_func_dict.items():
-                    pred = pred_dict[key]
-                    label = batch_data[key]
-                    metric = compute_metric_func(pred, label)
-                    if key not in metric_info:
-                        metric_info[key] = AverageMeter(key)
-                    metric_info[key].update(float(metric), batch_size)
-
+                is_batch_dict = isinstance(batch_data, dict)
+                for name, spec in self.compute_metric_func_dict.items():
+                    if callable(spec):
+                        fn = spec
+                        pred_key = name
+                        label_key = name
+                    elif isinstance(spec, dict):
+                        fn = spec.get("fn") or spec.get("callable")
+                        pred_key = spec.get("pred_key", name)
+                        label_key = spec.get("label_key", name)
+                    else:
+                        continue  # invalid config
+                    
+                    pred = pred_dict.get(pred_key, None)
+                    label = (batch_data.get(label_key, None) if is_batch_dict else None)
+                    if pred is None or label is None:
+                        # Not a single-input, single-scalar case (e.g., your streaming metric train_discrete) — skipping.
+                        logger.debug(f"[metric(skip)] name={name}, pred_key={pred_key}, label_key={label_key}")
+                        continue
+                    
+                    val =fn(pred, label)
+                    # Returning a dict (multiple scalars) is allowed.
+                    if isinstance(val, dict):
+                        for k, v in val.items():
+                            metric_info.setdefault(k, AverageMeter(k)).update(float(v), batch_size)
+                    else:
+                        metric_info.setdefault(name, AverageMeter(name)).update(float(val), batch_size)
+                    
             batch_cost = time.perf_counter() - batch_tic
             time_info["batch_cost"].update(batch_cost)
 
@@ -552,13 +666,15 @@ class BaseTrainer:
                 for name, average_meter in metric_info.items():
                     logs[name + "(metric)"] = average_meter.val
 
+                display_logs = self._filter_out_dict(logs, stage="train")
+                
                 msg = f"Train: Epoch [{self.state.epoch}/{self.config['max_epochs']}]"
                 msg += (
                     f" | Step: [{self.state.step_in_train_epoch}/"
                     + f"{self.state.max_steps_in_train_epoch}]"
                 )
                 if logs is not None:
-                    for key, val in logs.items():
+                    for key, val in display_logs.items():
                         msg += f" | {key}: {val:.6f}"
                 logger.info(msg)
                 # log training info to visualdl, wandb, tensorboard
@@ -639,6 +755,14 @@ class BaseTrainer:
             train_time_info, train_loss_info, train_metric_info = self.train_epoch(
                 train_dataloader
             )
+            
+            # stream metric lightweight hook
+            _extra_stream = self._compute_streaming_metrics(stage="train")
+            for k, v in _extra_stream.items():
+                if k not in train_metric_info:
+                    train_metric_info[k] = AverageMeter(k)
+                train_metric_info[k].update(float(v), 1)
+            
             # log training info
             logs: OrderedDict[str, float] = {}
             for name, average_meter in train_time_info.items():
@@ -647,9 +771,12 @@ class BaseTrainer:
                 logs[name + "(loss)"] = average_meter.avg
             for name, average_meter in train_metric_info.items():
                 logs[name + "(metric)"] = average_meter.avg
+            
+            display_logs = self._filter_out_dict(logs, stage="train")
+            
             msg = f"Train: Epoch [{self.state.epoch}/{self.config['max_epochs']}]"
             if logs is not None:
-                for key, val in logs.items():
+                for key, val in display_logs.items():
                     msg += f" | {key}: {val:.6f}"
             logger.info(msg)
             # Temporary disable wandb_writer, since it is not support step less the
@@ -700,6 +827,14 @@ class BaseTrainer:
                     val_dataloader
                 )
 
+                # stream metric lightweight hook
+                _extra_stream = self._compute_streaming_metrics(stage="eval")
+                for k, v in _extra_stream.items():
+                    if k not in eval_metric_info:
+                        eval_metric_info[k] = AverageMeter(k)
+                    eval_metric_info[k].update(float(v), 1)
+
+                # log evaluation info
                 logs: OrderedDict[str, float] = {}
                 for name, average_meter in eval_time_info.items():
                     logs[name] = average_meter.avg
@@ -708,9 +843,11 @@ class BaseTrainer:
                 for name, average_meter in eval_metric_info.items():
                     logs[name + "(metric)"] = average_meter.avg
 
+                display_logs = self._filter_out_dict(logs, stage="eval")
+
                 msg = f"Eval: Epoch [{self.state.epoch}/{self.config['max_epochs']}]"
                 if logs is not None:
-                    for key, val in logs.items():
+                    for key, val in display_logs.items():
                         msg += f" | {key}: {val:.6f}"
                 logger.info(msg)
                 # Temporary disable wandb_writer, since it is not support step less the
@@ -831,10 +968,121 @@ class BaseTrainer:
         for name, average_meter in metric_info.items():
             logs[name + "(metric)"] = average_meter.avg
 
+        display_logs = self._filter_out_dict(logs, stage="eval")
         msg = "Eval:"
         if logs is not None:
-            for key, val in logs.items():
+            for key, val in display_logs.items():
                 msg += f" | {key}: {val:.6f}"
         logger.info(msg)
 
         return time_info, loss_info, metric_info
+
+    def attach_metrics(self, metric_cfg=None, **runtime_objs):
+        """
+        metric_cfg: a dict produced by build_metric(cfg.Metric), or a manually
+                    provided collection of metric objects.
+        runtime_objs: dataset_infos / train_smiles / clip / ... forwarded uniformly
+                    to each metric via metric.bind(...).
+        """
+        from ppmat.metrics import build_metric as _build  # 惰性导入
+        if not metric_cfg:
+            return
+        mods = _build(metric_cfg)
+        if isinstance(mods, dict): self.metric_modules = mods
+        elif mods is not None:     self.metric_modules = {"default": mods}
+        else:                      self.metric_modules = {}
+        for m in self.metric_modules.values():
+            if hasattr(m, "bind"): m.bind(**runtime_objs)
+
+    def _update_streaming_metrics(self, *, result, batch, stage: str):
+        # Generic step hook: update if the metric exposes it; skip otherwise.
+        for name, m in self.metric_modules.items():
+            if hasattr(m, "update_step"):
+                try:
+                    m.update_step(result=result, batch=batch, stage=stage)
+                except Exception as e:
+                    # Do not break training on errors—this enables gradual/incremental adoption.
+                    logger.debug(f"[metric:{name}] update_step skipped: {e}")
+
+    def _compute_streaming_metrics(self, *, stage: str) -> Dict[str, float]:
+        # Generic epoch hook: aggregate all registered streaming metrics.
+        all_out = {}
+        for name, m in self.metric_modules.items():
+            if hasattr(m, "compute_epoch"):
+                try:
+                    out = m.compute_epoch(stage=stage) or {}
+                    # Optional prefixing:
+                    #   all_out.update({f"{name}/{k}": v for k, v in out.items()})
+                    all_out.update(out)
+                except Exception as e:
+                    logger.debug(f"[metric:{name}] compute_epoch skipped: {e}")
+            if hasattr(m, "reset"):
+                try: m.reset()
+                except Exception: pass
+        return all_out
+
+    def _to_name_set(self, obj) -> Optional[Set[str]]:
+        """
+        Normalize YAML values into a Python set.
+        - list/tuple/set -> set
+        - dict          -> dict.keys()
+        - str           -> {str}
+        - None          -> None (means "no filter")
+        """
+        if obj is None:
+            return None
+        if isinstance(obj, (set, list, tuple)):
+            return set(obj)
+        if isinstance(obj, dict):
+            return set(obj.keys())
+        return {str(obj)}
+
+    def _name_matches(self, base: str, stage: str, allowed: Optional[Set[str]]) -> bool:
+        """
+        Check whether a base metric name is allowed for a given stage.
+        Supports common aliases, e.g.:
+        - train:  "loss" ~ "train_loss" ~ "train/loss"
+        - eval:   "nll"  ~ "val_nll"    ~ "eval/nll"
+        """
+        if allowed is None:
+            return True
+        if base in allowed:
+            return True
+        if f"{stage}_{base}" in allowed:
+            return True
+        if stage == "eval" and f"val_{base}" in allowed:
+            return True
+        if f"{stage}/{base}" in allowed:
+            return True
+        return False
+
+    def _filter_out_dict(self, logs: Dict[str, float], stage: str) -> Dict[str, float]:
+        """
+        Keep only items permitted by out_dict for this stage.
+        We pass through keys ending with "(loss)" or "(metric)" only;
+        others (e.g., lr/reader_cost/batch_cost) are suppressed from console output.
+        """
+        cfg = self.out_dict_cfg
+        if cfg is None:
+            return logs            # not configured → print everything
+        if not cfg:
+            return {}              # empty dict → print nothing
+
+        loss_cfg = cfg.get("loss", {})
+        metric_cfg = cfg.get("metric", {})
+        sel_loss = self._to_name_set(loss_cfg.get(stage)) if isinstance(loss_cfg, dict) else self._to_name_set(loss_cfg)
+        sel_metric = self._to_name_set(metric_cfg.get(stage)) if isinstance(metric_cfg, dict) else self._to_name_set(metric_cfg)
+
+        from collections import OrderedDict
+        filtered = OrderedDict()
+        for k, v in logs.items():
+            if k.endswith("(loss)"):
+                base = k[:-len("(loss)")]
+                if self._name_matches(base, stage, sel_loss):
+                    filtered[k] = v
+            elif k.endswith("(metric)"):
+                base = k[:-len("(metric)")]
+                if self._name_matches(base, stage, sel_metric):
+                    filtered[k] = v
+            # else: skip non-loss/metric entries from console output
+        return filtered

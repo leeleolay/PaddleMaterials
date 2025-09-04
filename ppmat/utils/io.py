@@ -16,6 +16,7 @@ import ast
 import hashlib
 import json
 import os
+import argparse
 
 import numpy as np
 
@@ -112,5 +113,9 @@ def calc_md5(fullname):
 
 
 if __name__ == "__main__":
-    md5 = calc_md5("yourfile.zip")
+    parser = argparse.ArgumentParser(description="Calculate MD5 hash of a file")
+    parser.add_argument("filename", help="Path to the file to hash")
+    args = parser.parse_args()
+    
+    md5 = calc_md5(args.filename)
     print(md5)
