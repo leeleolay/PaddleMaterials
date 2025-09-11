@@ -1,6 +1,20 @@
+# Copyright (c) 2025 PaddlePaddle Authors. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import paddle
 
-from .utils import diffgraphformer_utils as utils
+from ppmat.models.diffnmr.utils import diffgraphformer_utils
 
 
 class DummyExtraFeatures:
@@ -16,7 +30,7 @@ class DummyExtraFeatures:
         empty_e = paddle.zeros(shape=E.shape[:-1] + [0], dtype=E.dtype)
         empty_y = paddle.zeros(shape=[y.shape[0], 0], dtype=y.dtype)
 
-        return utils.PlaceHolder(X=empty_x, E=empty_e, y=empty_y)
+        return diffgraphformer_utils.PlaceHolder(X=empty_x, E=empty_e, y=empty_y)
 
 
 class ExtraFeatures:
@@ -44,7 +58,7 @@ class ExtraFeatures:
             # => result shape (bs, 1+k)
             y_stacked = paddle.concat([n, y_cycles], axis=1)
 
-            return utils.PlaceHolder(X=x_cycles, E=extra_edge_attr, y=y_stacked)
+            return diffgraphformer_utils.PlaceHolder(X=x_cycles, E=extra_edge_attr, y=y_stacked)
 
         elif self.features_type == "eigenvalues":
             eigenfeatures = self.eigenfeatures(noisy_data)
@@ -58,7 +72,7 @@ class ExtraFeatures:
                 [n, y_cycles, n_components.astype(n.dtype), batched_eigenvalues], axis=1
             )
 
-            return utils.PlaceHolder(X=x_cycles, E=extra_edge_attr, y=y_stacked)
+            return diffgraphformer_utils.PlaceHolder(X=x_cycles, E=extra_edge_attr, y=y_stacked)
 
         elif self.features_type == "all":
             eigenfeatures = self.eigenfeatures(noisy_data)
@@ -81,7 +95,7 @@ class ExtraFeatures:
                 [n, y_cycles, n_components.astype(n.dtype), batched_eigenvalues], axis=1
             )
 
-            return utils.PlaceHolder(X=X_cat, E=extra_edge_attr, y=y_stacked)
+            return diffgraphformer_utils.PlaceHolder(X=X_cat, E=extra_edge_attr, y=y_stacked)
 
         else:
             raise ValueError(f"Features type {self.features_type} not implemented")
@@ -327,7 +341,7 @@ def get_eigenvectors_features(vectors, node_mask, n_connected, k=2):
 
 
 # ======================================
-# 8. batch_trace, batch_diagonal (Paddle 版本)
+# 8. batch_trace, batch_diagonal
 # ======================================
 def batch_trace(X):
     """
@@ -347,7 +361,7 @@ def batch_diagonal(X):
 
 
 # ======================================
-# 9. KNodeCycles (Paddle 版本)
+# 9. KNodeCycles
 # ======================================
 class KNodeCycles:
     """Builds cycle counts for each node in a graph."""

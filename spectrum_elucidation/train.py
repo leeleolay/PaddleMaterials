@@ -24,7 +24,6 @@ from ppmat.datasets import build_dataloader
 from ppmat.datasets import build_dataset_infos
 from ppmat.datasets.msd_nmr_dataset import DataLoaderCollection
 
-# from ppmat.datasets import set_signal_handlers
 from ppmat.metrics import build_metric
 from ppmat.models import build_model
 from ppmat.optimizer import build_optimizer
@@ -113,7 +112,7 @@ if __name__ == "__main__":
     train_smiles = dataset_infos.train_smiles
     
     # extra features
-    if config["Model"]["__init_params__"]["diffmodel_cfg"]["extra_features"] is not None:
+    if config["Model"]["__init_params__"].get("diffmodel_cfg", None) is not None:
         extra_features = ExtraFeatures(
             config["Model"]["__init_params__"]["diffmodel_cfg"]["extra_features"],
             dataset_infos=dataset_infos,
@@ -121,28 +120,31 @@ if __name__ == "__main__":
         domain_features = ExtraMolecularFeatures(
             dataset_infos=dataset_infos,
         )
+        fallback_loader = (
+            train_loader or val_loader or test_loader
+        )
+        dataset_infos.compute_input_output_dims(
+            dataloader=fallback_loader,
+            extra_features=extra_features,
+            domain_features=domain_features,
+            conditionDim=config["Model"]["__init_params__"]["diffmodel_cfg"]["conditdim"],
+        )
     else:
         extra_features = DummyExtraFeatures()
         domain_features = DummyExtraFeatures()
-    fallback_loader = (
-        train_loader or val_loader or test_loader
-    )
-    dataset_infos.compute_input_output_dims(
-        dataloader=fallback_loader,
-        extra_features=extra_features,
-        domain_features=domain_features,
-        conditionDim=config["Model"]["__init_params__"]["diffmodel_cfg"]["conditdim"],
-    )
 
     # CLIP for sample metric
-    model_cfg = config["CLIP"]
-    model = build_model(
-        model_cfg,
-        extra_features = extra_features, 
-        domain_features = domain_features, 
-        dataset_infos = dataset_infos,
-    )
-    clip_module = getattr(model, "clip", None)
+    if config.get("CLIP", None) is not None:
+        model_cfg = config["CLIP"]
+        model = build_model(
+            model_cfg,
+            extra_features = extra_features, 
+            domain_features = domain_features, 
+            dataset_infos = dataset_infos,
+        )
+        clip_module = getattr(model, "clip", None)
+    else:
+        clip_module = None
 
     # visualization tools
     visualization_tools = MolecularVisualization(
@@ -151,13 +153,14 @@ if __name__ == "__main__":
     )
 
     # build model from config
-    model_cfg = config["Model"]
+    model_cfg = config["Model"]    
     model = build_model(
         model_cfg, 
         extra_features = extra_features, 
         domain_features = domain_features, 
         dataset_infos = dataset_infos,
         visualization_tools = visualization_tools,
+        clip = clip_module,
     )
 
     # build optimizer and learning rate scheduler from config
@@ -199,7 +202,7 @@ if __name__ == "__main__":
         metric_cfg,
         dataset_infos=dataset_infos,
         train_smiles=train_smiles,
-        clip=None, #clip_module,
+        clip=clip_module,
         model=model,
     )
     

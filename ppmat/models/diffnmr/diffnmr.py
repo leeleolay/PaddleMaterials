@@ -30,20 +30,19 @@ from ppmat.models.diffnmr.diffusion_prior import DiffPriorNetwork
 from ppmat.models.diffnmr.diffusion_prior import NoiseScheduler
 from ppmat.models.diffnmr.diffusion_prior import freeze_model_and_make_eval_
 from ppmat.utils import logger
-from ppmat.utils import save_load
 
-from .graph_transformer import GraphTransformer
-from .graph_transformer import MolecularEncoder
-from .nmr_encoder import NMR_encoder
-from .nmr_encoder_onlyH import NMR_encoder_H
-from .noise_schedule import DiscreteUniformTransition
-from .noise_schedule import MarginalUniformTransition
-from .noise_schedule import PredefinedNoiseScheduleDiscrete
-from .utils import diffgraphformer_utils as utils
-from .utils import model_utils as m_utils
-from .utils.diffprior_utils import default
-from .utils.diffprior_utils import exists
-from .utils.diffprior_utils import l2norm
+from ppmat.models.diffnmr.graph_transformer import GraphTransformer
+from ppmat.models.diffnmr.graph_transformer import MolecularEncoder
+from ppmat.models.diffnmr.nmr_encoder import NMR_encoder
+from ppmat.models.diffnmr.nmr_encoder import NMR_encoder_H
+from ppmat.schedulers.scheduling_diffnmr import DiscreteUniformTransition
+from ppmat.schedulers.scheduling_diffnmr import MarginalUniformTransition
+from ppmat.schedulers.scheduling_diffnmr import PredefinedNoiseScheduleDiscrete
+from ppmat.models.diffnmr.utils import diffgraphformer_utils
+from ppmat.schedulers import scheduling_diffnmr
+from ppmat.models.diffnmr.utils.diffprior_utils import default
+from ppmat.models.diffnmr.utils.diffprior_utils import exists
+from ppmat.models.diffnmr.utils.diffprior_utils import l2norm
 
 
 class MolecularGraphFormer(nn.Layer):
@@ -121,7 +120,7 @@ class MolecularGraphFormer(nn.Layer):
             x_limit = paddle.ones([self.Xdim_output]) / self.Xdim_output
             e_limit = paddle.ones([self.Edim_output]) / self.Edim_output
             y_limit = paddle.ones([self.ydim_output]) / self.ydim_output
-            self.limit_dist = utils.PlaceHolder(X=x_limit, E=e_limit, y=y_limit)
+            self.limit_dist = diffgraphformer_utils.PlaceHolder(X=x_limit, E=e_limit, y=y_limit)
 
         elif diffmodel_cfg["transition"] == "marginal":
             node_types = self.dataset_info.node_types.astype("float32")
@@ -138,7 +137,7 @@ class MolecularGraphFormer(nn.Layer):
                 e_marginals=e_marginals,
                 y_classes=self.ydim_output,
             )
-            self.limit_dist = utils.PlaceHolder(
+            self.limit_dist = diffgraphformer_utils.PlaceHolder(
                 X=x_marginals,
                 E=e_marginals,
                 y=paddle.ones([self.ydim_output]) / self.ydim_output,
@@ -150,33 +149,20 @@ class MolecularGraphFormer(nn.Layer):
         # configure training setting and other properties
         self.best_val_nll = 1e8
         self.val_counter = 0
-
-        # configure generated datas for visualization after forward
-        self.val_nll = NLL()
-        self.val_X_kl = SumExceptBatchKL()
-        self.val_E_kl = SumExceptBatchKL()
-        self.val_X_logp = SumExceptBatchMetric()
-        self.val_E_logp = SumExceptBatchMetric()
-
-        self.test_nll = NLL()
-        self.test_X_kl = SumExceptBatchKL()
-        self.test_E_kl = SumExceptBatchKL()
-        self.test_X_logp = SumExceptBatchMetric()
-        self.test_E_logp = SumExceptBatchMetric()
         
         # set use formula for training and sample or not
         self.flag_use_formula = diffmodel_cfg.get("flag_use_formula", False)
 
     def forward(self, batch):
         batch_graph = batch["graph"]
-        property = batch["property"]
+        batch_property = batch["property"]
 
         # 0. Guard empty-edge batches
         if batch_graph.edges.T.size == 0:
             print("Found a batch with no edges. Skipping.")
             return None
         # 1. Convert sparse graph to dense tensors and apply node mask
-        dense_data, node_mask = utils.to_dense(
+        dense_data, node_mask = diffgraphformer_utils.to_dense(
             paddle.to_tensor(batch_graph.node_feat["feat"]),
             paddle.to_tensor(batch_graph.edges.T),
             paddle.to_tensor(batch_graph.edge_feat["feat"]),
@@ -184,11 +170,11 @@ class MolecularGraphFormer(nn.Layer):
         )
         dense_data = dense_data.mask(node_mask)
         X, E = dense_data.X, dense_data.E
-        y = paddle.to_tensor(property)
+        y = paddle.to_tensor(batch_property['y'])
 
         # 2. Add noise and compute extra features
-        noisy_data = m_utils.apply_noise(self, X, E, y, node_mask, self.flag_use_formula)
-        extra_data = m_utils.compute_extra_data(self, noisy_data)
+        noisy_data = scheduling_diffnmr.apply_noise(self, X, E, y, node_mask, self.flag_use_formula)
+        extra_data = scheduling_diffnmr.compute_extra_data(self, noisy_data)
 
         # Decoder inputs (noisy + extra features)
         input_X = paddle.concat(
@@ -202,8 +188,8 @@ class MolecularGraphFormer(nn.Layer):
         ).astype(dtype="float32")
 
         # 3. Encoder condition vector from clean inputs + extra features
-        z_t = utils.PlaceHolder(X=X, E=E, y=y).type_as(X).mask(node_mask)
-        extra_data_pure = m_utils.compute_extra_data(
+        z_t = diffgraphformer_utils.PlaceHolder(X=X, E=E, y=y).type_as(X).mask(node_mask)
+        extra_data_pure = scheduling_diffnmr.compute_extra_data(
             self,
             {"X_t": z_t.X, "E_t": z_t.E, "y_t": z_t.y, "node_mask": node_mask},
             isPure=True,
@@ -228,13 +214,13 @@ class MolecularGraphFormer(nn.Layer):
         pred = self.decoder(input_X, input_E, input_y, node_mask)
 
         # 5. Compute training loss 
-        loss = self.train_loss(
+        loss_dict = self.train_loss(
             masked_pred_X=pred.X,
             masked_pred_E=pred.E,
             pred_y=pred.y,
             true_X=X,
             true_E=E,
-            true_y=paddle.to_tensor(property),
+            true_y=paddle.to_tensor(batch_property['y']),
         )
 
         # 6. Assemble outputs for Trainer & streaming metrics
@@ -252,7 +238,7 @@ class MolecularGraphFormer(nn.Layer):
         }
         
         result = {
-            "loss_dict": loss,
+            "loss_dict": loss_dict,
             "pred_dict": pred_dict,
             "label_dict": label_dict,
             "node_mask": node_mask,
@@ -344,9 +330,19 @@ class NMRNetCLIP(nn.Layer):
             "pretrained_model_path" in spectrum_encoder
             and spectrum_encoder["pretrained_model_path"] is not None
         ):
-            save_load.load_pretrain(
-                self.spectrum_encoder, spectrum_encoder["pretrained_model_path"]
-            )
+            # load graph encoder model from pretrained model
+            state_dict = paddle.load(spectrum_encoder["pretrained_model_path"])
+            encoder_state_dict = {
+                k[len("text_encoder.") :]: v
+                for k, v in state_dict.items()
+                if k.startswith("text_encoder.")
+            }
+            # encoder_state_dict = {
+            #     k[len("encoder.") :]: v
+            #     for k, v in state_dict.items()
+            #     if k.startswith("encoder.")
+            # } # TODO: prior training, revise it and check
+            self.spectrum_encoder.set_state_dict(encoder_state_dict)
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -355,30 +351,31 @@ class NMRNetCLIP(nn.Layer):
             initializer.normal_(m.weight)
 
     def forward(self, batch):
-        batch_graph, other_data = batch
+        batch_graph = batch["graph"]
+        batch_property = batch["property"]
+        batch_spectrum = batch["spectrum"]
+        
         batch_length = batch_graph.num_graph
         # transfer to dense graph from sparse graph
-        if batch_graph.edges.T.numel() == 0:
+        if paddle.to_tensor(batch_graph.edges.T).numel() == 0:
             print("Found a batch with no edges. Skipping.")
             return None
-        dense_data, node_mask = utils.to_dense(
-            batch_graph.node_feat["feat"],
-            batch_graph.edges.T.contiguous(),
-            batch_graph.edge_feat["feat"],
-            batch_graph.graph_node_id,
+        dense_data, node_mask = diffgraphformer_utils.to_dense(
+            paddle.to_tensor(batch_graph.node_feat["feat"]),
+            paddle.to_tensor(batch_graph.edges.T).contiguous(),
+            paddle.to_tensor(batch_graph.edge_feat["feat"]),
+            paddle.to_tensor(batch_graph.graph_node_id),
         )
         dense_data = dense_data.mask(node_mask)
         X, E = dense_data.X, dense_data.E
-        y = other_data["y"]
+        y = paddle.to_tensor(batch_property["y"])
 
         # get NMR embedded vector
         # prepare NMR vectors
-        condition_H1nmr = other_data["conditionVec"]["H_nmr"]
-        condition_H1nmr = condition_H1nmr.reshape(batch_length, self.seq_len_H1, -1)
-        condition_C13nmr = other_data["conditionVec"]["C_nmr"]
-        condition_C13nmr = condition_C13nmr.reshape(batch_length, self.seq_len_C13)
-        num_H_peak = other_data["conditionVec"]["num_H_peak"]
-        num_C_peak = other_data["conditionVec"]["num_C_peak"]
+        condition_H1nmr = paddle.to_tensor(batch_spectrum["H_nmr"]).reshape(batch_length, self.seq_len_H1, -1)
+        condition_C13nmr = paddle.to_tensor(batch_spectrum["C_nmr"]).reshape(batch_length, self.seq_len_C13)
+        num_H_peak = paddle.to_tensor(batch_spectrum["num_H_peak"])
+        num_C_peak = paddle.to_tensor(batch_spectrum["num_C_peak"])
         conditionAll = [condition_H1nmr, num_H_peak, condition_C13nmr, num_C_peak]
         if self.flag_onlyH == True:
             global_H, _ = self.spectrum_encoder(conditionAll)
@@ -388,8 +385,8 @@ class NMRNetCLIP(nn.Layer):
 
         # get graph embedded vector
         # prepare the extra feature for encoder input without noisy
-        z_t = utils.PlaceHolder(X=X, E=E, y=y).type_as(X).mask(node_mask)
-        extra_data_pure = m_utils.compute_extra_data(
+        z_t = diffgraphformer_utils.PlaceHolder(X=X, E=E, y=y).type_as(X).mask(node_mask)
+        extra_data_pure = scheduling_diffnmr.compute_extra_data(
             self,
             {"X_t": z_t.X, "E_t": z_t.E, "y_t": z_t.y, "node_mask": node_mask},
             isPure=True,
@@ -423,45 +420,446 @@ class NMRNetCLIP(nn.Layer):
         loss_v1 = loss_fn(logits, labels)
         loss_v2 = loss_fn(logits.T, labels)
         loss = (loss_v1 + loss_v2) / 2
+        
+        loss_dict = {"loss": loss}
 
-        return {"loss": loss}
+        return {"loss_dict": loss_dict}
 
+class DiffNMR(nn.Layer):
+    def __init__(
+        self,
+        encoder_cfg,
+        decoder_cfg,
+        diffmodel_cfg,
+        connector_cfg,
+        dataset_infos,
+        extra_features,
+        domain_features,
+        clip,
+    ) -> None:
+        super().__init__()
+
+        # configure general variables settings
+        self.T = diffmodel_cfg["diffusion_steps"]
+        
+        # configure datasets inter-varibles
+        input_dims = dataset_infos.input_dims
+        output_dims = dataset_infos.output_dims
+        self.dataset_info = dataset_infos
+
+        self.dataset_info = dataset_infos
+        self.extra_features = extra_features
+        self.domain_features = domain_features
+
+        # configure noise scheduler
+        self.noise_schedule = PredefinedNoiseScheduleDiscrete(
+            diffmodel_cfg["diffusion_noise_schedule"],
+            timesteps=self.T,
+        )
+
+        # set spectrum encoder model
+        if encoder_cfg.get("onlyH", False):
+            self.flag_onlyH = True
+            self.encoder = NMR_encoder_H(
+                dim_H=encoder_cfg["dim_enc_H"],
+                dimff_H=encoder_cfg["dimff_enc_H"],
+                dim_C=encoder_cfg["dim_enc_C"],
+                dimff_C=encoder_cfg["dimff_enc_C"],
+                hidden_dim=encoder_cfg["ffn_hidden"],
+                n_head=encoder_cfg["n_head"],
+                num_layers=encoder_cfg["n_layers"],
+                drop_prob=encoder_cfg["drop_prob"],
+                peakwidthemb_num=encoder_cfg["peakwidthemb_num"],
+                integralemb_num=encoder_cfg["integralemb_num"],
+            )
+        else:
+            self.flag_onlyH = False
+            self.encoder = NMR_encoder(
+                dim_H=encoder_cfg["dim_enc_H"],
+                dimff_H=encoder_cfg["dimff_enc_H"],
+                dim_C=encoder_cfg["dim_enc_C"],
+                dimff_C=encoder_cfg["dimff_enc_C"],
+                hidden_dim=encoder_cfg["ffn_hidden"],
+                n_head=encoder_cfg["n_head"],
+                num_layers=encoder_cfg["n_layers"],
+                drop_prob=encoder_cfg["drop_prob"],
+                peakwidthemb_num=encoder_cfg["peakwidthemb_num"],
+                integralemb_num=encoder_cfg["integralemb_num"],
+            )
+        # load spectrum encoder model from pretrained model
+        state_dict = paddle.load(encoder_cfg["pretrained_path"])
+        prefixes = ("spectrum_encoder.", "encoder.")
+        encoder_state_dict = {
+            k[len(pref):]: v
+            for k, v in state_dict.items()
+            for pref in prefixes
+            if k.startswith(pref)
+        }
+        self.encoder.set_state_dict(encoder_state_dict)
+
+        # set graph decoder model
+        self.decoder = GraphTransformer(
+            n_layers=decoder_cfg["num_layers"],
+            input_dims=input_dims,
+            hidden_mlp_dims=decoder_cfg["hidden_mlp_dims"],
+            hidden_dims=decoder_cfg["hidden_dims"],
+            output_dims=output_dims,
+            act_fn_in=nn.ReLU(),
+            act_fn_out=nn.ReLU(),
+        )
+        # load graph decoder model from pretrained model
+        state_dict = paddle.load(decoder_cfg["pretrained_path"])
+        decoder_state_dict = {
+            k[len("decoder.") :]: v
+            for k, v in state_dict.items()
+            if k.startswith("decoder.")
+        }
+        self.decoder.set_state_dict(decoder_state_dict)
+
+        # set connector model
+        self.connector_flag = False
+        if connector_cfg and connector_cfg["__name__"] == "DiffPrior":
+            self.connector_flag = True
+            self.connector = DiffPrior(
+                config=connector_cfg,
+                model=DiffPriorNetwork(
+                    dim=connector_cfg["prior_network"]["dim"],
+                    num_timesteps=connector_cfg["prior_network"]["num_timesteps"],
+                    num_time_embeds=connector_cfg["prior_network"][
+                        "num_time_embeds"
+                    ],
+                    num_graph_embeds=connector_cfg["prior_network"][
+                        "num_graph_embeds"
+                    ],
+                    num_text_embeds=connector_cfg["prior_network"][
+                        "num_text_embeds"
+                    ],
+                    max_text_len=connector_cfg["prior_network"]["max_text_len"],
+                    self_cond=connector_cfg["prior_network"]["self_cond"],
+                    depth=connector_cfg["prior_network"]["depth"],
+                    dim_head=connector_cfg["prior_network"]["dim_head"],
+                    heads=connector_cfg["prior_network"]["heads"],
+                ),
+                clip=clip
+            )
+            state_dict = paddle.load(connector_cfg["pretrained_path"])
+            connector_state_dict = {
+                k[len("connector.") :]: v
+                for k, v in state_dict.items()
+                if k.startswith("connector.")
+            }
+            self.connector.set_state_dict(connector_state_dict)
+        else:
+            self.connector = nn.Identity()
+
+        # configure loss calculation with initialization of transition model
+        self.Xdim = input_dims["X"]
+        self.Edim = input_dims["E"]
+        self.ydim = input_dims["y"]
+        self.Xdim_output = output_dims["X"]
+        self.Edim_output = output_dims["E"]
+        self.ydim_output = output_dims["y"]
+        self.node_dist = dataset_infos.nodes_dist
+
+        # Transition Model
+        if diffmodel_cfg["transition"] == "uniform":
+            self.transition_model = DiscreteUniformTransition(
+                x_classes=self.Xdim_output,
+                e_classes=self.Edim_output,
+                y_classes=self.ydim_output,
+            )
+            x_limit = paddle.ones([self.Xdim_output]) / self.Xdim_output
+            e_limit = paddle.ones([self.Edim_output]) / self.Edim_output
+            y_limit = paddle.ones([self.ydim_output]) / self.ydim_output
+            self.limit_dist = diffgraphformer_utils.PlaceHolder(X=x_limit, E=e_limit, y=y_limit)
+
+        elif diffmodel_cfg["transition"] == "marginal":
+            node_types = self.dataset_info.node_types.astype("float32")
+            x_marginals = node_types / paddle.sum(node_types)
+
+            edge_types = self.dataset_info.edge_types.astype("float32")
+            e_marginals = edge_types / paddle.sum(edge_types)
+            logger.info(
+                f"Marginal distribution of classes: {x_marginals.tolist()} for nodes, "
+            )
+            logger.info(f"{e_marginals.tolist()} for edges")
+
+            self.transition_model = MarginalUniformTransition(
+                x_marginals=x_marginals,
+                e_marginals=e_marginals,
+                y_classes=self.ydim_output,
+            )
+            self.limit_dist = diffgraphformer_utils.PlaceHolder(
+                X=x_marginals,
+                E=e_marginals,
+                y=paddle.ones([self.ydim_output]) / self.ydim_output,
+            )
+
+        self.train_loss = TrainLossDiscrete(diffmodel_cfg["lambda_train"])
+
+        self.best_val_nll = 1e8
+        self.val_counter = 0
+        self.vocabDim = decoder_cfg["vocab_dim"]
+
+        self.val_nll = NLL()
+        self.val_X_kl = SumExceptBatchKL()
+        self.val_E_kl = SumExceptBatchKL()
+        self.val_X_logp = SumExceptBatchMetric()
+        self.val_E_logp = SumExceptBatchMetric()
+
+        self.test_nll = NLL()
+        self.test_X_kl = SumExceptBatchKL()
+        self.test_E_kl = SumExceptBatchKL()
+        self.test_X_logp = SumExceptBatchMetric()
+        self.test_E_logp = SumExceptBatchMetric()
+
+
+        self.seq_len_H1 = encoder_cfg["seq_len_H1"]  # TODO remove later
+        self.seq_len_C13 = encoder_cfg["seq_len_C13"]  # TODO remove later
+        self.tem = 2  # TODO remove later
+        
+        # set use formula for training and sample or not
+        self.flag_use_formula = diffmodel_cfg.get("flag_use_formula", False)
+
+    # def preprocess_data(self, batch_graph, other_data):
+    #     dense_data, node_mask = diffgraphformer_utils.to_dense(
+    #         batch_graph.node_feat["feat"],
+    #         batch_graph.edges.T,
+    #         batch_graph.edge_feat["feat"],
+    #         batch_graph.graph_node_id,
+    #     )
+    #     dense_data = dense_data.mask(node_mask)
+
+    #     # add noise to the inputs (X, E)
+    #     noisy_data = scheduling_diffnmr.apply_noise(
+    #         self, dense_data.X, dense_data.E, other_data["y"], node_mask, self.flag_use_formula
+    #     )
+    #     extra_data = scheduling_diffnmr.compute_extra_data(self, noisy_data)
+
+    #     # concate data
+    #     input_X = paddle.concat(
+    #         [noisy_data["X_t"].astype("float32"), extra_data.X], axis=2
+    #     ).astype(dtype="float32")
+    #     input_E = paddle.concat(
+    #         [noisy_data["E_t"].astype("float32"), extra_data.E], axis=3
+    #     ).astype(dtype="float32")
+    #     input_y = paddle.hstack(
+    #         [noisy_data["y_t"].astype("float32"), extra_data.y]
+    #     ).astype(dtype="float32")
+
+    #     batch_length = batch_graph.num_graph
+    #     condition_H1nmr = other_data["conditionVec"]["H_nmr"]
+    #     condition_H1nmr = condition_H1nmr.reshape(batch_length, self.seq_len_H1, -1)
+    #     condition_C13nmr = other_data["conditionVec"]["C_nmr"]
+    #     condition_C13nmr = condition_C13nmr.reshape(batch_length, self.seq_len_C13)
+    #     num_H_peak = other_data["conditionVec"]["num_H_peak"]
+    #     num_C_peak = other_data["conditionVec"]["num_C_peak"]
+    #     conditionAll = [condition_H1nmr, num_H_peak, condition_C13nmr, num_C_peak]
+
+    #     return (
+    #         dense_data,
+    #         noisy_data,
+    #         node_mask,
+    #         extra_data,
+    #         input_X,
+    #         input_E,
+    #         input_y,
+    #         conditionAll,
+    #     )
+
+    def make_src_mask(self, src):
+        src_mask = (src != 0).unsqueeze(1).unsqueeze(2)
+        return src_mask
+
+
+    def forward(self, batch, mode="train"):
+        batch_graph = batch["graph"]
+        batch_property = batch["property"]
+        batch_spectrum = batch["spectrum"]
+
+        # 0. Guard empty-edge batches
+        if batch_graph.edges.T.size == 0:
+            print("Found a batch with no edges. Skipping.")
+            return None
+
+        # 1. Convert sparse graph to dense tensors and apply node mask
+        dense_data, node_mask = diffgraphformer_utils.to_dense(
+            paddle.to_tensor(batch_graph.node_feat["feat"]),
+            paddle.to_tensor(batch_graph.edges.T),
+            paddle.to_tensor(batch_graph.edge_feat["feat"]),
+            paddle.to_tensor(batch_graph.graph_node_id),
+        )
+        dense_data = dense_data.mask(node_mask)
+        X, E = dense_data.X, dense_data.E
+        y = paddle.to_tensor(batch_property['y'])
+
+        # 2. Add noise and compute extra features
+        noisy_data = scheduling_diffnmr.apply_noise(self, X, E, y, node_mask, self.flag_use_formula)
+        extra_data = scheduling_diffnmr.compute_extra_data(self, noisy_data)
+
+        # Decoder inputs (noisy + extra features)
+        input_X = paddle.concat(
+            [noisy_data["X_t"].astype("float32"), extra_data.X], axis=2
+        ).astype(dtype="float32")
+        input_E = paddle.concat(
+            [noisy_data["E_t"].astype("float32"), extra_data.E], axis=3
+        ).astype(dtype="float32")
+        input_y = paddle.hstack(
+            [noisy_data["y_t"].astype("float32"), extra_data.y]
+        ).astype(dtype="float32")
+
+        # 3. get NMR embedded vector
+        # prepare NMR vectors
+        batch_length = batch_graph.num_graph
+        condition_H1nmr = paddle.to_tensor(batch_spectrum["H_nmr"]).reshape(batch_length, self.seq_len_H1, -1)#TODO: optimize self.seq_len_H1
+        condition_C13nmr = paddle.to_tensor(batch_spectrum["C_nmr"]).reshape(batch_length, self.seq_len_C13)
+        num_H_peak = paddle.to_tensor(batch_spectrum["num_H_peak"])
+        num_C_peak = paddle.to_tensor(batch_spectrum["num_C_peak"])
+        condition_Spectrum = [condition_H1nmr, num_H_peak, condition_C13nmr, num_C_peak]
+        if self.flag_onlyH == True:
+            global_H, _ = self.encoder(condition_Spectrum)
+            embeddings_spectrum = global_H
+        else:
+            embeddings_spectrum = self.encoder(condition_Spectrum)
+        input_y = paddle.concat([input_y, embeddings_spectrum], axis=1).astype("float32")
+
+        # 4. Decoder forward
+        # Convention: pred.X and pred.E are logits with shapes [B, n, Cx] and [B, n, n, Ce]
+        pred = self.decoder(input_X, input_E, input_y, node_mask)
+
+        # 5. Compute training loss 
+        loss_dict = self.train_loss(
+            masked_pred_X=pred.X,
+            masked_pred_E=pred.E,
+            pred_y=pred.y,
+            true_X=X,
+            true_E=E,
+            true_y=paddle.to_tensor(batch_property['y']),
+        )
+
+        # 6. Assemble outputs for Trainer & streaming metrics
+        # Predictions: provide masked_pred_X/E; mirror X_logits/E_logits for legacy paths 
+        pred_dict = {
+            "masked_pred_X": pred.X,
+            "masked_pred_E": pred.E,
+            "pred_y": pred.y,
+        }
+        # Labels: provide true_X/true_E; node_mask is optional but useful for some metrics
+        label_dict = {
+            "true_X": X,
+            "true_E": E,
+            "true_y": y,
+        }
+        
+        result = {
+            "loss_dict": loss_dict,
+            "pred_dict": pred_dict,
+            "label_dict": label_dict,
+            "node_mask": node_mask,
+            "noisy_data": noisy_data,
+        }
+
+        return result
+
+    @paddle.no_grad()
+    def sample(self, batch, i):
+        batch_graph, other_data = batch
+
+        # transfer to dense graph from sparse graph
+        if batch_graph.edges.T.numel() == 0:
+            print("Found a batch with no edges. Skipping.")
+            return None
+
+        # process data
+        (
+            dense_data,
+            noisy_data,
+            node_mask,
+            extra_data,
+            input_X,
+            input_E,
+            input_y,
+        ) = self.preprocess_data(batch_graph, other_data)
+        X, E = dense_data.X, dense_data.E
+
+        # set condition
+        batch_length = X.shape[0]
+        conditionVec = other_data["conditionVec"]
+        y_condition = conditionVec.reshape(batch_length, self.vocabDim)
+
+
+        # forward of the model
+        pred = self.forward_MultiModalModel(
+            input_X, input_E, input_y, node_mask, y_condition
+        )
+
+        # evaluate the loss especially in the inference stage
+        loss = self.train_loss(
+            masked_pred_X=pred.X,
+            masked_pred_E=pred.E,
+            pred_y=pred.y,
+            true_X=X,
+            true_E=E,
+            true_y=other_data["y"],
+        )
+
+        batch_length = other_data["y"].shape[0]
+        conditionAll = other_data["conditionVec"]
+        conditionAll = conditionAll.reshape(batch_length, self.vocabDim)
+
+        nll = scheduling_diffnmr.compute_val_loss(
+            self,
+            pred,
+            noisy_data,
+            dense_data.X,
+            dense_data.E,
+            other_data["y"],
+            node_mask,
+            condition=conditionAll,
+            test=False,
+        )
+        loss["nll"] = nll
+
+        # save the data for visualization
+        self.val_y_collection.append(other_data["conditionVec"])
+        self.val_atomCount.append(paddle.to_tensor(other_data["atom_count"]))
+        self.val_data_X.append(X)
+        self.val_data_E.append(E)
+
+        return loss
+
+
+# DiffNMR_v2
 class DiffPrior(nn.Layer):
     def __init__(
         self,
-        config,
-        model: nn.Layer,
+        sample_cfg: dict,
+        connector_cfg: dict,
         clip: nn.Layer,
-        graph_embed_scale=None,
-        timesteps: int = 1000,
-        cond_drop_prob: float = 0.0,
-        condition_on_text_encodings: bool = True,
     ):
         super().__init__()
 
-        self.config = config
-        self.model = model
         self.clip = clip
-
-        self.sample_timesteps = default(config["sample_timesteps"], timesteps)
+        self.timesteps = sample_cfg["timesteps"] # TODO: check
+        self.sample_timesteps = default(sample_cfg["sample_timesteps"], self.timesteps)
         self.noise_scheduler = NoiseScheduler(
-            beta_schedule=config["beta_schedule"],
-            timesteps=config["timesteps"],
-            loss_type=config["loss_type"],
+            beta_schedule=sample_cfg["beta_schedule"],
+            timesteps=sample_cfg["timesteps"],
+            loss_type=sample_cfg["loss_type"],
         )
         if exists(clip):
             freeze_model_and_make_eval_(clip)
             self.clip = clip
         else:
             self.clip = None
-        self.net = model
+        self.net = DiffPriorNetwork(**connector_cfg)
         self.graph_embed_dim = default(
-            config["graph_embed_dim"], lambda: clip.dim_latent
+            sample_cfg["graph_embed_dim"], lambda: clip.dim_latent
         )
 
         assert (
-            model.dim == self.graph_embed_dim
-        ), f"your diffusion prior network has a dimension of {model.dim}, \
+            self.net.dim == self.graph_embed_dim
+        ), f"your diffusion prior network has a dimension of {self.net.dim}, \
             but you set your image embedding dimension (keyword graph_embed_dim) \
             on DiffPrior to {self.graph_embed_dim}"
         assert (
@@ -472,33 +870,33 @@ class DiffPrior(nn.Layer):
             (keyword graph_embed_dim) for the DiffPrior was set \
             to {self.graph_embed_dim}"
 
-        self.cond_drop_prob = default(config["cond_drop_prob"], cond_drop_prob)
+        self.cond_drop_prob = default(sample_cfg["cond_drop_prob"], 0.0)
         self.text_cond_drop_prob = default(
-            config["text_cond_drop_prob"], self.cond_drop_prob
+            sample_cfg["text_cond_drop_prob"], self.cond_drop_prob
         )
         self.graph_cond_drop_prob = default(
-            config["graph_cond_drop_prob"], self.cond_drop_prob
+            sample_cfg["graph_cond_drop_prob"], self.cond_drop_prob
         )
 
         self.can_classifier_guidance = (
             self.text_cond_drop_prob > 0.0 and self.graph_cond_drop_prob > 0.0
         )
         self.condition_on_text_encodings = default(
-            config["condition_on_text_encodings"], condition_on_text_encodings
+            sample_cfg["condition_on_text_encodings"], True
         )
 
-        self.predict_x_start = config["predict_x_start"]
-        self.predict_v = config["predict_v"]
+        self.predict_x_start = sample_cfg["predict_x_start"]
+        self.predict_v = sample_cfg["predict_v"]
 
         self.graph_embed_scale = default(
-            graph_embed_scale, config["graph_embed_dim"] ** 0.5
+            sample_cfg["graph_embed_scale"], sample_cfg["graph_embed_dim"] ** 0.5
         )
 
-        self.sampling_clamp_l2norm = config["sampling_clamp_l2norm"]
-        self.sampling_final_clamp_l2norm = config["sampling_final_clamp_l2norm"]
+        self.sampling_clamp_l2norm = sample_cfg["sampling_clamp_l2norm"]
+        self.sampling_final_clamp_l2norm = sample_cfg["sampling_final_clamp_l2norm"]
 
-        self.training_clamp_l2norm = config["training_clamp_l2norm"]
-        self.init_graph_embed_l2norm = config["init_graph_embed_l2norm"]
+        self.training_clamp_l2norm = sample_cfg["training_clamp_l2norm"]
+        self.init_graph_embed_l2norm = sample_cfg["init_graph_embed_l2norm"]
 
         # TODO: maybe could remove this dummy buffer
         self.register_buffer(
@@ -560,7 +958,7 @@ class DiffPrior(nn.Layer):
         if batch_graph.edges.T.numel() == 0:
             print("Found a batch with no edges. Skipping.")
             return None
-        dense_data, node_mask = utils.to_dense(
+        dense_data, node_mask = diffgraphformer_utils.to_dense(
             batch_graph.node_feat["feat"],
             batch_graph.edges.T.contiguous(),
             batch_graph.edge_feat["feat"],
@@ -846,422 +1244,3 @@ class DiffPrior(nn.Layer):
             posterior_log_variance,
         ) = self.noise_scheduler.q_posterior(x_start=x_start, x_t=x, t=t)
         return model_mean, posterior_variance, posterior_log_variance, x_start
-
-class DiffNMR(nn.Layer):
-    def __init__(
-        self,
-        config,
-        dataset_infos,
-        train_metrics,
-        sampling_metrics,
-        visualization_tools,
-        extra_features,
-        domain_features,
-    ) -> None:
-        super().__init__()
-
-        self.name = config["__name__"]
-        self.model_dtype = paddle.get_default_dtype()
-        self.T = config["graph_decoder"]["diffusion_model"]["diffusion_steps"]
-        self.visualization_tools = visualization_tools
-
-        input_dims = dataset_infos.input_dims
-        output_dims = dataset_infos.output_dims
-        self.dataset_info = dataset_infos
-        self.extra_features = extra_features
-        self.domain_features = domain_features
-
-        self.noise_schedule = PredefinedNoiseScheduleDiscrete(
-            config["graph_decoder"]["diffusion_model"]["diffusion_noise_schedule"],
-            timesteps=self.T,
-        )
-
-        self.add_condition = True  # TODO revise it later
-
-        # set nmr encoder model
-        if config.get("onlyH", False):
-            self.flag_onlyH = True
-            self.encoder = NMR_encoder_H(
-                dim_H=config["nmr_encoder"]["dim_enc_H"],
-                dimff_H=config["nmr_encoder"]["dimff_enc_H"],
-                dim_C=config["nmr_encoder"]["dim_enc_C"],
-                dimff_C=config["nmr_encoder"]["dimff_enc_C"],
-                hidden_dim=config["nmr_encoder"]["ffn_hidden"],
-                n_head=config["nmr_encoder"]["n_head"],
-                num_layers=config["nmr_encoder"]["n_layers"],
-                drop_prob=config["nmr_encoder"]["drop_prob"],
-                peakwidthemb_num=config["nmr_encoder"]["peakwidthemb_num"],
-                integralemb_num=config["nmr_encoder"]["integralemb_num"],
-            )
-        else:
-            self.flag_onlyH = False
-            self.encoder = NMR_encoder(
-                dim_H=config["nmr_encoder"]["dim_enc_H"],
-                dimff_H=config["nmr_encoder"]["dimff_enc_H"],
-                dim_C=config["nmr_encoder"]["dim_enc_C"],
-                dimff_C=config["nmr_encoder"]["dimff_enc_C"],
-                hidden_dim=config["nmr_encoder"]["ffn_hidden"],
-                n_head=config["nmr_encoder"]["n_head"],
-                num_layers=config["nmr_encoder"]["n_layers"],
-                drop_prob=config["nmr_encoder"]["drop_prob"],
-                peakwidthemb_num=config["nmr_encoder"]["peakwidthemb_num"],
-                integralemb_num=config["nmr_encoder"]["integralemb_num"],
-            )
-        
-        # load nmr encoder model from pretrained model
-        state_dict = paddle.load(config["nmr_encoder"]["pretrained_path"])
-        prefixes = ("spectrum_encoder.", "encoder.")
-        encoder_state_dict = {
-            k[len(pref):]: v
-            for k, v in state_dict.items()
-            for pref in prefixes
-            if k.startswith(pref)
-        }
-        self.encoder.set_state_dict(encoder_state_dict)
-
-        # set graph decoder model
-        self.decoder = GraphTransformer(
-            n_layers=config["graph_decoder"]["num_layers"],
-            input_dims=input_dims,
-            hidden_mlp_dims=config["graph_decoder"]["hidden_mlp_dims"],
-            hidden_dims=config["graph_decoder"]["hidden_dims"],
-            output_dims=output_dims,
-            act_fn_in=nn.ReLU(),
-            act_fn_out=nn.ReLU(),
-        )
-        # load graph decoder model from pretrained model
-        state_dict = paddle.load(config["graph_decoder"]["pretrained_path"])
-        decoder_state_dict = {
-            k[len("decoder.") :]: v
-            for k, v in state_dict.items()
-            if k.startswith("decoder.")
-        }
-        self.decoder.set_state_dict(decoder_state_dict)
-
-        # set connector model
-        self.connector_flag = False
-        if config.get("connector") and config["connector"]["__name__"] == "DiffPrior":
-            self.connector_flag = True
-            self.connector = DiffPriorModel(
-                config=config["connector"],
-                model=DiffPriorNetwork(
-                    dim=config["connector"]["prior_network"]["dim"],
-                    num_timesteps=config["connector"]["prior_network"]["num_timesteps"],
-                    num_time_embeds=config["connector"]["prior_network"][
-                        "num_time_embeds"
-                    ],
-                    num_graph_embeds=config["connector"]["prior_network"][
-                        "num_graph_embeds"
-                    ],
-                    num_text_embeds=config["connector"]["prior_network"][
-                        "num_text_embeds"
-                    ],
-                    max_text_len=config["connector"]["prior_network"]["max_text_len"],
-                    self_cond=config["connector"]["prior_network"]["self_cond"],
-                    depth=config["connector"]["prior_network"]["depth"],
-                    dim_head=config["connector"]["prior_network"]["dim_head"],
-                    heads=config["connector"]["prior_network"]["heads"],
-                ),
-                clip=NMRNetCLIP(**config["clip"]),
-            )
-            state_dict = paddle.load(config["connector"]["pretrained_path"])
-            connector_state_dict = {
-                k[len("connector.") :]: v
-                for k, v in state_dict.items()
-                if k.startswith("connector.")
-            }
-            self.connector.set_state_dict(connector_state_dict)
-        else:
-            self.connector = nn.Identity()
-
-        self.Xdim = input_dims["X"]
-        self.Edim = input_dims["E"]
-        self.ydim = input_dims["y"]
-        self.Xdim_output = output_dims["X"]
-        self.Edim_output = output_dims["E"]
-        self.ydim_output = output_dims["y"]
-        self.node_dist = dataset_infos.nodes_dist
-
-        # Transition Model
-        if config["graph_decoder"]["diffusion_model"]["transition"] == "uniform":
-            self.transition_model = DiscreteUniformTransition(
-                x_classes=self.Xdim_output,
-                e_classes=self.Edim_output,
-                y_classes=self.ydim_output,
-            )
-            x_limit = paddle.ones([self.Xdim_output]) / self.Xdim_output
-            e_limit = paddle.ones([self.Edim_output]) / self.Edim_output
-            y_limit = paddle.ones([self.ydim_output]) / self.ydim_output
-            self.limit_dist = utils.PlaceHolder(X=x_limit, E=e_limit, y=y_limit)
-
-        elif config["graph_decoder"]["diffusion_model"]["transition"] == "marginal":
-            node_types = self.dataset_info.node_types.astype(self.model_dtype)
-            x_marginals = node_types / paddle.sum(node_types)
-
-            edge_types = self.dataset_info.edge_types.astype(self.model_dtype)
-            e_marginals = edge_types / paddle.sum(edge_types)
-            logger.info(
-                f"Marginal distribution of classes: {x_marginals.tolist()} for nodes, "
-            )
-            logger.info(f"{e_marginals.tolist()} for edges")
-
-            self.transition_model = MarginalUniformTransition(
-                x_marginals=x_marginals,
-                e_marginals=e_marginals,
-                y_classes=self.ydim_output,
-            )
-            self.limit_dist = utils.PlaceHolder(
-                X=x_marginals,
-                E=e_marginals,
-                y=paddle.ones([self.ydim_output]) / self.ydim_output,
-            )
-
-        self.train_loss = TrainLossDiscrete(
-            config["graph_decoder"]["diffusion_model"]["lambda_train"]
-        )
-
-        self.best_val_nll = 1e8
-        self.val_counter = 0
-        self.vocabDim = config["graph_decoder"]["vocab_dim"]
-
-        self.val_nll = NLL()
-        self.val_X_kl = SumExceptBatchKL()
-        self.val_E_kl = SumExceptBatchKL()
-        self.val_X_logp = SumExceptBatchMetric()
-        self.val_E_logp = SumExceptBatchMetric()
-
-        self.test_nll = NLL()
-        self.test_X_kl = SumExceptBatchKL()
-        self.test_E_kl = SumExceptBatchKL()
-        self.test_X_logp = SumExceptBatchMetric()
-        self.test_E_logp = SumExceptBatchMetric()
-
-        self.train_metrics = train_metrics
-        self.sampling_metrics = sampling_metrics
-
-        self.seq_len_H1 = config["nmr_encoder"]["seq_len_H1"]  # TODO remove later
-        self.seq_len_C13 = config["nmr_encoder"]["seq_len_C13"]  # TODO remove later
-        self.tem = 2  # TODO remove later
-        
-        # set use formula for training and sample or not
-        self.flag_use_formula = config.get("flag_use_formula", False)
-
-    def preprocess_data(self, batch_graph, other_data):
-        dense_data, node_mask = utils.to_dense(
-            batch_graph.node_feat["feat"],
-            batch_graph.edges.T,
-            batch_graph.edge_feat["feat"],
-            batch_graph.graph_node_id,
-        )
-        dense_data = dense_data.mask(node_mask)
-
-        # add noise to the inputs (X, E)
-        noisy_data = m_utils.apply_noise(
-            self, dense_data.X, dense_data.E, other_data["y"], node_mask, self.flag_use_formula
-        )
-        extra_data = m_utils.compute_extra_data(self, noisy_data)
-
-        # concate data
-        input_X = paddle.concat(
-            [noisy_data["X_t"].astype("float32"), extra_data.X], axis=2
-        ).astype(dtype="float32")
-        input_E = paddle.concat(
-            [noisy_data["E_t"].astype("float32"), extra_data.E], axis=3
-        ).astype(dtype="float32")
-        input_y = paddle.hstack(
-            [noisy_data["y_t"].astype("float32"), extra_data.y]
-        ).astype(dtype="float32")
-
-        batch_length = batch_graph.num_graph
-        condition_H1nmr = other_data["conditionVec"]["H_nmr"]
-        condition_H1nmr = condition_H1nmr.reshape(batch_length, self.seq_len_H1, -1)
-        condition_C13nmr = other_data["conditionVec"]["C_nmr"]
-        condition_C13nmr = condition_C13nmr.reshape(batch_length, self.seq_len_C13)
-        num_H_peak = other_data["conditionVec"]["num_H_peak"]
-        num_C_peak = other_data["conditionVec"]["num_C_peak"]
-        conditionAll = [condition_H1nmr, num_H_peak, condition_C13nmr, num_C_peak]
-
-        return (
-            dense_data,
-            noisy_data,
-            node_mask,
-            extra_data,
-            input_X,
-            input_E,
-            input_y,
-            conditionAll,
-        )
-
-    def make_src_mask(self, src):
-        src_mask = (src != 0).unsqueeze(1).unsqueeze(2)
-        return src_mask
-
-    def forward_MultiModalModel(self, X, E, y, node_mask, condition):
-        if self.connector_flag is True:
-            with paddle.no_grad():
-                conditionVec = self.connector.sample(condition)  # , srcMask)
-        else:
-            if self.flag_onlyH == True:
-                global_H, global_C = self.encoder(condition)
-                conditionVec = global_H
-            else:
-                conditionVec = self.encoder(condition)
-            # conditionVec = conditionVec.reshape([conditionVec.shape[0], -1])
-
-        y = paddle.concat([y, conditionVec], axis=1).astype("float32")
-
-        output = self.decoder(X, E, y, node_mask)
-        return output
-
-    def forward(self, batch, mode="train"):
-        batch_graph, other_data = batch
-
-        # transfer to dense graph from sparse graph
-        if batch_graph.edges.T.numel() == 0:
-            print("Found a batch with no edges. Skipping.")
-            return None
-
-        # process data
-        (
-            dense_data,
-            noisy_data,
-            node_mask,
-            extra_data,
-            input_X,
-            input_E,
-            input_y,
-            conditionAll,
-        ) = self.preprocess_data(batch_graph, other_data)
-        X, E = dense_data.X, dense_data.E
-
-        # set condition
-        if self.add_condition:
-            conditionVec = conditionAll
-        else:
-            conditionVec = paddle.zeros(shape=[X.shape[0], 1024]).cuda(blocking=True)
-
-        # forward of the model
-        pred = self.forward_MultiModalModel(
-            input_X, input_E, input_y, node_mask, conditionVec
-        )
-
-        # compute loss
-        loss = self.train_loss(
-            masked_pred_X=pred.X,
-            masked_pred_E=pred.E,
-            pred_y=pred.y,
-            true_X=X,
-            true_E=E,
-            true_y=other_data["y"],
-        )
-
-        # compute metrics
-        if mode == "train":
-            metrics = self.train_metrics(
-                masked_pred_X=pred.X,
-                masked_pred_E=pred.E,
-                true_X=X,
-                true_E=E,
-                log=True,
-            )
-
-        elif mode == "eval":
-            # batch_length = other_data["y"].shape[0]
-            # conditionAll = other_data["conditionVec"]
-            # conditionAll = conditionAll.reshape(batch_length, self.vocabDim)
-            nll = m_utils.compute_val_loss(
-                self,
-                pred,
-                noisy_data,
-                dense_data.X,
-                dense_data.E,
-                other_data["y"],
-                node_mask,
-                condition=conditionVec,
-                test=False,
-            )
-            loss["nll"] = nll
-
-            # comput eval epoch metric info
-            metrics = {
-                "val_nll": self.val_nll.accumulate(),
-                "val_X_kl": self.val_X_kl.accumulate() * self.T,
-                "val_E_kl": self.val_E_kl.accumulate() * self.T,
-                "val_X_logp": self.val_X_logp.accumulate(),
-                "val_E_logp": self.val_E_logp.accumulate(),
-            }
-            val_nll = metrics["val_nll"]
-            if val_nll < self.best_val_nll:
-                self.best_val_nll = val_nll
-                metrics["best_val_nll"] = self.best_val_nll
-
-        return loss, metrics
-
-    @paddle.no_grad()
-    def sample(self, batch, i):
-        batch_graph, other_data = batch
-
-        # transfer to dense graph from sparse graph
-        if batch_graph.edges.T.numel() == 0:
-            print("Found a batch with no edges. Skipping.")
-            return None
-
-        # process data
-        (
-            dense_data,
-            noisy_data,
-            node_mask,
-            extra_data,
-            input_X,
-            input_E,
-            input_y,
-        ) = self.preprocess_data(batch_graph, other_data)
-        X, E = dense_data.X, dense_data.E
-
-        # set condition
-        if self.add_condition:
-            batch_length = X.shape[0]
-            conditionVec = other_data["conditionVec"]
-            y_condition = conditionVec.reshape(batch_length, self.vocabDim)
-        else:
-            y_condition = paddle.zeros(shape=[X.shape[0], 1024]).cuda(blocking=True)
-
-        # forward of the model
-        pred = self.forward_MultiModalModel(
-            input_X, input_E, input_y, node_mask, y_condition
-        )
-
-        # evaluate the loss especially in the inference stage
-        loss = self.train_loss(
-            masked_pred_X=pred.X,
-            masked_pred_E=pred.E,
-            pred_y=pred.y,
-            true_X=X,
-            true_E=E,
-            true_y=other_data["y"],
-        )
-
-        batch_length = other_data["y"].shape[0]
-        conditionAll = other_data["conditionVec"]
-        conditionAll = conditionAll.reshape(batch_length, self.vocabDim)
-
-        nll = m_utils.compute_val_loss(
-            self,
-            pred,
-            noisy_data,
-            dense_data.X,
-            dense_data.E,
-            other_data["y"],
-            node_mask,
-            condition=conditionAll,
-            test=False,
-        )
-        loss["nll"] = nll
-
-        # save the data for visualization
-        self.val_y_collection.append(other_data["conditionVec"])
-        self.val_atomCount.append(paddle.to_tensor(other_data["atom_count"]))
-        self.val_data_X.append(X)
-        self.val_data_E.append(E)
-
-        return loss

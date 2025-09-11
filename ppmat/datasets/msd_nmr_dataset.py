@@ -470,9 +470,13 @@ class MSDnmrDataset(Dataset):
         # get property-like data "y"
         if self.properties is not None:
             property = self.properties[idx]
+            atom_count = self.raw_data["atom_count"][idx]
             if isinstance(property, str):
                 property = self.load_from_cache(property)
-            data["property"] = property
+            data["property"] = {
+                'y':property, 
+                'atom_count': atom_count,
+            }
         
         # data = self.transforms(data) if self.transforms is not None else data
 
@@ -1264,7 +1268,7 @@ class MSDnmrinfos:
         self.input_dims = {
             "X": graph.node_feat["feat"].shape[1],
             "E": graph.edge_feat["feat"].shape[1],
-            "y": property.shape[1] + 1,
+            "y": property['y'].shape[1] + 1,
         }  # + 1 due to time conditioning
         ex_extra_feat = extra_features(example_data)
         self.input_dims["X"] += ex_extra_feat.X.shape[-1]

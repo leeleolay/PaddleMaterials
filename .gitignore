@@ -168,3 +168,6 @@ legacy/
 jointContribution/
 pretrained/
 result*
+spectrum_elucidation/retrival_database
+test/samplers
+outputs

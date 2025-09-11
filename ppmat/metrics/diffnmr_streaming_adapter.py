@@ -17,7 +17,8 @@ from typing import Any, Dict, Optional
 import paddle
 from ppmat.metrics.streaming_base import StreamingMetricBase
 from ppmat.metrics.diffnmr_metric import DiffNMRMetric
-from ppmat.models.diffnmr.utils import model_utils as m_utils
+from ppmat.metrics.diffnmr_metric import SamplingMolecularMetrics
+from ppmat.schedulers import scheduling_diffnmr
 
 
 class DiffNMRStreamingAdapter(StreamingMetricBase):
@@ -32,6 +33,11 @@ class DiffNMRStreamingAdapter(StreamingMetricBase):
 
     Train: accumulates CE/Top-k via DiffNMRMetric (no logging noise).
     Eval : accumulates NLL (and KL/logp if compute_val_loss supports it).
+    Sample : 
+        exact SMILES match accuracy
+        RDKit quality metrics (Validity/Uniqueness/Novelty/ConnComp + stats)
+        Histogram MAE on n-nodes / atom-types / bond-types / valency
+        Optional retrieval top-k (molVec-nmrVec), with CSV similarity dump
     """
 
     def __init__(
@@ -44,6 +50,8 @@ class DiffNMRStreamingAdapter(StreamingMetricBase):
         self.train_core = DiffNMRMetric(mode="train", dataset_infos=dataset_infos)
         self.model: Optional[paddle.nn.Layer] = None
         self.eval_acc = EvalAccumulator()
+        self.sample_core = None
+        self.reset()
 
     # ---- lifecycle ----
     def bind(self, **runtime_objs):
@@ -55,11 +63,25 @@ class DiffNMRStreamingAdapter(StreamingMetricBase):
                 self.train_core.bind(**{k: v for k, v in runtime_objs.items() if k != "model"})
             except TypeError:
                 pass
+        clip = runtime_objs.get("clip", None)
+        train_smiles = runtime_objs.get("train_smiles", [])
+        num_candidate = runtime_objs.get("num_candidate", 1)
+        dataset_infos = runtime_objs.get("dataset_infos", None)
+        if self.sample_core is None and dataset_infos is not None:
+            self.sample_core = SamplingMolecularMetrics(
+                dataset_infos=dataset_infos,
+                train_smiles=train_smiles,
+                clip=clip,
+                num_candidate=num_candidate,
+            )
 
     def reset(self):
         if hasattr(self.train_core, "reset"):
             self.train_core.reset()
         self.eval_acc.reset()
+        self._right, self._total = 0, 0
+        if self.sample_core is not None:
+            self.sample_core.reset()
 
     # ---- streaming entrypoints ----
     def update_step(self, *, result: Dict[str, Any], batch: Any, stage: str):
@@ -67,12 +89,17 @@ class DiffNMRStreamingAdapter(StreamingMetricBase):
             self._update_train(result, batch)
         elif stage == "eval":
             self._update_eval(result, batch)
+        elif stage == "sample":
+            self._update_sample(result, batch)
+            
 
     def compute_epoch(self, *, stage: str) -> Dict[str, float]:
         if stage == "train":
             return self._finalize_train()
         if stage == "eval":
             return self.eval_acc.finalize()
+        if stage == "sample":
+            return self._finalize_sample()
         return {}
 
     # ---- train path ----
@@ -104,6 +131,18 @@ class DiffNMRStreamingAdapter(StreamingMetricBase):
         if hasattr(self.train_core, "reset"):
             self.train_core.reset()
         return out
+    
+    def _finalize_sample(self) -> Dict[str, float]:
+        if self._total == 0:
+            return {}
+        # out = {
+        #     "Accuracy": self._right / float(self._total),
+        #     "basic_metrics/n_mae":       float(self.sample_core.mae_n.accumulate()),
+        #     "basic_metrics/node_mae":    float(self.sample_core.mae_nodes.accumulate()),
+        #     "basic_metrics/edge_mae":    float(self.sample_core.mae_edges.accumulate()),
+        #     "basic_metrics/valency_mae": float(self.sample_core.mae_val.accumulate()),
+        # }
+        return self.sample_metric_dict
 
     # ---- eval path ----
     def _update_eval(self, result: Dict[str, Any], batch: Any):
@@ -130,7 +169,7 @@ class DiffNMRStreamingAdapter(StreamingMetricBase):
         noisy = result.get("noisy_data", None)
         if noisy is None:
             flag = bool(getattr(self.model, "flag_use_formula", False))
-            noisy = m_utils.apply_noise(self.model, true_X, true_E, true_y, node_mask, flag)
+            noisy = scheduling_diffnmr.apply_noise(self.model, true_X, true_E, true_y, node_mask, flag)
 
         # Pack predictions to match compute_val_loss signature
         Pred = type("Pred", (), {})
@@ -138,15 +177,21 @@ class DiffNMRStreamingAdapter(StreamingMetricBase):
         pred_obj.X, pred_obj.E, pred_obj.y = pred_X, pred_E, pred_y
 
         # Try to get detailed terms if supported; fallback to scalar
+        batch_spectrum = batch["spectrum"]
+        condition_H1nmr = paddle.to_tensor(batch_spectrum["H_nmr"])
+        condition_C13nmr = paddle.to_tensor(batch_spectrum["C_nmr"])
+        num_H_peak = paddle.to_tensor(batch_spectrum["num_H_peak"])
+        num_C_peak = paddle.to_tensor(batch_spectrum["num_C_peak"])
+        condition_Spectrum = [condition_H1nmr, num_H_peak, condition_C13nmr, num_C_peak]
         try:
-            terms = m_utils.compute_val_loss(
+            terms = scheduling_diffnmr.compute_val_loss(
                 self.model, pred_obj, noisy, true_X, true_E, true_y, node_mask,
-                condition=[],  # put your condition vector here if you have one
+                condition=condition_Spectrum,  # put your condition vector here if you have one
                 return_terms=True,    # or True in test mode
             )
         except TypeError:
             # Older signature without 'test' or different arg order
-            terms = m_utils.compute_val_loss(
+            terms = scheduling_diffnmr.compute_val_loss(
                 self.model, pred_obj, noisy, true_X, true_E, true_y, node_mask, []
             )
 
@@ -160,6 +205,18 @@ class DiffNMRStreamingAdapter(StreamingMetricBase):
         else:
             self.eval_acc.add(key="val_nll", value=terms, batch_size=B, scale=self.t_scale)
 
+    def _update_sample(self, result: Dict[str, Any], batch: Any):
+        if self.sample_core is None:
+            return
+        self.sample_metric_dict = self.sample_core(
+            samples=result["samples"],
+            current_epoch=result.get("epoch_id", 0),
+            local_rank=result.get("local_rank", 0),
+            output_dir=result.get("output_dir", "."),
+            flag_test=False,
+        )
+        self._right += int(self.sample_metric_dict.get("Right Number", 0))
+        self._total += int(self.sample_metric_dict.get("Total Number", 0))
 
 # -------------------------
 # small helpers / accumulator

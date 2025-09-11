@@ -14,7 +14,7 @@
 
 import argparse
 
-from ppmat.sampler.base_sampler import BaseSampler
+from ppmat.sampler.base_sampler import MolecularSampler
 
 from ppmat.utils import logger
 
@@ -42,10 +42,6 @@ if __name__ == "__main__":
         help="Path to the checkpoint file.",
     )
     argparse.add_argument("--save_path", type=str, default="results")
-    argparse.add_argument("--flag_retrival_initilization", type=bool, default="False")
-    argparse.add_argument("--flag_use_formula", type=bool, default="False")
-    argparse.add_argument("--flag_retrival_sampling", type=bool, default="False")
-    argparse.add_argument("--num_candidates", type=int, default=20)
     argparse.add_argument(
         "--mode",
         type=str,
@@ -58,7 +54,7 @@ if __name__ == "__main__":
 
     args = argparse.parse_args()
 
-    sampler = BaseSampler(
+    sampler = MolecularSampler(
         model_name=args.model_name,
         weights_name=args.weights_name,
         config_path=args.config_path,
@@ -67,20 +63,12 @@ if __name__ == "__main__":
     if args.mode == "compute_metric":
         metric_result = sampler.compute_metric(
             save_path=args.save_path,
-            flag_retrival_initilization=args.flag_retrival_initilization,
-            flag_use_formula=args.flag_use_formula,
-            flag_retrival_sampling=args.flag_retrival_sampling,
-            num_candidates=args.num_candidates,
         )
         for metric_name, metric_value in metric_result.items():
             logger.info(f"{metric_name}: {metric_value}")
     elif args.mode == "by_dataloader":
         result = sampler.sample_by_dataloader(
             save_path=args.save_path,
-            flag_retrival_initilization=args.flag_retrival_initilization,
-            flag_use_formula=args.flag_use_formula,
-            flag_retrival_sampling=args.flag_retrival_sampling,
-            num_candidates=args.num_candidates,
         )
     else:
         raise ValueError(f"Unknown mode: {args.mode}")

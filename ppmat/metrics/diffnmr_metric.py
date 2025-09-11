@@ -299,7 +299,7 @@ from rdkit import Chem
 from rdkit.Chem import DataStructs, RDKFingerprint
 
 from ppmat.utils.ext_rdkit import compute_molecular_metrics
-from ppmat.models.diffnmr.utils import model_utils as m_utils
+from ppmat.schedulers import scheduling_diffnmr
 from ppmat.models.diffnmr.utils import diffgraphformer_utils as utils
 
 
@@ -431,7 +431,7 @@ class SamplingMolecularMetrics(nn.Layer):
       1) exact SMILES match accuracy
       2) RDKit quality metrics (Validity/Uniqueness/Novelty/ConnComp + stats)
       3) Histogram MAE on n-nodes / atom-types / bond-types / valency
-      4) Optional retrieval top-k (molVec-nmrVec), with CSV similarity dump.
+      4) Optional retrieval top-k (molVec-spectrumVec), with CSV similarity dump.
     """
     def __init__(self, dataset_infos: Any, train_smiles: List[str],
                  clip: Optional[nn.Layer] = None, num_candidate: int = 1):
@@ -442,7 +442,7 @@ class SamplingMolecularMetrics(nn.Layer):
         self.atom_decoder = dataset_infos.atom_decoder
         if clip:
             self.clip = clip
-            self.nmrVec = clip.text_encoder
+            self.spectrumVec = clip.spectrum_encoder
             self.molVec = clip.graph_encoder
 
         # target histograms
@@ -472,8 +472,8 @@ class SamplingMolecularMetrics(nn.Layer):
         # 1) exact match
         hit = 0
         for p, t in zip(pred, true):
-            mg  = m_utils.mol_from_graphs(self.atom_decoder, *p)
-            mt  = m_utils.mol_from_graphs(self.atom_decoder, *t)
+            mg  = scheduling_diffnmr.mol_from_graphs(self.atom_decoder, *p)
+            mt  = scheduling_diffnmr.mol_from_graphs(self.atom_decoder, *t)
             if Chem.MolToSmiles(mg, True) == Chem.MolToSmiles(mt, True):
                 hit += 1
         to_log.update({"Accuracy": hit / total, "Right Number": hit, "Total Number": total})
@@ -512,7 +512,7 @@ class SamplingMolecularMetrics(nn.Layer):
             to_log[f"molecular_metrics/valency_{k}_dist"] = float((g_val[k] - self.target_val[k]).item())
 
         # 5) retrieval top-k (optional)
-        if "candidates" in samples:
+        if "candidates" in samples and samples["batch_condition"] is None:
             to_log.update(self._retrieval_metrics(samples, output_dir, current_epoch, local_rank, verbose=log_each_molecule))
 
         # 6) dump SMILES
@@ -545,7 +545,7 @@ class SamplingMolecularMetrics(nn.Layer):
 
         with paddle.no_grad():
             # text/NMR embedding once
-            nmr_emb = self.nmrVec(cond_y)  # [B, d]
+            nmr_emb = self.spectrumVec(cond_y)  # [B, d]
             # flatten candidates
             X_flat = cand_X.reshape([C * B, *cand_X.shape[2:]])     # [C·B,n_max,d_x]
             E_flat = cand_E.reshape([C * B, *cand_E.shape[2:]])     # [C·B,n_max,n_max,d_e]
@@ -554,7 +554,7 @@ class SamplingMolecularMetrics(nn.Layer):
 
             z_t = (utils.PlaceHolder(X=X_flat, E=E_flat, y=y_flat).type_as(X_flat).mask(node_mask_flat))
 
-            extra = m_utils.compute_extra_data(
+            extra = scheduling_diffnmr.compute_extra_data(
                 self.clip,
                 {"X_t": z_t.X, "E_t": z_t.E, "y_t": z_t.y, "node_mask": node_mask_flat},
                 isPure=True,
@@ -575,22 +575,22 @@ class SamplingMolecularMetrics(nn.Layer):
         csv_records: List[Dict[str, str]] = []
 
         for i in range(B):
-            m_true = m_utils.mol_from_graphs(self.atom_decoder, *true_list[i])
+            m_true = scheduling_diffnmr.mol_from_graphs(self.atom_decoder, *true_list[i])
             s_true = Chem.MolToSmiles(m_true, True)
 
             # top-1
             sel = int(max_idx[i])
-            m_pred = m_utils.mol_from_graphs(self.atom_decoder, *cand_lists[sel][i])
+            m_pred = scheduling_diffnmr.mol_from_graphs(self.atom_decoder, *cand_lists[sel][i])
             s_pred = Chem.MolToSmiles(m_pred, True)
             if s_pred == s_true:
                 hit1 += 1
 
             # top-5 / top-10
             for sel in top5_idx[:, i].astype("int64").tolist():
-                if Chem.MolToSmiles(m_utils.mol_from_graphs(self.atom_decoder, *cand_lists[sel][i]), True) == s_true:
+                if Chem.MolToSmiles(scheduling_diffnmr.mol_from_graphs(self.atom_decoder, *cand_lists[sel][i]), True) == s_true:
                     hit5 += 1; break
             for sel in top10_idx[:, i].astype("int64").tolist():
-                if Chem.MolToSmiles(m_utils.mol_from_graphs(self.atom_decoder, *cand_lists[sel][i]), True) == s_true:
+                if Chem.MolToSmiles(scheduling_diffnmr.mol_from_graphs(self.atom_decoder, *cand_lists[sel][i]), True) == s_true:
                     hit10 += 1; break
 
             # fingerprint sim for top-1

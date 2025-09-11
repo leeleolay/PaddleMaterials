@@ -996,13 +996,10 @@ class BaseTrainer:
 
     def _update_streaming_metrics(self, *, result, batch, stage: str):
         # Generic step hook: update if the metric exposes it; skip otherwise.
-        for name, m in self.metric_modules.items():
+        for _, m in self.metric_modules.items():
             if hasattr(m, "update_step"):
-                try:
-                    m.update_step(result=result, batch=batch, stage=stage)
-                except Exception as e:
-                    # Do not break training on errors—this enables gradual/incremental adoption.
-                    logger.debug(f"[metric:{name}] update_step skipped: {e}")
+                m.update_step(result=result, batch=batch, stage=stage)
+                
 
     def _compute_streaming_metrics(self, *, stage: str) -> Dict[str, float]:
         # Generic epoch hook: aggregate all registered streaming metrics.

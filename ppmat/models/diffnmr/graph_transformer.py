@@ -1,15 +1,25 @@
+# Copyright (c) 2025 PaddlePaddle Authors. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import math
 
 import paddle
 import paddle.nn as nn
 from paddle.nn import functional as F
 
-from ppmat.models.diffnmr import diffusion_utils
-from ppmat.models.diffnmr.layer import Etoy
-from ppmat.models.diffnmr.layer import Xtoy
-from ppmat.models.diffnmr.layer import masked_softmax
-
-from .utils import diffgraphformer_utils as utils
+from ppmat.schedulers import scheduling_diffnmr
+from ppmat.models.diffnmr.utils import diffgraphformer_utils
 
 
 class GraphTransformer(nn.Layer):
@@ -101,7 +111,7 @@ class GraphTransformer(nn.Layer):
 
     def mlp_with_empty(self, x):
         new_shape = x.shape[:-1] + [0]
-        res = utils.return_empty(x, shape=new_shape)
+        res = diffgraphformer_utils.return_empty(x, shape=new_shape)
         return res
 
     def forward(self, X, E, y, node_mask):
@@ -120,7 +130,7 @@ class GraphTransformer(nn.Layer):
         X = self.mlp_in_X(X)
         y = self.mlp_in_y(y)
 
-        after_in = utils.PlaceHolder(X, E=new_E, y=y).mask(node_mask)
+        after_in = diffgraphformer_utils.PlaceHolder(X, E=new_E, y=y).mask(node_mask)
         X, E, y = after_in.X, after_in.E, after_in.y
 
         # Transformer layers
@@ -139,7 +149,7 @@ class GraphTransformer(nn.Layer):
         # Symmetrize E
         E = 0.5 * (E + paddle.transpose(E, perm=[0, 2, 1, 3]))
 
-        return utils.PlaceHolder(X=X, E=E, y=y).mask(node_mask)
+        return diffgraphformer_utils.PlaceHolder(X=X, E=E, y=y).mask(node_mask)
 
 
 class MolecularEncoder(nn.Layer):
@@ -229,7 +239,7 @@ class MolecularEncoder(nn.Layer):
         X = self.mlp_in_X(X)
         Y = self.mlp_in_y(y)
 
-        after_in = utils.PlaceHolder(X, E=new_E, y=Y).mask(node_mask)
+        after_in = diffgraphformer_utils.PlaceHolder(X, E=new_E, y=Y).mask(node_mask)
         X, E, Y = after_in.X, after_in.E, after_in.y
 
         for layer in self.tf_layers:
@@ -384,7 +394,7 @@ class NodeEdgeBlock(nn.Layer):
         # 1. Map X to keys and queries
         Q = self.q(X) * x_mask
         K = self.k(X) * x_mask
-        diffusion_utils.assert_correctly_masked(Q, x_mask)
+        scheduling_diffnmr.assert_correctly_masked(Q, x_mask)
 
         # 2. Reshape to (bs, n, n_head, df) with dx = n_head * df
         Q = paddle.reshape(Q, (Q.shape[0], Q.shape[1], self.n_head, self.df))
@@ -396,7 +406,7 @@ class NodeEdgeBlock(nn.Layer):
         # Compute unnormalized attentions. Y is (bs, n, n, n_head, df)
         Y = Q * K
         Y = Y / math.sqrt(Y.shape[-1])
-        diffusion_utils.assert_correctly_masked(Y, (e_mask1 * e_mask2).unsqueeze(-1))
+        scheduling_diffnmr.assert_correctly_masked(Y, (e_mask1 * e_mask2).unsqueeze(-1))
 
         E1 = self.e_mul(E) * e_mask1 * e_mask2  # bs, n, n, dx
         E1 = paddle.reshape(
@@ -421,7 +431,7 @@ class NodeEdgeBlock(nn.Layer):
 
         # Output E
         newE = self.e_out(newE) * e_mask1 * e_mask2
-        diffusion_utils.assert_correctly_masked(newE, e_mask1 * e_mask2)
+        scheduling_diffnmr.assert_correctly_masked(newE, e_mask1 * e_mask2)
 
         # Compute attentions. attn is still (bs, n, n, n_head, df)
         softmax_mask = paddle.expand(
@@ -456,3 +466,84 @@ class NodeEdgeBlock(nn.Layer):
         new_y = self.y_out(new_y)  # bs, dy
 
         return newX, newE, new_y
+
+
+class Xtoy(nn.Layer):
+    def __init__(self, dx, dy):
+        """Map node features to global features"""
+        super().__init__()
+        self.lin = paddle.nn.Linear(in_features=4 * dx, out_features=dy)
+
+    def forward(self, X, x_mask):
+        """X: bs, n, dx."""
+        x_mask = paddle.expand(x_mask, shape=[-1, -1, X.shape[-1]])
+        float_imask = 1 - x_mask.astype("float32")
+        m = paddle.sum(X, axis=1) / paddle.sum(x_mask, axis=1)
+        mi = paddle.min(X + 1e6 * float_imask, axis=1)
+        ma = paddle.max(X - 1e6 * float_imask, axis=1)
+        std = paddle.sum((X - m.unsqueeze(1)) ** 2 * x_mask, axis=1) / paddle.sum(
+            x_mask, axis=1
+        )
+        z = paddle.concat([m, mi, ma, std], axis=1)
+        out = self.lin(z)
+        return out
+
+
+class Etoy(nn.Layer):
+    def __init__(self, d, dy):
+        """Map edge features to global features."""
+        super().__init__()
+        self.lin = paddle.nn.Linear(in_features=4 * d, out_features=dy)
+
+    def forward(self, E, e_mask1, e_mask2):
+        """
+        E: bs, n, n, de
+        Features relative to the diagonal of E could potentially be added.
+        """
+        mask = paddle.expand(e_mask1 * e_mask2, shape=[-1, -1, -1, E.shape[-1]])
+        float_imask = 1 - mask.astype("float32")
+        divide = paddle.sum(mask, axis=(1, 2))
+        m = paddle.sum(E, axis=(1, 2)) / divide
+        mi = paddle.min(paddle.min(E + 1e6 * float_imask, axis=2), axis=1)
+        ma = paddle.max(paddle.max(E - 1e6 * float_imask, axis=2), axis=1)
+        std = (
+            paddle.sum((E - m.unsqueeze(1).unsqueeze(1)) ** 2 * mask, axis=(1, 2))
+            / divide
+        )
+        z = paddle.concat([m, mi, ma, std], axis=1)
+        out = self.lin(z)
+        return out
+
+
+def masked_softmax(x, mask, axis=-1):
+    """
+    Perform softmax over masked values in `x`.
+
+    Args:
+        x: Tensor, the input data.
+        mask: Tensor, the binary mask of the same shape as `x`.
+        axis: The axis to apply softmax.
+
+    Returns:
+        Tensor with masked softmax applied.
+    """
+    if paddle.sum(mask) == 0:
+        return x
+
+    # TODO: ndim check: only support adding dimensions backwards now
+    x_dims = x.ndim
+    mask_dims = mask.ndim
+    if mask_dims < x_dims:
+        diff = x_dims - mask_dims
+        mask = paddle.unsqueeze(mask, axis=[-1] * diff)
+        repeat_times = [1] * mask_dims + [x.shape[i] for i in range(mask_dims, x_dims)]
+        mask = paddle.tile(mask, repeat_times=repeat_times)
+
+    x_masked = x.clone()
+    x_masked = paddle.where(
+        mask == 0, paddle.to_tensor(-float("inf"), dtype=x.dtype), x_masked
+    )
+
+    return paddle.nn.functional.softmax(x_masked, axis=axis)
+
+

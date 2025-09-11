@@ -81,6 +81,7 @@ Tracker:
 Model:
   __name__: DiffNMRModel
   nmr_encoder:
+    __name__: NMRNetCLIP
     pretrained_path: "./pretrained/step2_best.pdparams" #"/home/liuxuwei01/PaddleMaterial/output/step2_init_weight.pdparams" #"./output/step2_best.pdparams"
     dim_enc_H: 1024
     dimff_enc_H: 2048
