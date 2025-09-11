@@ -56,7 +56,8 @@ __all__ = [
     "MPTrjDataset",
     "JarvisDataset",
     "HighLevelWaterDataset",
-    "MSDnmrDataset"
+    "MSDnmrDataset",
+    "MatbenchDataset"
 ]
 
 INFO_CLASS_REGISTRY: Dict[str, type] = {
