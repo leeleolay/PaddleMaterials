@@ -1,0 +1,120 @@
+# DiffNMR
+
+[DiffNMR: Diffusion Models for Nuclear Magnetic Resonance Spectra Elucidation](https://arxiv.org/abs/2507.08854)
+
+## Abstract
+
+Nuclear Magnetic Resonance (NMR) spectroscopy is a central characterization method for molecular structure elucidation, yet interpreting NMR spectra to deduce molecular structures remains challenging due to the complexity of spectral data and the vastness of the chemical space. In this work, we introduce DiffNMR, a novel end-to-end framework that leverages a conditional discrete diffusion model for de novo molecular structure elucidation from NMR spectra. DiffNMR refines molecular graphs iteratively through a diffusion-based generative process, ensuring global consistency and mitigating error accumulation inherent in autoregressive methods. The framework integrates a two-stage pretraining strategy that aligns spectral and molecular representations via diffusion autoencoder (Diff-AE) and contrastive learning, the incorporation of retrieval initialization and similarity filtering during inference, and a specialized NMR encoder with radial basis function (RBF) encoding for chemical shifts, preserving continuity and chemical correlation. Experimental results demonstrate that DiffNMR achieves competitive performance for NMR-based structure elucidation, offering an efficient and robust solution for automated molecular analysis.
+
+![DiffNMR Overview](../../docs/diffnmr_overview.png)
+
+## Datasets:
+
+- MSD_NMR:
+
+    MSD-NMR selects 45,231 stable inorganic materials from Material Projects, which includes the majority of experimentally-generated materials with at most 20 atoms in a unit cell.
+
+    | Dataset | train | val | test | total |
+    |:--------|------:|----:|-----:|------:|
+    | [MSD-NMR](https://paddle-org.bj.bcebos.com/paddlematerial/datasets/msd/msd_nmr.zip) |  |  |  |  |
+    | n<15    | 109,358 | 6,076  | 6,075  | 121,509 |
+    | n<20    | 235,512 | 13,085 | 13,084 | 261,681 |
+    | n<25    | 351,273 | 19,516 | 19,515 | 390,304 |
+    | n<35    | 517,319 | 28,741 | 28,739 | 574,799 |
+
+
+## Results
+
+<table>
+    <head>
+        <tr>
+            <th  nowrap="nowrap">Model</th>
+            <th  nowrap="nowrap">Dataset</th>
+            <th  nowrap="nowrap">Match Rate</th>
+            <th  nowrap="nowrap">RMS Dist</th>
+            <th  nowrap="nowrap">GPUs</th>
+            <th  nowrap="nowrap">Training time</th>
+            <th  nowrap="nowrap">Config</th>
+            <th  nowrap="nowrap">Checkpoint | Log</th>
+        </tr>
+    </head>
+    <body>
+        <tr>
+            <td  nowrap="nowrap">diffcsp_mp20</td>
+            <td  nowrap="nowrap">mp20</td>
+            <td  nowrap="nowrap">51.72</td>
+            <td  nowrap="nowrap">0.0591</td>
+            <td  nowrap="nowrap">1</td>
+            <td  nowrap="nowrap">~13.5 hours</td>
+            <td  nowrap="nowrap"><a href="diffcsp_mp20.yaml">diffcsp_mp20</a></td>
+            <td  nowrap="nowrap"><a href="https://paddle-org.bj.bcebos.com/paddlematerial/checkpoints/structure_generation/diffcsp/diffcsp_mp20.zip">checkpoint | log</a></td>
+        </tr>  
+    </body>
+</table>
+
+### Training
+```bash
+## 2 stage pretraining
+### stage 1: pretrain Diff-AE of Molecular Encoder and Molecular Decoder
+# multi-gpu training, we use 4 gpus here
+python -m paddle.distributed.launch --gpus="0,1,2,3" spectrum_elucidation/train.py -c spectrum_elucidation/configs/DiffNMR/DiffNMR_DiffGraphFormer.yaml
+# single-gpu training
+python spectrum_elucidation/train.py -c spectrum_elucidation/configs/DiffNMR/DiffNMR_DiffGraphFormer.yaml
+### stage 2: pretrain NMRNet by CLIP
+python -m paddle.distributed.launch --gpus="0,1,2,3" spectrum_elucidation/train.py -c spectrum_elucidation/configs/DiffNMR/DiffNMR_NMRNet.yaml
+# single-gpu training
+python spectrum_elucidation/train.py -c spectrum_elucidation/configs/DiffNMR/DiffNMR_NMRNet.yaml
+## fine-tuning
+# multi-gpu training, we use 4 gpus here
+python -m paddle.distributed.launch --gpus="0,1,2,3" spectrum_elucidation/train.py -c spectrum_elucidation/configs/DiffNMR/DiffNMR.yaml
+# single-gpu training
+python spectrum_elucidation/train.py -c spectrum_elucidation/configs/DiffNMR/DiffNMR.yaml
+```
+
+### Validation
+```bash
+# Adjust program behavior on-the-fly using command-line parameters – this provides a convenient way to customize settings without modifying the configuration file directly.
+# such as: --Global.do_eval=True
+## 2 stage pretraining
+### stage 1: pretrain Diff-AE of Molecular Encoder and Molecular Decoder
+python spectrum_elucidation/train.py -c spectrum_elucidation/configs/DiffNMR/DiffNMR_DiffGraphFormer.yaml Global.do_eval=True Global.do_train=False Global.do_test=False Trainer.pretrained_model_path='your model path(*.pdparams)'
+### stage 2: pretrain NMRNet by CLIP
+python spectrum_elucidation/train.py -c spectrum_elucidation/configs/DiffNMR/DiffNMR_NMRNet.yaml Global.do_eval=True Global.do_train=False Global.do_test=False Trainer.pretrained_model_path='your model path(*.pdparams)'
+## fine-tuning
+python spectrum_elucidation/train.py -c spectrum_elucidation/configs/DiffNMR/DiffNMR.yaml Global.do_eval=True Global.do_train=False Global.do_test=False Trainer.pretrained_model_path='your model path(*.pdparams)'
+```
+
+### Testing
+```bash
+# This command is used to evaluate the model's performance on the test dataset.
+## 2 stage pretraining
+### stage 1: pretrain Diff-AE of Molecular Encoder and Molecular Decoder
+python spectrum_elucidation/train.py -c spectrum_elucidation/configs/DiffNMR/DiffNMR_DiffGraphFormer.yaml Global.do_eval=False Global.do_train=False Global.do_test=True Trainer.pretrained_model_path='your model path(*.pdparams)'
+### stage 2: pretrain NMRNet by CLIP
+python spectrum_elucidation/train.py -c spectrum_elucidation/configs/DiffNMR/DiffNMR_NMRNet.yaml Global.do_eval=False Global.do_train=False Global.do_test=True Trainer.pretrained_model_path='your model path(*.pdparams)'
+## fine-tuning
+python spectrum_elucidation/train.py -c spectrum_elucidation/configs/DiffNMR/DiffNMR.yaml Global.do_eval=False Global.do_train=False Global.do_test=True Trainer.pretrained_model_path='your model path(*.pdparams)'
+```
+
+### Sample
+```bash
+# This command is used to predict the  crystal structure using a trained model.
+# Note: The model_name and weights_name parameters are used to specify the pre-trained model and its corresponding weights. The chemical_formula parameter is used to specify the chemical formula of the crystal structure to be predicted.
+# The prediction results will be saved in the folder specified by the `save_path` parameter, with the default set to `result`.
+
+# Mode 1: Leverage a pre-trained machine learning model for crystal structure prediction. The implementation includes automated model download functionality, eliminating the need for manual configuration.
+python spectrum_elucidation/sample.py --model_name='diffcsp_mp20' --weights_name='latest.pdparams' --save_path='result_diffnmr_mp20/' --chemical_formula="LiMnO2"
+
+# Mode2: Use a custom configuration file and checkpoint for crystal structure prediction. This approach allows for more flexibility and customization.
+python spectrum_elucidation/sample.py --config_path='spectrum_elucidation/configs/diffcsp/diffcsp_mp20.yaml' --checkpoint_path='./output/diffcsp_mp20/checkpoints/latest.pdparams' --save_path='result_diffcsp_mp20/' --chemical_formula="LiMnO2"
+```
+
+## Citation
+```
+@article{yang2025diffnmr,
+  title={DiffNMR: Diffusion Models for Nuclear Magnetic Resonance Spectra Elucidation},
+  author= {Yang, Qingsong and Wu, Binglan and Liu, Xuwei and Chen, Bo and Li, Wei and Long, Gen and Chen, Xin and Xiao, Mingjun},
+  journal={arXiv preprint arXiv:2507.08854},
+  year={2025}
+}
+```
