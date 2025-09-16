@@ -123,14 +123,12 @@ python spectrum_elucidation/train.py -c spectrum_elucidation/configs/diffnmr/Dif
 ### Sample
 ```bash
 # This command is used to predict the  crystal structure using a trained model.
-# Note: The model_name and weights_name parameters are used to specify the pre-trained model and its corresponding weights. The chemical_formula parameter is used to specify the chemical formula of the crystal structure to be predicted.
+# Note: The model_name and weights_name parameters are used to specify the pre-trained model and its corresponding weights. 
 # The prediction results will be saved in the folder specified by the `save_path` parameter, with the default set to `result`.
 
-# Mode 1: Leverage a pre-trained machine learning model for crystal structure prediction. The implementation includes automated model download functionality, eliminating the need for manual configuration.
-python spectrum_elucidation/sample.py --model_name='diffcsp_mp20' --weights_name='latest.pdparams' --save_path='result_diffnmr_mp20/' --chemical_formula="LiMnO2"
+# Mode 1: Use a custom configuration file and checkpoint for crystal structure prediction. This approach allows for more flexibility and customization.
+python spectrum_elucidation/sample.py --config_path='spectrum_elucidation/configs/diffnmr/DiffNMR.yaml' --weights_name='DiffNMR_nless15_best.pdparams' --save_path='result_diffnmr_nless15/' --checkpoint_path="pretrained"
 
-# Mode2: Use a custom configuration file and checkpoint for crystal structure prediction. This approach allows for more flexibility and customization.
-python spectrum_elucidation/sample.py --config_path='spectrum_elucidation/configs/diffcsp/diffcsp_mp20.yaml' --checkpoint_path='./output/diffcsp_mp20/checkpoints/latest.pdparams' --save_path='result_diffcsp_mp20/' --chemical_formula="LiMnO2"
 ```
 
 ## Citation

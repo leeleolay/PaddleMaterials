@@ -99,7 +99,7 @@ Sampler:
   visual_num: 10 # number of visualize molecules in the sample
   chains_to_save: 5 # less sample batch size, select representative sample in sample batch for visualize
   number_chain_steps: 10 # Number of frames in each gif
-  sample_batch_iters: 1 # Number of sample batches
+  sample_batch_iters: 100 # Number of sample batches
   flag_retrival_sampling: False
   flag_use_formula: False
   flag_retrival_initilization: False
@@ -126,7 +126,7 @@ Sampler:
       __init_params__:
         shuffle: True
         drop_last: False
-        batch_size: 8
+        batch_size: 256
 
 
 Model:
