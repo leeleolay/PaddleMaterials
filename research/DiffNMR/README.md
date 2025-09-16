@@ -18,7 +18,7 @@
 
 DiffNMR is an end-to-end framework that infers **molecular structures directly from 1H/13C NMR spectra** using a **conditional discrete diffusion model**. It holistically refines molecular graphs through denoising steps (instead of autoregressive token-by-token generation), improving global consistency and reducing error accumulation. The system couples a **two-stage pretraining** pipeline—(i) **Diffusion Autoencoder (Diff-AE)** for molecular representation + graph decoder pretraining and (ii) **contrastive alignment** between spectra and molecular representations—with a domain-tailored **NMR encoder** that leverages **RBF encodings** for chemical shifts and coupling constants. Inference further benefits from **similarity-based filtering** and optional **retrieval-initialized sampling**, yielding strong Top‑k accuracy and high Tanimoto similarity across molecule sizes.
 
-> Paper: arXiv:2507.08854 (v1). DOI: 10.48550/arXiv.2507.08854.
+![DiffNMR Overview](https://paddle-org.bj.bcebos.com/paddlematerials/docs/diffnmr_overview.png)
 
 ---
 
@@ -67,100 +67,17 @@ DiffNMR is an end-to-end framework that infers **molecular structures directly f
 
 ---
 
-## Getting Started
-
-### 0) Environment
-
-Refer to the [install doc](../../Install.md) to install PaddleMaterials
-
-
-### 1) Elucidate molecular structures from NMR spectra normaly.
-
-Create a JSON/CSV containing 1H & 13C peaks per sample. Example JSON (one sample):
-
-```json
-{
-  "id": "sample_0001",
-  "formula": "C10H12O2",  // optional
-  "h1": [
-    {"shift": 3.62, "multiplicity": "t", "integral": 2, "j": [1.28]},
-    {"shift": 5.81, "multiplicity": "s", "integral": 1},
-    {"shift": 4.62, "multiplicity": "d", "integral": 2, "j": [6.78]}
-  ],
-  "c13": [173.0, 62.3, 53.8]
-}
-```
-
-* **1H**: shift (ppm), multiplicity {s,d,t,q,m,...}, integral (≈ #H), optional **J** list (Hz)
-* **13C**: shift (ppm)
-
-### 2) Elucidate molecular structures from NMR spectra by retrival initialization
-
-Example commands (paths may differ by repo layout):
-
-```bash
-# Option A: by predefined model name (weights auto‑loaded if provided by PaddleMaterial)
-python spectrum_elucidation/sample.py \
-  --model_name diffnmr \
-  --mode by_dataloader \
-  --data_path ./data/nmr_test.json \
-  --save_path ./results_diffnmr
-
-# Option B: by explicit config/weights
-python spectrum_elucidation/sample.py \
-  --config_path ./configs/diffnmr/sample.yaml \
-  --checkpoint_path ./checkpoints/diffnmr/best.pdparams \
-  --mode by_dataloader \
-  --data_path ./data/nmr_test.json \
-  --save_path ./results_diffnmr
-```
-
-Useful config keys (YAML):
-
-```yaml
-sampling:
-  num_samples: 64        # candidates per spectrum
-  steps: 500             # diffusion steps (random init)
-retrieval:
-  enabled: true          # retrieval‑initialized sampling
-  topk: 32               # pool size from DB
-  index_path: ./db/index.faiss
-filtering:
-  enabled: true          # similarity filtering
-  keep_topk: 10
-```
-
-### 3) Elucidate molecular structures from NMR spectra by retrival sampling
-
-```bash
-# Stage‑1 Diff‑AE pretraining (molecular reconstruction)
-python spectrum_elucidation/train.py --config_path ./configs/diffnmr/pretrain_diffae.yaml
-
-# Stage‑2 contrastive pretraining (NMR↔molecule alignment)
-python spectrum_elucidation/train.py --config_path ./configs/diffnmr/pretrain_contrast.yaml
-
-# End‑to‑end fine‑tuning
-python spectrum_elucidation/train.py --config_path ./configs/diffnmr/finetune.yaml
-```
-
-### 4) Elucidate molecular structures from NMR spectra by use formula
-
-
-### 5) Elucidate molecular structures from NMR spectra by retrival sampling and retrival initialization
-
-
----
-
 ## Results (summary)
 
 * **1H+13C** achieves the best Top‑1/Top‑k; adding **molecular formula** improves all sizes (≤15/≤20/≤25 HAC).
 * **Similarity filtering** and **retrieval initialization** notably improve **Top‑1** and **avg. Tanimoto**, with the largest gains on higher HAC.
 
-> See the paper for detailed tables/figures and ablations (RBF encoding vs discrete, pretraining stages, etc.).
+![Results Table1](https://paddle-org.bj.bcebos.com/paddlematerials/docs/DiffNMR_Table1.png)
+![Results Table2](https://paddle-org.bj.bcebos.com/paddlematerials/docs/DiffNMR_Table2.png)
 
 ---
 
-## Repository Layout (suggested)
+## Repository Layout
 
 ```
 PaddleMaterials/
@@ -172,6 +89,38 @@ PaddleMaterials/
     train.py
     sample.py
 ```
+
+---
+
+## How to Use
+Refer to the [install doc](../../Install.md) to install PaddleMaterials.
+
+### 1. Prepare Vocabulary Table & Retrieval Database:
+```bash
+cd spectrum_elucidation
+wget https://paddle-org.bj.bcebos.com/paddlematerials/checkpoints/spectrum_elucidation/diffnmr/vocab.tar.gz
+tar -xvf vocab.tar.gz
+wget https://paddle-org.bj.bcebos.com/paddlematerials/checkpoints/spectrum_elucidation/diffnmr/retrival_database.zip
+unzip retrival_database.zip
+```
+
+### 2. Generate molecular structures from NMR spectra with DiffNMR:
+```bash
+cd pretrained
+wget https://paddle-org.bj.bcebos.com/paddlematerials/checkpoints/spectrum_elucidation/diffnmr/DiffNMR_nless15_best.pdparams
+cd ..
+python spectrum_elucidation/sample.py --config_path='spectrum_elucidation/configs/diffnmr/DiffNMR.yaml' --weights_name='DiffNMR_nless15_best.pdparams' --save_path='result_diffnmr_nless15/' --checkpoint_path="pretrained"
+```
+
+### 3. Generate molecular structures with Retrieval-initializion/Similarity Filtering/Formula:
+revise the `spectrum_elucidation/configs/diffnmr/DiffNMR.py` and replace the following arguments according to your needs:
+```yaml
+flag_retrival_sampling: True
+flag_use_formula: True
+flag_retrival_initilization: True
+num_candidates: 1 # recommend set to 20 for retrieval-sampling similarity filtering
+```
+run the command reference to step 2.
 
 ---
 
