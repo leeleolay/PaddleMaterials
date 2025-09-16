@@ -62,6 +62,11 @@ class BaseTrainer:
             Scheduler. Defaults to None.
         compute_metric_func_dict (Optional[Dict], optional): Compute metric function
             dictionary. Defaults to None.
+    
+    Notic:
+        support 2 types metric integration method. recommend metric module first. if
+        metirc calc is complicated using multipul inputs and outputs of models, could 
+        use stream metric.
     """
 
     def __init__(

@@ -342,9 +342,9 @@ class NMRNetCLIP(nn.Layer):
             # load graph encoder model from pretrained model
             state_dict = paddle.load(spectrum_encoder["pretrained_model_path"])
             encoder_state_dict = {
-                k[len("text_encoder.") :]: v
+                k[len("spectrum_encoder.") :]: v
                 for k, v in state_dict.items()
-                if k.startswith("text_encoder.")
+                if k.startswith("spectrum_encoder.")
             }
             # encoder_state_dict = {
             #     k[len("encoder.") :]: v

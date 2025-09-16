@@ -251,9 +251,6 @@ class MSDnmrDataset(Dataset):
         if cache_path is not None:
             self.cache_path = cache_path
         else:
-            # for example:
-            # path = ./data/mp2018_train_60k/mp2018_train_60k_train.json
-            # cache_path = ./data/mp2018_train_60k_cache/mp2018_train_60k_train
             self.cache_path = osp.join(
                 osp.split(path)[0] + "_cache", osp.splitext(osp.basename(path))[0]
             )

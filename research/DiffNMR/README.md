@@ -50,7 +50,7 @@ DiffNMR is an end-to-end framework that infers **molecular structures directly f
 **Architecture**
 
 * **Molecular encoder** (graph transformer) → compact molecular representation.
-* **Graph diffusion decoder** (discrete denoising on nodes/edges; FiLM‑conditioned by NMR embedding).
+* **Graph diffusion decoder** (discrete denoising on nodes/edges).
 * **NMR encoder**: RBF(δ) for shifts; embeddings for multiplicity/integrals; RBF(J) for couplings; transformers per modality; **bi‑directional cross‑attention** (1H↔13C); pooled & fused to a conditioning vector.
 
 **Training**
@@ -61,8 +61,9 @@ DiffNMR is an end-to-end framework that infers **molecular structures directly f
 
 **Inference**
 
-* Optional **retrieval‑init** (start from nearest neighbor in latent space) vs **random‑init**.
 * **Similarity filtering**: rank sampled candidates by cosine similarity between predicted molecule & input NMR embeddings.
+* **Retrieval initialization** (start from nearest neighbor in latent space) improves Top‑1 accuracy.
+* **Use formula** outputs atoms enforced to reset according to formula.
 
 ---
 
@@ -70,20 +71,10 @@ DiffNMR is an end-to-end framework that infers **molecular structures directly f
 
 ### 0) Environment
 
-* **Framework**: \[PaddlePaddle ≥ 2.6] and **PaddleMaterial** toolkit.
-* Install PaddleMaterial (example):
+Refer to the [install doc](../../Install.md) to install PaddleMaterials
 
-```bash
-# from source
-git clone https://github.com/PaddlePaddle/PaddleMaterial.git
-cd PaddleMaterial
-pip install -r requirements.txt
-pip install -e .
-```
 
-> Note: CUDA/NCCL versions should match your device drivers. See Paddle/PaddleMaterial docs for details.
-
-### 1) Prepare NMR inputs
+### 1) Elucidate molecular structures from NMR spectra normaly.
 
 Create a JSON/CSV containing 1H & 13C peaks per sample. Example JSON (one sample):
 
@@ -103,7 +94,7 @@ Create a JSON/CSV containing 1H & 13C peaks per sample. Example JSON (one sample
 * **1H**: shift (ppm), multiplicity {s,d,t,q,m,...}, integral (≈ #H), optional **J** list (Hz)
 * **13C**: shift (ppm)
 
-### 2) Run inference (spectrum → structure)
+### 2) Elucidate molecular structures from NMR spectra by retrival initialization
 
 Example commands (paths may differ by repo layout):
 
@@ -139,7 +130,7 @@ filtering:
   keep_topk: 10
 ```
 
-### 3) Training (optional)
+### 3) Elucidate molecular structures from NMR spectra by retrival sampling
 
 ```bash
 # Stage‑1 Diff‑AE pretraining (molecular reconstruction)
@@ -151,6 +142,12 @@ python spectrum_elucidation/train.py --config_path ./configs/diffnmr/pretrain_co
 # End‑to‑end fine‑tuning
 python spectrum_elucidation/train.py --config_path ./configs/diffnmr/finetune.yaml
 ```
+
+### 4) Elucidate molecular structures from NMR spectra by use formula
+
+
+### 5) Elucidate molecular structures from NMR spectra by retrival sampling and retrival initialization
+
 
 ---
 

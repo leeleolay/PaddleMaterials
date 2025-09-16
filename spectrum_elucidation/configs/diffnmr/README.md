@@ -10,9 +10,9 @@ Nuclear Magnetic Resonance (NMR) spectroscopy is a central characterization meth
 
 ## Datasets:
 
-- MSD_NMR:
+- MSD-NMR:
 
-    MSD-NMR selects 45,231 stable inorganic materials from Material Projects, which includes the majority of experimentally-generated materials with at most 20 atoms in a unit cell.
+    MSD-NMR Multimodal-Spectroscopic-Dataset (MSD-NMR) is a comprehensive dataset for molecular structure elucidation from NMR spectra. It contains 121,509 spectra, each corresponding to a molecular structure with up to 15 heavy atoms. Up to 574,799 spectra with up to 35 heavy atoms. The dataset is divided into training, validation, and test sets.
 
     | Dataset | train | val | test | total |
     |:--------|------:|----:|-----:|------:|
@@ -30,8 +30,8 @@ Nuclear Magnetic Resonance (NMR) spectroscopy is a central characterization meth
         <tr>
             <th  nowrap="nowrap">Model</th>
             <th  nowrap="nowrap">Dataset</th>
-            <th  nowrap="nowrap">Match Rate</th>
-            <th  nowrap="nowrap">RMS Dist</th>
+            <th  nowrap="nowrap">Loss</th>
+            <th  nowrap="nowrap">Negative log likelihood</th>
             <th  nowrap="nowrap">GPUs</th>
             <th  nowrap="nowrap">Training time</th>
             <th  nowrap="nowrap">Config</th>
@@ -40,13 +40,37 @@ Nuclear Magnetic Resonance (NMR) spectroscopy is a central characterization meth
     </head>
     <body>
         <tr>
-            <td  nowrap="nowrap">diffcsp_mp20</td>
-            <td  nowrap="nowrap">mp20</td>
-            <td  nowrap="nowrap">51.72</td>
-            <td  nowrap="nowrap">0.0591</td>
-            <td  nowrap="nowrap">1</td>
-            <td  nowrap="nowrap">~13.5 hours</td>
-            <td  nowrap="nowrap"><a href="diffcsp_mp20.yaml">diffcsp_mp20</a></td>
+            <td  nowrap="nowrap">diffnmr_diffgraphfromer_msdnmr_nless15</td>
+            <td  nowrap="nowrap">msdnmr_nless15</td>
+            <td  nowrap="nowrap">1.946618</td>
+            <td  nowrap="nowrap">66.028621</td>
+            <td  nowrap="nowrap">4</td>
+            <td  nowrap="nowrap">~34.15 hours</td>
+            <td  nowrap="nowrap"><a href="DiffNMR_DiffGraphFormer.yaml">DiffNMR_DiffGraphFormer</a></td>
+            <td  nowrap="nowrap"><a href="https://paddle-org.bj.bcebos.com/paddlematerial/checkpoints/structure_generation/diffcsp/diffcsp_mp20.zip">checkpoint | log</a></td>
+        </tr>  
+    </body>
+    <body>
+        <tr>
+            <td  nowrap="nowrap">diffnmr_nmrnet_msdnmr_nless15</td>
+            <td  nowrap="nowrap">msdnmr_nless15</td>
+            <td  nowrap="nowrap">3.217951</td>
+            <td  nowrap="nowrap">-</td>
+            <td  nowrap="nowrap">4</td>
+            <td  nowrap="nowrap">~6.5 hours</td>
+            <td  nowrap="nowrap"><a href="DiffNMR_DiffGraphFormer.yaml">DiffNMR_NMRNet</a></td>
+            <td  nowrap="nowrap"><a href="https://paddle-org.bj.bcebos.com/paddlematerial/checkpoints/structure_generation/diffcsp/diffcsp_mp20.zip">checkpoint | log</a></td>
+        </tr>  
+    </body>
+    <body>
+        <tr>
+            <td  nowrap="nowrap">diffnmr_msdnmr_nless15</td>
+            <td  nowrap="nowrap">msdnmr_nless15</td>
+            <td  nowrap="nowrap">1.946618</td>
+            <td  nowrap="nowrap">66.028621</td>
+            <td  nowrap="nowrap">4</td>
+            <td  nowrap="nowrap">~34.15 hours</td>
+            <td  nowrap="nowrap"><a href="DiffNMR_DiffGraphFormer.yaml">DiffNMR</a></td>
             <td  nowrap="nowrap"><a href="https://paddle-org.bj.bcebos.com/paddlematerial/checkpoints/structure_generation/diffcsp/diffcsp_mp20.zip">checkpoint | log</a></td>
         </tr>  
     </body>
@@ -57,18 +81,18 @@ Nuclear Magnetic Resonance (NMR) spectroscopy is a central characterization meth
 ## 2 stage pretraining
 ### stage 1: pretrain Diff-AE of Molecular Encoder and Molecular Decoder
 # multi-gpu training, we use 4 gpus here
-python -m paddle.distributed.launch --gpus="0,1,2,3" spectrum_elucidation/train.py -c spectrum_elucidation/configs/DiffNMR/DiffNMR_DiffGraphFormer.yaml
+python -m paddle.distributed.launch --gpus="0,1,2,3" spectrum_elucidation/train.py -c spectrum_elucidation/configs/diffnmr/DiffNMR_DiffGraphFormer.yaml
 # single-gpu training
-python spectrum_elucidation/train.py -c spectrum_elucidation/configs/DiffNMR/DiffNMR_DiffGraphFormer.yaml
-### stage 2: pretrain NMRNet by CLIP
-python -m paddle.distributed.launch --gpus="0,1,2,3" spectrum_elucidation/train.py -c spectrum_elucidation/configs/DiffNMR/DiffNMR_NMRNet.yaml
+python spectrum_elucidation/train.py -c spectrum_elucidation/configs/diffnmr/DiffNMR_DiffGraphFormer.yaml
+### stage 2: pretrain NMR Spectrum Encoder NMRNet by CLIP
+python -m paddle.distributed.launch --gpus="0,1,2,3" spectrum_elucidation/train.py -c spectrum_elucidation/configs/diffnmr/DiffNMR_NMRNet.yaml
 # single-gpu training
-python spectrum_elucidation/train.py -c spectrum_elucidation/configs/DiffNMR/DiffNMR_NMRNet.yaml
+python spectrum_elucidation/train.py -c spectrum_elucidation/configs/diffnmr/DiffNMR_NMRNet.yaml
 ## fine-tuning
 # multi-gpu training, we use 4 gpus here
-python -m paddle.distributed.launch --gpus="0,1,2,3" spectrum_elucidation/train.py -c spectrum_elucidation/configs/DiffNMR/DiffNMR.yaml
+python -m paddle.distributed.launch --gpus="0,1,2,3" spectrum_elucidation/train.py -c spectrum_elucidation/configs/diffnmr/DiffNMR.yaml
 # single-gpu training
-python spectrum_elucidation/train.py -c spectrum_elucidation/configs/DiffNMR/DiffNMR.yaml
+python spectrum_elucidation/train.py -c spectrum_elucidation/configs/diffnmr/DiffNMR.yaml
 ```
 
 ### Validation
@@ -77,11 +101,11 @@ python spectrum_elucidation/train.py -c spectrum_elucidation/configs/DiffNMR/Dif
 # such as: --Global.do_eval=True
 ## 2 stage pretraining
 ### stage 1: pretrain Diff-AE of Molecular Encoder and Molecular Decoder
-python spectrum_elucidation/train.py -c spectrum_elucidation/configs/DiffNMR/DiffNMR_DiffGraphFormer.yaml Global.do_eval=True Global.do_train=False Global.do_test=False Trainer.pretrained_model_path='your model path(*.pdparams)'
-### stage 2: pretrain NMRNet by CLIP
-python spectrum_elucidation/train.py -c spectrum_elucidation/configs/DiffNMR/DiffNMR_NMRNet.yaml Global.do_eval=True Global.do_train=False Global.do_test=False Trainer.pretrained_model_path='your model path(*.pdparams)'
+python spectrum_elucidation/train.py -c spectrum_elucidation/configs/diffnmr/DiffNMR_DiffGraphFormer.yaml Global.do_eval=True Global.do_train=False Global.do_test=False Trainer.pretrained_model_path='your model path(*.pdparams)'
+### stage 2: pretrain NMR Spectrum Encoder NMRNet by CLIP
+python spectrum_elucidation/train.py -c spectrum_elucidation/configs/diffnmr/DiffNMR_NMRNet.yaml Global.do_eval=True Global.do_train=False Global.do_test=False Trainer.pretrained_model_path='your model path(*.pdparams)'
 ## fine-tuning
-python spectrum_elucidation/train.py -c spectrum_elucidation/configs/DiffNMR/DiffNMR.yaml Global.do_eval=True Global.do_train=False Global.do_test=False Trainer.pretrained_model_path='your model path(*.pdparams)'
+python spectrum_elucidation/train.py -c spectrum_elucidation/configs/diffnmr/DiffNMR.yaml Global.do_eval=True Global.do_train=False Global.do_test=False Trainer.pretrained_model_path='your model path(*.pdparams)'
 ```
 
 ### Testing
@@ -89,11 +113,11 @@ python spectrum_elucidation/train.py -c spectrum_elucidation/configs/DiffNMR/Dif
 # This command is used to evaluate the model's performance on the test dataset.
 ## 2 stage pretraining
 ### stage 1: pretrain Diff-AE of Molecular Encoder and Molecular Decoder
-python spectrum_elucidation/train.py -c spectrum_elucidation/configs/DiffNMR/DiffNMR_DiffGraphFormer.yaml Global.do_eval=False Global.do_train=False Global.do_test=True Trainer.pretrained_model_path='your model path(*.pdparams)'
-### stage 2: pretrain NMRNet by CLIP
-python spectrum_elucidation/train.py -c spectrum_elucidation/configs/DiffNMR/DiffNMR_NMRNet.yaml Global.do_eval=False Global.do_train=False Global.do_test=True Trainer.pretrained_model_path='your model path(*.pdparams)'
+python spectrum_elucidation/train.py -c spectrum_elucidation/configs/diffnmr/DiffNMR_DiffGraphFormer.yaml Global.do_eval=False Global.do_train=False Global.do_test=True Trainer.pretrained_model_path='your model path(*.pdparams)'
+### stage 2: pretrain NMR Spectrum Encoder NMRNet by CLIP
+python spectrum_elucidation/train.py -c spectrum_elucidation/configs/diffnmr/DiffNMR_NMRNet.yaml Global.do_eval=False Global.do_train=False Global.do_test=True Trainer.pretrained_model_path='your model path(*.pdparams)'
 ## fine-tuning
-python spectrum_elucidation/train.py -c spectrum_elucidation/configs/DiffNMR/DiffNMR.yaml Global.do_eval=False Global.do_train=False Global.do_test=True Trainer.pretrained_model_path='your model path(*.pdparams)'
+python spectrum_elucidation/train.py -c spectrum_elucidation/configs/diffnmr/DiffNMR.yaml Global.do_eval=False Global.do_train=False Global.do_test=True Trainer.pretrained_model_path='your model path(*.pdparams)'
 ```
 
 ### Sample

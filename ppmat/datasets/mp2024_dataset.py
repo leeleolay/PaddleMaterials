@@ -52,8 +52,7 @@ class MP2024Dataset(Dataset):
     │ Sample Count      │ 130000  │  10000  │  15361  │
     └───────────────────┴─────────┴─────────┴─────────┘
     ```
-    Download preprocessed data: https://paddle-org.bj.bcebos.com/paddlematerial/datasets
-        /mp2024/mp2024_train_130k.zip
+    Download preprocessed data: https://paddle-org.bj.bcebos.com/paddlematerial/datasets/mp2024/mp2024_train_130k.zip # noqa
 
     **Data Format**
     Each sample in the dataset is represented as a `dict` with the following keys and

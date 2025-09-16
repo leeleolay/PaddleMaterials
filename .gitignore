@@ -164,8 +164,6 @@ nohup.out
 ppmat/models/mattersim/threebody_indices.c
 step2_latest.log_nobug
 step3_15_H_without_formular.ckpt
-legacy/
-jointContribution/
 pretrained/
 result*
 spectrum_elucidation/retrival_database

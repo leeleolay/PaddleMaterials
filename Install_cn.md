@@ -30,11 +30,11 @@
 
 ### 1.3 源码安装PaddleMaterial：
 
-    # clone PaddleMaterial
-    git clone https://github.com/PaddlePaddle/PaddleMaterial.git
+    # clone PaddleMaterials
+    git clone https://github.com/PaddlePaddle/PaddleMaterials.git
 
     # 切换到PaddleMaterial目录
-    cd PaddleMaterial
+    cd PaddleMaterials
 
     # 安装依赖
     pip install --upgrade pip setuptools wheel

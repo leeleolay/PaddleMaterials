@@ -1008,10 +1008,10 @@ def reconstruction_logp(model, t, X, E, node_mask, condition_Spectrum):
 
     if model.__class__ is DiffNMR:
         if model.flag_onlyH is True:
-            global_H, _ = model.spectrum_encoder(condition_Spectrum)
+            global_H, _ = model.encoder(condition_Spectrum)
             embeddings_spectrum = global_H
         else:
-            embeddings_spectrum = model.spectrum_encoder(condition_Spectrum)
+            embeddings_spectrum = model.encoder(condition_Spectrum)
         input_y = paddle.concat([input_y, embeddings_spectrum], axis=1).astype(
             "float32"
         )

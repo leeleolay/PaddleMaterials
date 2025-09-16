@@ -24,19 +24,21 @@
 
 ## 📣 News
 
-🔥 **2025.09.12**: The Suzhou Laboratory has established a novel model DiffNMR based on PaddleMaterials, a novel end-to-end framework that leverages a conditional discrete diffusion model for de novo molecular structure elucidation from NMR spectra. For more information, please refer to [DiffNMR](./research/DiffNMR/README.md).
+🔥 **2025.09.25**: The **MetaX** has supported all models of multiple tasks including MLIP, PP, SG, SE. Welcome to run PaddleMaterials on MetaX chips. Pleare reference to [SupportedHardwareList](./docs/multi_device.md) for more multi-hardware adaption information.
 
-🔥 **2025.07.01**: The Suzhou Laboratory has established a novel framework based on PaddleMaterials, combining an active learning workflow with conditional-diffusion-based structure generation, thereby achieving unprecedented expansion of two-dimensional material databases. For more information, please refer to [ML2DDB](./research/ML2DDB/README.md).
+🔥 **2025.09.12**: The **Suzhou Laboratory** has established a novel model DiffNMR based on PaddleMaterials, a novel end-to-end framework that leverages a conditional discrete diffusion model for de novo molecular structure elucidation from NMR spectra. For more information, please refer to [DiffNMR](./research/DiffNMR/README.md).
+
+🔥 **2025.07.01**: The **Suzhou Laboratory** has established a novel framework based on PaddleMaterials, combining an active learning workflow with conditional-diffusion-based structure generation, thereby achieving unprecedented expansion of two-dimensional material databases. For more information, please refer to [ML2DDB](./research/ML2DDB/README.md).
 
 ## 📑 Task
 - [MLIP-Machine Learning Interatomic Potential](interatomic_potentials/README.md)
-- [IOMPP-Inorganic Material Property Prediction](property_prediction/README.md)
-- [IOMSG-Inorganic Material Structure Generation](structure_generation/README.md)
-- [OMSE-Organic Material Spectrum Elucidation](spectrum_elucidation/README.md)
+- [PP-Property Prediction](property_prediction/README.md)
+- [SG-Structure Generation](structure_generation/README.md)
+- [SE-Spectrum Elucidation](spectrum_elucidation/README.md)
 
 ## 🔧 Installation
 
-Please refer to the installation [document](Install.md) for environment configuration.
+Please refer to the installation [document](Install.md) on your harware environment reference to [SupportedHardwareList](./docs/multi_device.md).
 
 
 ## ⚡ Get Started
@@ -81,6 +83,7 @@ For more information on how to use PaddleMaterials to train and fine tune a mode
 <p align="left">
  <img src="docs/suzhoulab.png" align="middle" width = "200"/>
  <img src="docs/zhonghua.jpeg" align="middle" width = "240"/>
+ <img src="docs/MetaX.png" align="middle" width = "240"/>
 <p align="left">
 
 ## 👩‍👩‍👧‍👦 Community
