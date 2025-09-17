@@ -423,7 +423,7 @@ class NMRNetCLIP(nn.Layer):
 
         # compute similarity between graph and NMR
         V1_f = condition_graph  # Assuming V1 is a feature obtained from molecular graph
-        V2_f = condition_nmr  # Assume V2 is a feature obtained from NMR text
+        V2_f = condition_nmr  # Assume V2 is a feature obtained from NMR spectrum
         V1_e = paddle.nn.functional.normalize(x=V1_f, p=2, axis=1)
         V2_e = paddle.nn.functional.normalize(x=V2_f, p=2, axis=1)
         logits = paddle.matmul(x=V1_e, y=V2_e.T) * paddle.exp(
@@ -543,8 +543,8 @@ class DiffNMR(nn.Layer):
                     num_timesteps=connector_cfg["prior_network"]["num_timesteps"],
                     num_time_embeds=connector_cfg["prior_network"]["num_time_embeds"],
                     num_graph_embeds=connector_cfg["prior_network"]["num_graph_embeds"],
-                    num_text_embeds=connector_cfg["prior_network"]["num_text_embeds"],
-                    max_text_len=connector_cfg["prior_network"]["max_text_len"],
+                    num_spectrum_embeds=connector_cfg["prior_network"]["num_spectrum_embeds"],
+                    max_spectrum_len=connector_cfg["prior_network"]["max_spectrum_len"],
                     self_cond=connector_cfg["prior_network"]["self_cond"],
                     depth=connector_cfg["prior_network"]["depth"],
                     dim_head=connector_cfg["prior_network"]["dim_head"],
@@ -683,7 +683,7 @@ class DiffNMR(nn.Layer):
         src_mask = (src != 0).unsqueeze(1).unsqueeze(2)
         return src_mask
 
-    def forward(self, batch, mode="train"):
+    def forward(self, batch):
         batch_graph = batch["graph"]
         batch_property = batch["property"]
         batch_spectrum = batch["spectrum"]
@@ -874,36 +874,27 @@ class DiffPrior(nn.Layer):
         else:
             self.clip = None
         self.net = DiffPriorNetwork(**connector_cfg)
-        self.graph_embed_dim = default(
-            sample_cfg["graph_embed_dim"], lambda: clip.dim_latent
-        )
+        self.graph_embed_dim = sample_cfg["graph_embed_dim"]
 
         assert (
             self.net.dim == self.graph_embed_dim
         ), f"your diffusion prior network has a dimension of {self.net.dim}, \
             but you set your image embedding dimension (keyword graph_embed_dim) \
             on DiffPrior to {self.graph_embed_dim}"
-        assert (
-            not exists(clip)
-            or clip.spectrum_encoder_projector.weight.shape[1] == self.graph_embed_dim
-        ), f"you passed in a CLIP to the diffusion prior with latent dimensions of \
-            {clip.dim_latent}, but your image embedding dimension \
-            (keyword graph_embed_dim) for the DiffPrior was set \
-            to {self.graph_embed_dim}"
 
         self.cond_drop_prob = default(sample_cfg["cond_drop_prob"], 0.0)
-        self.text_cond_drop_prob = default(
-            sample_cfg["text_cond_drop_prob"], self.cond_drop_prob
+        self.spectrum_cond_drop_prob = default(
+            sample_cfg["spectrum_cond_drop_prob"], self.cond_drop_prob
         )
         self.graph_cond_drop_prob = default(
             sample_cfg["graph_cond_drop_prob"], self.cond_drop_prob
         )
 
         self.can_classifier_guidance = (
-            self.text_cond_drop_prob > 0.0 and self.graph_cond_drop_prob > 0.0
+            self.spectrum_cond_drop_prob > 0.0 and self.graph_cond_drop_prob > 0.0
         )
-        self.condition_on_text_encodings = default(
-            sample_cfg["condition_on_text_encodings"], True
+        self.condition_on_spectrum_encodings = default(
+            sample_cfg["condition_on_spectrum_encodings"], True
         )
 
         self.predict_x_start = sample_cfg["predict_x_start"]
@@ -924,53 +915,116 @@ class DiffPrior(nn.Layer):
             name="_dummy", tensor=paddle.to_tensor(data=[True]), persistable=False
         )
 
-    def forward(
-        self,
-        text=None,
-        moleculargraph=None,
-        text_embed=None,
-        moleculargraph_embed=None,
-        text_encodings=None,
-        *args,
-        **kwargs,
-    ):
-        assert exists(text) ^ exists(
-            text_embed
-        ), "either text or text embedding must be supplied"
-        assert exists(moleculargraph) ^ exists(
-            moleculargraph_embed
-        ), "either moleculegraph or moleculegraph embedding must be supplied"
-        assert not (
-            self.condition_on_text_encodings
-            and (not exists(text_encodings) and not exists(text))
-        ), "cannot use both conditions at once"
+    # def forward(
+    #     self,
+    #     spectrum=None,
+    #     moleculargraph=None,
+    #     spectrum_embed=None,
+    #     moleculargraph_embed=None,
+    #     spectrum_encodings=None,
+    #     *args,
+    #     **kwargs,
+    # ):
+    #     assert exists(spectrum) ^ exists(
+    #         spectrum_embed
+    #     ), "either spectrum or spectrum embedding must be supplied"
+    #     assert exists(moleculargraph) ^ exists(
+    #         moleculargraph_embed
+    #     ), "either moleculegraph or moleculegraph embedding must be supplied"
+    #     assert not (
+    #         self.condition_on_spectrum_encodings
+    #         and (not exists(spectrum_encodings) and not exists(spectrum))
+    #     ), "cannot use both conditions at once"
 
-        if exists(moleculargraph):
-            moleculargraph_embed, _ = self.clip.graph_encoder(moleculargraph)
+    #     if exists(moleculargraph):
+    #         moleculargraph_embed, _ = self.clip.graph_encoder(moleculargraph)
 
-        # calculate text conditionings, based on what is passed in
-        if exists(text):
-            text_embed, text_encodings = self.clip.spectrum_encoder(text)
+    #     # calculate spectrum conditionings, based on what is passed in
+    #     if exists(spectrum):
+    #         spectrum_embed, spectrum_encodings = self.clip.spectrum_encoder(spectrum)
 
-        text_cond = dict(text_embed=text_embed)
+    #     spectrum_cond = dict(spectrum_embed=spectrum_embed)
 
-        if self.condition_on_text_encodings:
-            assert exists(
-                text_encodings
-            ), "text encodings must be present for diffusion prior if specified"
-            text_cond = {**text_cond, "text_encodings": text_encodings}
+    #     if self.condition_on_spectrum_encodings:
+    #         assert exists(
+    #             spectrum_encodings
+    #         ), "spectrum encodings must be present for diffusion prior if specified"
+    #         spectrum_cond = {**spectrum_cond, "spectrum_encodings": spectrum_encodings}
 
-        # timestep conditioning from ddpm
-        batch = tuple(moleculargraph_embed.shape)[0]
-        times = self.noise_scheduler.sample_random_times(batch)
+    #     # timestep conditioning from ddpm
+    #     batch = tuple(moleculargraph_embed.shape)[0]
+    #     times = self.noise_scheduler.sample_random_times(batch)
 
-        # scale image embed (Katherine)
+    #     # scale image embed (Katherine)
+    #     moleculargraph_embed *= self.graph_embed_scale
+
+    #     # calculate forward loss
+    #     return self.p_losses(
+    #         moleculargraph_embed, times, spectrum_cond=spectrum_cond, *args, **kwargs
+    #     )
+    
+    def forward(self, batch):
+        # 统一输入输出格式，与其他模型保持一致
+        batch_graph = batch["graph"]
+        batch_property = batch.get("property", {})
+        batch_spectrum = batch.get("spectrum", {})
+        
+        # 1. 数据预处理和验证
+        if batch_graph.edges.T.size == 0:
+            return {
+                "loss_dict": {"loss": paddle.to_tensor(0.0)},
+                "pred_dict": {},
+                "label_dict": {},
+                "node_mask": None
+            }
+
+        # 2. 获取分子图嵌入
+        if "moleculargraph" in batch:
+            moleculargraph_embed, _ = self.clip.graph_encoder(batch["moleculargraph"])
+        else:
+            dense_data, node_mask = diffgraphformer_utils.to_dense(
+                paddle.to_tensor(batch_graph.node_feat["feat"]),
+                paddle.to_tensor(batch_graph.edges.T),
+                paddle.to_tensor(batch_graph.edge_feat["feat"]),
+                paddle.to_tensor(batch_graph.graph_node_id),
+            )
+            moleculargraph_embed = dense_data.X
+
+        # 3. 获取文本条件
+        spectrum_cond = {}
+        if "spectrum" in batch:
+            spectrum_embed, spectrum_encodings = self.clip.spectrum_encoder(batch_spectrum)
+            spectrum_cond["spectrum_embed"] = spectrum_embed
+            if self.condition_on_spectrum_encodings:
+                spectrum_cond["spectrum_encodings"] = spectrum_encodings
+        elif "spectrum_embed" in batch:
+            spectrum_cond["spectrum_embed"] = batch["spectrum_embed"]
+
+        # 4. 扩散过程
+        batch_size = moleculargraph_embed.shape[0]
+        times = self.noise_scheduler.sample_random_times(batch_size)
         moleculargraph_embed *= self.graph_embed_scale
 
-        # calculate forward loss
-        return self.p_losses(
-            moleculargraph_embed, times, text_cond=text_cond, *args, **kwargs
+        # 5. 计算损失
+        loss_dict = self.p_losses(
+            moleculargraph_embed, 
+            times, 
+            spectrum_cond=spectrum_cond
         )
+
+        # 6. 返回统一格式的结果字典
+        return {
+            "loss_dict": loss_dict,
+            "pred_dict": {
+                "moleculargraph_embed": moleculargraph_embed,
+                "spectrum_embed": spectrum_cond.get("spectrum_embed"),
+                "times": times
+            },
+            "label_dict": {
+                "graph": batch_graph,
+                "property": batch_property
+            }
+        }
 
     def generate_embed_vector(self, batch):
         batch_graph, other_data = batch
@@ -996,25 +1050,25 @@ class DiffPrior(nn.Layer):
             graph_X, graph_E, graph_y, node_mask
         )
 
-        text_conditionVec = other_data["conditionVec"]
-        text_conditionVec = text_conditionVec.reshape(
+        spectrum_conditionVec = other_data["conditionVec"]
+        spectrum_conditionVec = spectrum_conditionVec.reshape(
             [batch_length, self.config["CLIP"]["nmr_encoder"]["max_len"]]
         )
 
         assert isinstance(
-            text_conditionVec, paddle.Tensor
-        ), "nmr_text_conditionVec should be a tensor, but got type {}".format(
-            type(text_conditionVec)
+            spectrum_conditionVec, paddle.Tensor
+        ), "nmr_spectrum_conditionVec should be a tensor, but got type {}".format(
+            type(spectrum_conditionVec)
         )
-        text_srcMask = self.clip.make_src_mask(text_conditionVec)
+        spectrum_srcMask = self.clip.make_src_mask(spectrum_conditionVec)
 
-        clip_text_embeds = self.clip.spectrum_encoder(text_conditionVec, text_srcMask)
-        clip_text_embeds = clip_text_embeds.reshape([clip_text_embeds.shape[0], -1])
-        clip_text_embeds = self.clip.spectrum_encoder_projector(clip_text_embeds)
+        clip_spectrum_embeds = self.clip.spectrum_encoder(spectrum_conditionVec, spectrum_srcMask)
+        clip_spectrum_embeds = clip_spectrum_embeds.reshape([clip_spectrum_embeds.shape[0], -1])
+        clip_spectrum_embeds = self.clip.spectrum_encoder_projector(clip_spectrum_embeds)
 
-        return clip_graph_embeds, clip_text_embeds
+        return clip_graph_embeds, clip_spectrum_embeds
 
-    def p_losses(self, moleculargraph_embed, times, text_cond, noise=None):
+    def p_losses(self, moleculargraph_embed, times, spectrum_cond, noise=None):
         noise = default(
             noise,
             lambda: paddle.randn(
@@ -1030,16 +1084,16 @@ class DiffPrior(nn.Layer):
         if self.net.self_cond and random.random() < 0.5:
             with paddle.no_grad():
                 self_cond = self.net(
-                    moleculargraph_embed_noisy, times, **text_cond
+                    moleculargraph_embed_noisy, times, **spectrum_cond
                 ).detach()
 
         pred = self.net(
             moleculargraph_embed_noisy,
             times,
             self_cond=self_cond,
-            text_cond_drop_prob=self.text_cond_drop_prob,
+            spectrum_cond_drop_prob=self.spectrum_cond_drop_prob,
             graph_cond_drop_prob=self.graph_cond_drop_prob,
-            **text_cond,
+            **spectrum_cond,
         )
 
         if self.predict_x_start and self.training_clamp_l2norm:
@@ -1063,48 +1117,48 @@ class DiffPrior(nn.Layer):
 
     @paddle.no_grad()
     def sample(
-        self, text, mask, num_samples_per_batch=2, cond_scale=1.0, timesteps=None
+        self, spectrum, mask, num_samples_per_batch=2, cond_scale=1.0, timesteps=None
     ):
         timesteps = default(timesteps, self.sample_timesteps)
 
-        text = repeat(text, "b ... -> (b r) ...", r=num_samples_per_batch)
+        spectrum = repeat(spectrum, "b ... -> (b r) ...", r=num_samples_per_batch)
         mask = repeat(mask, "b ... -> (b r) ...", r=num_samples_per_batch)
 
-        batch_size = tuple(text.shape)[0]
+        batch_size = tuple(spectrum.shape)[0]
         graph_embed_dim = self.graph_embed_dim
 
-        text_embeds = self.clip.spectrum_encoder(text, mask)
-        text_embeds = text_embeds.reshape([text_embeds.shape[0], -1])
-        text_embeds = self.clip.spectrum_encoder_projector(text_embeds)
+        spectrum_embeds = self.clip.spectrum_encoder(spectrum, mask)
+        spectrum_embeds = spectrum_embeds.reshape([spectrum_embeds.shape[0], -1])
+        spectrum_embeds = self.clip.spectrum_encoder_projector(spectrum_embeds)
 
-        text_cond = dict(text_embed=text_embeds)
+        spectrum_cond = dict(spectrum_embed=spectrum_embeds)
 
-        if self.condition_on_text_encodings:
-            text_encodings = None  # TODO: revise this
-            text_cond = {**text_cond, "text_encodings": text_encodings}
+        if self.condition_on_spectrum_encodings:
+            spectrum_encodings = None  # TODO: revise this
+            spectrum_cond = {**spectrum_cond, "spectrum_encodings": spectrum_encodings}
 
         graph_embeds = self.p_sample_loop(
             (batch_size, graph_embed_dim),
-            text_cond=text_cond,
+            spectrum_cond=spectrum_cond,
             cond_scale=cond_scale,
             timesteps=timesteps,
         )
 
         # retrieve original unscaled image embed
 
-        text_embeds = text_cond["text_embed"]
+        spectrum_embeds = spectrum_cond["spectrum_embed"]
 
-        text_embeds = rearrange(
-            text_embeds, "(b r) d -> b r d", r=num_samples_per_batch
+        spectrum_embeds = rearrange(
+            spectrum_embeds, "(b r) d -> b r d", r=num_samples_per_batch
         )
         graph_embeds = rearrange(
             graph_embeds, "(b r) d -> b r d", r=num_samples_per_batch
         )
 
-        text_image_sims = paddle.einsum(
-            "b r d, b r d -> b r", l2norm(text_embeds), l2norm(graph_embeds)
+        spectrum_image_sims = paddle.einsum(
+            "b r d, b r d -> b r", l2norm(spectrum_embeds), l2norm(graph_embeds)
         )
-        top_sim_indices = text_image_sims.topk(k=1)[1]
+        top_sim_indices = spectrum_image_sims.topk(k=1)[1]
 
         top_sim_indices = repeat(top_sim_indices, "b 1 -> b 1 d", d=graph_embed_dim)
 
@@ -1128,7 +1182,7 @@ class DiffPrior(nn.Layer):
         return graph_embed
 
     @paddle.no_grad()
-    def p_sample_loop_ddpm(self, shape, text_cond, cond_scale=1.0):
+    def p_sample_loop_ddpm(self, shape, spectrum_cond, cond_scale=1.0):
         batch = shape[0]
         graph_embed = paddle.randn(shape=shape)
         x_start = None
@@ -1144,7 +1198,7 @@ class DiffPrior(nn.Layer):
             graph_embed, x_start = self.p_sample(
                 graph_embed,
                 times,
-                text_cond=text_cond,
+                spectrum_cond=spectrum_cond,
                 self_cond=self_cond,
                 cond_scale=cond_scale,
             )
@@ -1154,7 +1208,7 @@ class DiffPrior(nn.Layer):
 
     @paddle.no_grad()
     def p_sample_loop_ddim(
-        self, shape, text_cond, *, timesteps, eta=1.0, cond_scale=1.0
+        self, shape, spectrum_cond, *, timesteps, eta=1.0, cond_scale=1.0
     ):
         batch, alphas, total_timesteps = (
             shape[0],
@@ -1180,7 +1234,7 @@ class DiffPrior(nn.Layer):
                 time_cond,
                 self_cond=self_cond,
                 cond_scale=cond_scale,
-                **text_cond,
+                **spectrum_cond,
             )
             if self.predict_v:
                 x_start = self.noise_scheduler.predict_start_from_v(
@@ -1218,7 +1272,7 @@ class DiffPrior(nn.Layer):
 
     @paddle.no_grad()
     def p_sample(
-        self, x, t, text_cond=None, self_cond=None, clip_denoised=True, cond_scale=1.0
+        self, x, t, spectrum_cond=None, self_cond=None, clip_denoised=True, cond_scale=1.0
     ):
         (
             b,
@@ -1227,7 +1281,7 @@ class DiffPrior(nn.Layer):
         model_mean, _, model_log_variance, x_start = self.p_mean_variance(
             x=x,
             t=t,
-            text_cond=text_cond,
+            spectrum_cond=spectrum_cond,
             self_cond=self_cond,
             clip_denoised=clip_denoised,
             cond_scale=cond_scale,
@@ -1240,14 +1294,14 @@ class DiffPrior(nn.Layer):
         return pred, x_start
 
     def p_mean_variance(
-        self, x, t, text_cond, self_cond=None, clip_denoised=False, cond_scale=1.0
+        self, x, t, spectrum_cond, self_cond=None, clip_denoised=False, cond_scale=1.0
     ):
         assert not (
             cond_scale != 1.0 and not self.can_classifier_guidance
         ), "the model was not trained with conditional dropout, and thus one cannot \
             use classifier free guidance (cond_scale anything other than 1)"
         pred = self.net.forward_with_cond_scale(
-            x, t, cond_scale=cond_scale, self_cond=self_cond, **text_cond
+            x, t, cond_scale=cond_scale, self_cond=self_cond, **spectrum_cond
         )
         if self.predict_v:
             x_start = self.noise_scheduler.predict_start_from_v(x, t=t, v=pred)

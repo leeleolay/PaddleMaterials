@@ -111,9 +111,9 @@ if __name__ == "__main__":
     train_smiles = dataset_infos.train_smiles
 
     # extra features
-    if config["Model"]["__init_params__"].get("diffmodel_cfg", None) is not None:
+    if config.get("DataInfo", None) is not None:
         extra_features = ExtraFeatures(
-            config["Model"]["__init_params__"]["diffmodel_cfg"]["extra_features"],
+            config["DataInfo"]["extra_features"],
             dataset_infos=dataset_infos,
         )
         domain_features = ExtraMolecularFeatures(
@@ -124,9 +124,7 @@ if __name__ == "__main__":
             dataloader=fallback_loader,
             extra_features=extra_features,
             domain_features=domain_features,
-            conditionDim=config["Model"]["__init_params__"]["diffmodel_cfg"][
-                "conditdim"
-            ],
+            conditionDim=config["DataInfo"]["conditdim"],
         )
     else:
         extra_features = DummyExtraFeatures()
@@ -135,13 +133,12 @@ if __name__ == "__main__":
     # CLIP for sample metric
     if config.get("CLIP", None) is not None:
         model_cfg = config["CLIP"]
-        model = build_model(
+        clip_module = build_model(
             model_cfg,
             extra_features=extra_features,
             domain_features=domain_features,
             dataset_infos=dataset_infos,
         )
-        clip_module = getattr(model, "clip", None)
     else:
         clip_module = None
 

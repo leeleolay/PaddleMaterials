@@ -136,8 +136,8 @@ Model:
       num_timesteps: 1000
       num_time_embeds: 1
       num_graph_embeds: 1
-      num_text_embeds: 1
-      max_text_len: 256
+      num_spectrum_embeds: 1
+      max_spectrum_len: 256
       self_cond: False
       depth: 6
       dim_head: 64
@@ -147,13 +147,13 @@ Model:
       timesteps: 1000
       sample_timesteps: 64
       cond_drop_prob: 0.1
-      text_cond_drop_prob: 0.05
+      spectrum_cond_drop_prob: 0.05
       graph_cond_drop_prob: 0.05
       loss_type: "l2"
       predict_x_start: true
       predict_v: false
       beta_schedule: "cosine"
-      condition_on_text_encodings: false
+      condition_on_spectrum_encodings: false
       sampling_clamp_l2norm: false
       sampling_final_clamp_l2norm: false
       training_clamp_l2norm: false
@@ -162,6 +162,42 @@ Model:
 
 
 CLIP:
+    __class_name__: NMRNetCLIP
+    __init_params__:
+      spectrum_encoder:
+        pretrained_model_path: "./pretrained/DiffNMR_NMRNet_nless15_best.pdparams"
+        dim_enc_H: 1024
+        dimff_enc_H: 2048
+        dim_enc_C: 256
+        dimff_enc_C: 512
+        ffn_hidden: 512
+        n_head: 8
+        n_layers: 3
+        drop_prob: 0.1 # 0.0
+        seq_len_H1: 20
+        seq_len_C13: 75
+        peakwidthemb_num: 70
+        integralemb_num: 26
+      graph_encoder:
+        pretrained_model_path: "./pretrained/DiffNMR_DiffGraphFormer_nless15_best.pdparams"
+        n_layers_GT: 5
+        hidden_mlp_dims: {
+          "X": 256,
+          "E": 128,
+          "y": 256,
+        }
+        hidden_dims: {
+          'dx': 256,
+          'de': 64,
+          'dy': 256,
+          'n_head': 8,
+          'dim_ffX': 256,
+          'dim_ffE': 128,
+          'dim_ffy': 256,
+        }
+      diffmodel_cfg: # to be deleted
+        extra_features: 'all' # 'all', 'cycles', 'eigenvalues' or null
+        conditdim: 512
 
 
 Optimizer:
@@ -237,3 +273,8 @@ Dataset:
         shuffle: True
         drop_last: False
         batch_size: 256
+
+
+DataInfo:
+    extra_features: 'all' # 'all', 'cycles', 'eigenvalues' or null
+    conditdim: 512

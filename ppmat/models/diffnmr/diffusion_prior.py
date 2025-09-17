@@ -37,8 +37,8 @@ class DiffPriorNetwork(nn.Layer):
         num_timesteps=None,
         num_time_embeds=1,
         num_graph_embeds=1,
-        num_text_embeds=1,
-        max_text_len=256,
+        num_spectrum_embeds=1,
+        max_spectrum_len=256,
         self_cond=False,
         **kwargs,
     ):
@@ -46,12 +46,12 @@ class DiffPriorNetwork(nn.Layer):
         self.dim = dim
         self.num_time_embeds = num_time_embeds
         self.num_graph_embeds = num_graph_embeds
-        self.num_text_embeds = num_text_embeds
-        self.to_text_embeds = paddle.nn.Sequential(
-            paddle.nn.Linear(in_features=dim, out_features=dim * num_text_embeds)
-            if num_text_embeds > 1
+        self.num_spectrum_embeds = num_spectrum_embeds
+        self.to_spectrum_embeds = paddle.nn.Sequential(
+            paddle.nn.Linear(in_features=dim, out_features=dim * num_spectrum_embeds)
+            if num_spectrum_embeds > 1
             else paddle.nn.Identity(),
-            Rearrange("b (n d) -> b n d", n=num_text_embeds),
+            Rearrange("b (n d) -> b n d", n=num_spectrum_embeds),
         )
         self.continuous_embedded_time = not exists(num_timesteps)
         self.to_time_embeds = paddle.nn.Sequential(
@@ -74,12 +74,12 @@ class DiffPriorNetwork(nn.Layer):
             tensor=paddle.randn(shape=[dim])
         )
         self.causal_transformer = CausalTransformer(dim=dim, **kwargs)
-        self.max_text_len = max_text_len
-        self.null_text_encodings = paddle.base.framework.EagerParamBase.from_tensor(
-            tensor=paddle.randn(shape=[1, max_text_len, dim])
+        self.max_spectrum_len = max_spectrum_len
+        self.null_spectrum_encodings = paddle.base.framework.EagerParamBase.from_tensor(
+            tensor=paddle.randn(shape=[1, max_spectrum_len, dim])
         )
-        self.null_text_embeds = paddle.base.framework.EagerParamBase.from_tensor(
-            tensor=paddle.randn(shape=[1, num_text_embeds, dim])
+        self.null_spectrum_embeds = paddle.base.framework.EagerParamBase.from_tensor(
+            tensor=paddle.randn(shape=[1, num_spectrum_embeds, dim])
         )
         self.null_graph_embed = paddle.base.framework.EagerParamBase.from_tensor(
             tensor=paddle.randn(shape=[1, dim])
@@ -93,7 +93,7 @@ class DiffPriorNetwork(nn.Layer):
             return logits
 
         null_logits = self.forward(
-            *args, text_cond_drop_prob=1.0, graph_cond_drop_prob=1, **kwargs
+            *args, spectrum_cond_drop_prob=1.0, graph_cond_drop_prob=1, **kwargs
         )
         return null_logits + (logits - null_logits) * cond_scale
 
@@ -102,10 +102,10 @@ class DiffPriorNetwork(nn.Layer):
         graph_embed,
         diffusion_timesteps,
         *,
-        text_embed,
-        text_encodings=None,
+        spectrum_embed,
+        spectrum_encodings=None,
         self_cond=None,
-        text_cond_drop_prob=0.0,
+        spectrum_cond_drop_prob=0.0,
         graph_cond_drop_prob=0.0,
     ):
         batch, dim, dtype = (
@@ -113,10 +113,10 @@ class DiffPriorNetwork(nn.Layer):
             graph_embed.dtype,
         )
 
-        # num_time_embeds, num_graph_embeds, num_text_embeds = (
+        # num_time_embeds, num_graph_embeds, num_spectrum_embeds = (
         #     self.num_time_embeds,
         #     self.num_graph_embeds,
-        #     self.num_text_embeds,
+        #     self.num_spectrum_embeds,
         # ) # TODO: check it from original dalle2 repo
 
         # setup self conditioning
@@ -127,41 +127,41 @@ class DiffPriorNetwork(nn.Layer):
             self_cond = rearrange(self_cond, "b d -> b 1 d")
 
         # in section 2.2 of DALLE-2 paper, last paragraph
-        # "... consisting of encoded text, CLIP text embedding, diffusion timestep
+        # "... consisting of encoded spectrum, CLIP spectrum embedding, diffusion timestep
         # embedding, noised CLIP image embedding, final embedding for prediction"
-        text_embed = self.to_text_embeds(text_embed)
+        spectrum_embed = self.to_spectrum_embeds(spectrum_embed)
         graph_embed = self.to_graph_embeds(graph_embed)
 
         # classifier free guidance masks
-        text_keep_mask = prob_mask_like((batch,), 1 - text_cond_drop_prob)
-        text_keep_mask = rearrange(text_keep_mask, "b -> b 1 1")
+        spectrum_keep_mask = prob_mask_like((batch,), 1 - spectrum_cond_drop_prob)
+        spectrum_keep_mask = rearrange(spectrum_keep_mask, "b -> b 1 1")
 
         image_keep_mask = prob_mask_like((batch,), 1 - graph_cond_drop_prob)
         image_keep_mask = rearrange(image_keep_mask, "b -> b 1 1")
-        if not exists(text_encodings):
-            text_encodings = paddle.empty(shape=(batch, 0, dim), dtype=dtype)
+        if not exists(spectrum_encodings):
+            spectrum_encodings = paddle.empty(shape=(batch, 0, dim), dtype=dtype)
 
-        # make text encodings optional
+        # make spectrum encodings optional
         # although the paper seems to suggest it is present
-        if not exists(text_encodings):
-            text_encodings = paddle.empty(shape=(batch, 0, dim), dtype=dtype)
+        if not exists(spectrum_encodings):
+            spectrum_encodings = paddle.empty(shape=(batch, 0, dim), dtype=dtype)
 
-        if text_encodings.shape[1] == 0:
+        if spectrum_encodings.shape[1] == 0:
             mask = paddle.zeros(shape=(batch, 0), dtype=bool)
         else:
-            mask = paddle.any(x=text_encodings != 0.0, axis=-1)
+            mask = paddle.any(x=spectrum_encodings != 0.0, axis=-1)
 
-        # replace any padding in the text encodings with learned
+        # replace any padding in the spectrum encodings with learned
         # padding tokens unique across position
-        text_encodings = text_encodings[:, : self.max_text_len]
-        mask = mask[:, : self.max_text_len]
+        spectrum_encodings = spectrum_encodings[:, : self.max_spectrum_len]
+        mask = mask[:, : self.max_spectrum_len]
 
-        text_len = tuple(text_encodings.shape)[-2]
-        remainder = self.max_text_len - text_len
+        spectrum_len = tuple(spectrum_encodings.shape)[-2]
+        remainder = self.max_spectrum_len - spectrum_len
 
         if remainder > 0:
-            text_encodings = nn.functional.pad(
-                x=text_encodings,
+            spectrum_encodings = nn.functional.pad(
+                x=spectrum_encodings,
                 pad=(0, 0, 0, remainder),
                 value=0.0,
                 pad_from_left_axis=False,
@@ -171,20 +171,20 @@ class DiffPriorNetwork(nn.Layer):
                 x=mask, pad=(0, remainder), value=0, pad_from_left_axis=False
             ).astype("bool")
 
-        # mask out text encodings with null encodings
-        null_text_encodings = self.null_text_encodings.to(text_encodings.dtype)
+        # mask out spectrum encodings with null encodings
+        null_spectrum_encodings = self.null_spectrum_encodings.to(spectrum_encodings.dtype)
 
-        text_encodings = paddle.where(
-            condition=rearrange(mask, "b n -> b n 1").clone() & text_keep_mask,
-            x=text_encodings,
-            y=null_text_encodings,
+        spectrum_encodings = paddle.where(
+            condition=rearrange(mask, "b n -> b n 1").clone() & spectrum_keep_mask,
+            x=spectrum_encodings,
+            y=null_spectrum_encodings,
         )
 
-        # mask out text embeddings with null text embeddings
-        null_text_embeds = self.null_text_embeds.to(text_embed.dtype)
+        # mask out spectrum embeddings with null spectrum embeddings
+        null_spectrum_embeds = self.null_spectrum_embeds.to(spectrum_embed.dtype)
 
-        text_embed = paddle.where(
-            condition=text_keep_mask, x=text_embed, y=null_text_embeds
+        spectrum_embed = paddle.where(
+            condition=spectrum_keep_mask, x=spectrum_embed, y=null_spectrum_embeds
         )
 
         # mask out image embeddings with null image embeddings
@@ -194,7 +194,7 @@ class DiffPriorNetwork(nn.Layer):
             condition=image_keep_mask, x=graph_embed, y=null_graph_embed
         )
 
-        # whether text embedding is used for conditioning depends on whether text
+        # whether spectrum embedding is used for conditioning depends on whether spectrum
         # encodings are available for attention (for classifier free guidance,
         # even though it seems from the paper it was not used in the prior ddpm,
         # as the objective is different)
@@ -210,7 +210,7 @@ class DiffPriorNetwork(nn.Layer):
             learned_queries = paddle.concat(x=(self_cond, learned_queries), axis=-2)
 
         tokens = paddle.concat(
-            x=(text_encodings, text_embed, time_embed, graph_embed, learned_queries),
+            x=(spectrum_encodings, spectrum_embed, time_embed, graph_embed, learned_queries),
             axis=-2,
         )
 

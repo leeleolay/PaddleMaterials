@@ -353,3 +353,7 @@ Dataset:
         shuffle: True
         drop_last: False
         batch_size: 256
+
+DataInfo:
+    extra_features: 'all' # 'all', 'cycles', 'eigenvalues' or null
+    conditdim: 512
