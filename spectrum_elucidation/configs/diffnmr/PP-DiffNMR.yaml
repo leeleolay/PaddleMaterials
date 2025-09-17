@@ -36,11 +36,11 @@ Global:
 
 Trainer:
   # Max epochs to train
-  max_epochs: 2000
+  max_epochs: 1000
   # Random seed
   seed: 42
   # Save path for checkpoints and logs
-  output_dir: ./output/DiffNMR/DiffNMR
+  output_dir: ./output/DiffNMR_CHnmr/DiffGraphFormer/train
   # Save frequency [epoch], for example, save_freq=10 means save checkpoints every 10 epochs
   save_freq: 100 # set 0 to disable saving during training
   # Logging frequency [step], for example, log_freq=10 means log every 10 steps
@@ -175,6 +175,37 @@ Model:
       extra_features: 'all' # 'all', 'cycles', 'eigenvalues' or null
       lambda_train: [5, 0]
       conditdim: 512
+    connector_cfg:  # if no connector set null
+      __name__: DiffPrior
+      pretrained_model_path: ./output/DiffNMR_CHnmr/DiffGraphFormer/train/checkpoints/best.pdparams
+      model_cfg:
+        dim: 512
+        num_timesteps: 1000
+        num_time_embeds: 1
+        num_graph_embeds: 1
+        num_spectrum_embeds: 1
+        max_spectrum_len: 256
+        self_cond: False
+        depth: 6
+        dim_head: 64
+        heads: 8
+      sample_cfg:
+        graph_embed_dim: 512
+        timesteps: 1000
+        sample_timesteps: 64
+        cond_drop_prob: 0.1
+        spectrum_cond_drop_prob: 0.05
+        graph_cond_drop_prob: 0.05
+        loss_type: "l2"
+        predict_x_start: true
+        predict_v: false
+        beta_schedule: "cosine"
+        condition_on_spectrum_encodings: false
+        sampling_clamp_l2norm: false
+        sampling_final_clamp_l2norm: false
+        training_clamp_l2norm: false
+        init_graph_embed_l2norm: false
+        graph_embed_scale: null
 
 
 CLIP:
@@ -225,10 +256,6 @@ Optimizer:
       epsilon: 1e-8
       lr: 0.0002
 
-Metric:
-    __class_name__: DiffNMRStreamingAdapter
-    __init_params__:
-      dataset_infos: null   # insert by Trainer when runtime
 
 Dataset:
   train:
@@ -253,7 +280,7 @@ Dataset:
       __init_params__:
         shuffle: False
         drop_last: False
-        batch_size: 256
+        batch_size: 64
   val:
     dataset:
       __class_name__: MSDnmrDataset
@@ -272,7 +299,7 @@ Dataset:
       __init_params__:
         shuffle: False
         drop_last: False
-        batch_size: 256
+        batch_size: 64
   test:
     dataset:
       __class_name__: MSDnmrDataset
@@ -291,7 +318,8 @@ Dataset:
       __init_params__:
         shuffle: True
         drop_last: False
-        batch_size: 256
+        batch_size: 64
+
 
 DataInfo:
     extra_features: 'all' # 'all', 'cycles', 'eigenvalues' or null

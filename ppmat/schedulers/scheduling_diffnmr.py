@@ -571,7 +571,9 @@ def step(
             global_H, _ = model.encoder(conditionVec)
             embeddings_spectrum = global_H
         else:
-            embeddings_spectrum = model.encoder(conditionVec)
+            embeddings_spectrum, (spectrum_encoding, _) = model.encoder(conditionVec)
+        if model.connector_flag is True:
+            embeddings_spectrum = model.connector.sample(embeddings_spectrum, spectrum_encoding)
         input_y = paddle.concat([input_y, embeddings_spectrum], axis=1).astype(
             "float32"
         )

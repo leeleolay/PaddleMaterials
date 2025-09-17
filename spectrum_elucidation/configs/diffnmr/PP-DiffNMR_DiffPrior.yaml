@@ -36,11 +36,11 @@ Global:
 
 Trainer:
   # Max epochs to train
-  max_epochs: 1000
+  max_epochs: 2000
   # Random seed
   seed: 42
   # Save path for checkpoints and logs
-  output_dir: ./output/DiffNMR_CHnmr/DiffGraphFormer/train
+  output_dir: ./output/DiffNMR/DiffPrior/train
   # Save frequency [epoch], for example, save_freq=10 means save checkpoints every 10 epochs
   save_freq: 100 # set 0 to disable saving during training
   # Logging frequency [step], for example, log_freq=10 means log every 10 steps
@@ -99,13 +99,14 @@ Sampler:
   visual_num: 10 # number of visualize molecules in the sample
   chains_to_save: 5 # less sample batch size, select representative sample in sample batch for visualize
   number_chain_steps: 10 # Number of frames in each gif
-  sample_batch_iters: 1 # Number of sample batches
+  sample_batch_iters: 100 # Number of sample batches
   flag_retrival_sampling: False
   flag_use_formula: False
   flag_retrival_initilization: False
   num_candidates: 1
-  pretrained_model_path: ./pretrained/step1_best.pdparams
-  output_dir: ./output/DiffNMR_CHnmr/DiffGraphFormer/sample
+  retrival_database_path: ./spectrum_elucidation/retrival_database/mol_rep_15.csv
+  pretrained_model_path: ./pretrained/DiffNMR_nless15_best.pdparams
+  output_dir: ./output/PP-DiffNMR/DiffNMR/sample
   out_dict: {"Accuracy"}
   data:
     dataset:
@@ -234,7 +235,7 @@ Dataset:
       __init_params__:
         shuffle: False
         drop_last: False
-        batch_size: 256
+        batch_size: 64
   val:
     dataset:
       __class_name__: MSDnmrDataset
@@ -253,7 +254,7 @@ Dataset:
       __init_params__:
         shuffle: False
         drop_last: False
-        batch_size: 256
+        batch_size: 64
   test:
     dataset:
       __class_name__: MSDnmrDataset
@@ -272,7 +273,7 @@ Dataset:
       __init_params__:
         shuffle: True
         drop_last: False
-        batch_size: 256
+        batch_size: 64
 
 
 DataInfo:

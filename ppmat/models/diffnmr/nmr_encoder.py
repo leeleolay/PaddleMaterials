@@ -176,8 +176,8 @@ class NMR_fusion(nn.Layer):
         tensor_Cnmr = tensor_Cnmr[:, : int(max_len_C), :]
 
         # project to uniform dimension
-        H_aligned = self.proj_h(tensor_Hnmr)
-        C_aligned = self.proj_c(tensor_Cnmr)
+        H_aligned = self.proj_h(tensor_Hnmr) # [B, Lh, D]
+        C_aligned = self.proj_c(tensor_Cnmr) # [B, Lc, D]
 
         # bidirectonal cross-attention
         pad_mask_H = mask_H == 1
@@ -207,55 +207,53 @@ class NMR_fusion(nn.Layer):
         # combine the cross-attention output of two modalities with the origin features
         if self.bi_crossattn_fusion_mode == "concat":
             # Method 1: Concatenate outputs from two directions
-            fused_H = paddle.concat(
-                [H_aligned, attn_H2C], axis=-1
-            )  # [batch, seq_a, 2*hidden_dim]
-            fused_C = paddle.concat(
-                [C_aligned, attn_C2H], axis=-1
-            )  # [batch, seq_b, 2*hidden_dim]
+            fused_H = paddle.concat([H_aligned, attn_H2C], axis=-1)  # [B, Lh, 2*D]
+            fused_C = paddle.concat([C_aligned, attn_C2H], axis=-1)  # [B, Lc, 2*D]
 
         elif self.bi_crossattn_fusion_mode == "add":
             # Method 2: Residual connection
-            fused_H = H_aligned + attn_H2C  # [batch, seq_a, hidden_dim]
-            fused_C = C_aligned + attn_C2H  # [batch, seq_b, hidden_dim]
+            fused_H = H_aligned + attn_H2C  # [B, Lh, 2*D]
+            fused_C = C_aligned + attn_C2H  # [B, Lc, 2*D]
 
         elif self.bi_crossattn_fusion_mode == "gated":
             # Method 3: Gated Fusion (Adaptive Weights)
-            gate_H = F.sigmoid(self.gate_linear(attn_H2C))  # 计算权重
+            gate_H = F.sigmoid(self.gate_linear(attn_H2C))
             fused_H = (1 - gate_H) * H_aligned + gate_H * attn_H2C
-            gate_C = F.sigmoid(self.gate_linear(attn_C2H))  # 计算权重
+            gate_C = F.sigmoid(self.gate_linear(attn_C2H))
             fused_C = (1 - gate_C) * C_aligned + gate_C * attn_C2H
 
         else:
-            fused_H = attn_H2C
-            fused_C = attn_C2H
+            fused_H, fused_C = attn_H2C, attn_C2H
 
-        # Intra-modal Aggregation
+        # Intra-modal Aggregation (Temporal Pooling)
         if self.pool_mode == "mean_pool":
             # method 1：average pooling
-            global_H = self.masked_mean_pool(fused_H, mask_H)
-
-            global_C = self.masked_mean_pool(fused_C, mask_C)  # [batch, 256]
+            global_H = self.masked_mean_pool(fused_H, mask_H)  # [B, Dh]
+            global_C = self.masked_mean_pool(fused_C, mask_C)  # [B, Dc]
 
         elif self.pool_mode == "attn_pool":
             # Apply attention pooling to each of the two modalities separately
-            global_H = self.attn_pool(fused_H, mask_H)
-            global_C = self.attn_pool(fused_C, mask_C)  # [batch, 256]
+            global_H = self.attn_pool(fused_H, mask_H)  # [B, D*]
+            global_C = self.attn_pool(fused_C, mask_C)  # [B, D*]
 
-        # cross-modal fusion
+        # cross-modal fusion (obtained spectrum_embedding)
         if self.crossmodal_fusion == "concat_linear":
-            merged = paddle.concat([global_H, global_C], axis=-1)  # [batch, 512]
-            global_output = self.concat_linear(merged)  # 压缩到 [batch, 256]
-
+            merged = paddle.concat([global_H, global_C], axis=-1)  # [B, 2D*]
+            global_output = self.concat_linear(merged)             # [B, D]
         elif self.crossmodal_fusion == "weighted_sum":
             merged = paddle.concat([global_H, global_C], axis=-1)
-            # 或者
+            # option
             # merged = global_H + global_C
+            gate = F.sigmoid(self.weighted_sum(merged))             # [B, 1]
+            global_output = gate * global_H + (1 - gate) * global_C # [B, D*]
+        else:
+            global_output = (global_H, global_C)                    
 
-            gate = F.sigmoid(self.weighted_sum(merged))  # [batch,1]
-            global_output = gate * global_H + (1 - gate) * global_C
 
-        return global_output
+        spectrum_token_enc = paddle.concat([fused_H, fused_C], axis=1) # [B, Lh+Lc, D or 2*D]
+        spectrum_token_mask = paddle.concat([mask_H, mask_C], axis=1) # [B, Lh+Lc]
+
+        return global_output, (spectrum_token_enc, spectrum_token_mask)
 
 
 class NMR_fusion_H(nn.Layer):

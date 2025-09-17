@@ -423,7 +423,7 @@ class NMRNetCLIP(nn.Layer):
 
         # compute similarity between graph and NMR
         V1_f = condition_graph  # Assuming V1 is a feature obtained from molecular graph
-        V2_f = condition_nmr  # Assume V2 is a feature obtained from NMR spectrum
+        V2_f, _ = condition_nmr  # Assume V2 is a feature obtained from NMR spectrum
         V1_e = paddle.nn.functional.normalize(x=V1_f, p=2, axis=1)
         V2_e = paddle.nn.functional.normalize(x=V2_f, p=2, axis=1)
         logits = paddle.matmul(x=V1_e, y=V2_e.T) * paddle.exp(
@@ -537,22 +537,11 @@ class DiffNMR(nn.Layer):
         if connector_cfg and connector_cfg["__name__"] == "DiffPrior":
             self.connector_flag = True
             self.connector = DiffPrior(
-                config=connector_cfg,
-                model=DiffPriorNetwork(
-                    dim=connector_cfg["prior_network"]["dim"],
-                    num_timesteps=connector_cfg["prior_network"]["num_timesteps"],
-                    num_time_embeds=connector_cfg["prior_network"]["num_time_embeds"],
-                    num_graph_embeds=connector_cfg["prior_network"]["num_graph_embeds"],
-                    num_spectrum_embeds=connector_cfg["prior_network"]["num_spectrum_embeds"],
-                    max_spectrum_len=connector_cfg["prior_network"]["max_spectrum_len"],
-                    self_cond=connector_cfg["prior_network"]["self_cond"],
-                    depth=connector_cfg["prior_network"]["depth"],
-                    dim_head=connector_cfg["prior_network"]["dim_head"],
-                    heads=connector_cfg["prior_network"]["heads"],
-                ),
+                sample_cfg=connector_cfg["sample_cfg"],
+                connector_cfg=connector_cfg["model_cfg"],
                 clip=clip,
             )
-            state_dict = paddle.load(connector_cfg["pretrained_path"])
+            state_dict = paddle.load(connector_cfg["pretrained_model_path"])
             connector_state_dict = {
                 k[len("connector.") :]: v
                 for k, v in state_dict.items()
@@ -632,52 +621,6 @@ class DiffNMR(nn.Layer):
         # set use formula for training and sample or not
         self.flag_use_formula = diffmodel_cfg.get("flag_use_formula", False)
 
-    # def preprocess_data(self, batch_graph, other_data):
-    #     dense_data, node_mask = diffgraphformer_utils.to_dense(
-    #         batch_graph.node_feat["feat"],
-    #         batch_graph.edges.T,
-    #         batch_graph.edge_feat["feat"],
-    #         batch_graph.graph_node_id,
-    #     )
-    #     dense_data = dense_data.mask(node_mask)
-
-    #     # add noise to the inputs (X, E)
-    #     noisy_data = scheduling_diffnmr.apply_noise(
-    #         self, dense_data.X, dense_data.E, other_data["y"], node_mask,
-    #         self.flag_use_formula
-    #     )
-    #     extra_data = scheduling_diffnmr.compute_extra_data(self, noisy_data)
-
-    #     # concate data
-    #     input_X = paddle.concat(
-    #         [noisy_data["X_t"].astype("float32"), extra_data.X], axis=2
-    #     ).astype(dtype="float32")
-    #     input_E = paddle.concat(
-    #         [noisy_data["E_t"].astype("float32"), extra_data.E], axis=3
-    #     ).astype(dtype="float32")
-    #     input_y = paddle.hstack(
-    #         [noisy_data["y_t"].astype("float32"), extra_data.y]
-    #     ).astype(dtype="float32")
-
-    #     batch_length = batch_graph.num_graph
-    #     condition_H1nmr = other_data["conditionVec"]["H_nmr"]
-    #     condition_H1nmr = condition_H1nmr.reshape(batch_length, self.seq_len_H1, -1)
-    #     condition_C13nmr = other_data["conditionVec"]["C_nmr"]
-    #     condition_C13nmr = condition_C13nmr.reshape(batch_length, self.seq_len_C13)
-    #     num_H_peak = other_data["conditionVec"]["num_H_peak"]
-    #     num_C_peak = other_data["conditionVec"]["num_C_peak"]
-    #     conditionAll = [condition_H1nmr, num_H_peak, condition_C13nmr, num_C_peak]
-
-    #     return (
-    #         dense_data,
-    #         noisy_data,
-    #         node_mask,
-    #         extra_data,
-    #         input_X,
-    #         input_E,
-    #         input_y,
-    #         conditionAll,
-    #     )
 
     def make_src_mask(self, src):
         src_mask = (src != 0).unsqueeze(1).unsqueeze(2)
@@ -735,9 +678,13 @@ class DiffNMR(nn.Layer):
         condition_Spectrum = [condition_H1nmr, num_H_peak, condition_C13nmr, num_C_peak]
         if self.flag_onlyH is True:
             global_H, _ = self.encoder(condition_Spectrum)
-            embeddings_spectrum = global_H
+            embeddings_spectrum, _ = global_H
         else:
-            embeddings_spectrum = self.encoder(condition_Spectrum)
+            embeddings_spectrum, _ = self.encoder(condition_Spectrum)
+        
+        if self.connector_flag is True:
+            embeddings_spectrum = self.connector.sample(embeddings_spectrum)
+        
         input_y = paddle.concat([input_y, embeddings_spectrum], axis=1).astype(
             "float32"
         )
@@ -850,7 +797,7 @@ class DiffNMR(nn.Layer):
         return loss
 
 
-# DiffNMR_v2
+# PP-DiffNMR
 class DiffPrior(nn.Layer):
     def __init__(
         self,
@@ -915,108 +862,83 @@ class DiffPrior(nn.Layer):
             name="_dummy", tensor=paddle.to_tensor(data=[True]), persistable=False
         )
 
-    # def forward(
-    #     self,
-    #     spectrum=None,
-    #     moleculargraph=None,
-    #     spectrum_embed=None,
-    #     moleculargraph_embed=None,
-    #     spectrum_encodings=None,
-    #     *args,
-    #     **kwargs,
-    # ):
-    #     assert exists(spectrum) ^ exists(
-    #         spectrum_embed
-    #     ), "either spectrum or spectrum embedding must be supplied"
-    #     assert exists(moleculargraph) ^ exists(
-    #         moleculargraph_embed
-    #     ), "either moleculegraph or moleculegraph embedding must be supplied"
-    #     assert not (
-    #         self.condition_on_spectrum_encodings
-    #         and (not exists(spectrum_encodings) and not exists(spectrum))
-    #     ), "cannot use both conditions at once"
-
-    #     if exists(moleculargraph):
-    #         moleculargraph_embed, _ = self.clip.graph_encoder(moleculargraph)
-
-    #     # calculate spectrum conditionings, based on what is passed in
-    #     if exists(spectrum):
-    #         spectrum_embed, spectrum_encodings = self.clip.spectrum_encoder(spectrum)
-
-    #     spectrum_cond = dict(spectrum_embed=spectrum_embed)
-
-    #     if self.condition_on_spectrum_encodings:
-    #         assert exists(
-    #             spectrum_encodings
-    #         ), "spectrum encodings must be present for diffusion prior if specified"
-    #         spectrum_cond = {**spectrum_cond, "spectrum_encodings": spectrum_encodings}
-
-    #     # timestep conditioning from ddpm
-    #     batch = tuple(moleculargraph_embed.shape)[0]
-    #     times = self.noise_scheduler.sample_random_times(batch)
-
-    #     # scale image embed (Katherine)
-    #     moleculargraph_embed *= self.graph_embed_scale
-
-    #     # calculate forward loss
-    #     return self.p_losses(
-    #         moleculargraph_embed, times, spectrum_cond=spectrum_cond, *args, **kwargs
-    #     )
     
     def forward(self, batch):
-        # 统一输入输出格式，与其他模型保持一致
+
         batch_graph = batch["graph"]
         batch_property = batch.get("property", {})
         batch_spectrum = batch.get("spectrum", {})
-        
-        # 1. 数据预处理和验证
-        if batch_graph.edges.T.size == 0:
-            return {
-                "loss_dict": {"loss": paddle.to_tensor(0.0)},
-                "pred_dict": {},
-                "label_dict": {},
-                "node_mask": None
-            }
 
-        # 2. 获取分子图嵌入
-        if "moleculargraph" in batch:
-            moleculargraph_embed, _ = self.clip.graph_encoder(batch["moleculargraph"])
-        else:
+        # 1. obtain the graph embeddings
+        if "graph_embed" in batch:
+            graph_embed = batch["graph_embed"]
+        elif "graph" in batch:
             dense_data, node_mask = diffgraphformer_utils.to_dense(
                 paddle.to_tensor(batch_graph.node_feat["feat"]),
-                paddle.to_tensor(batch_graph.edges.T),
+                paddle.to_tensor(batch_graph.edges.T).contiguous(),
                 paddle.to_tensor(batch_graph.edge_feat["feat"]),
                 paddle.to_tensor(batch_graph.graph_node_id),
             )
-            moleculargraph_embed = dense_data.X
+            dense_data = dense_data.mask(node_mask)
+            X, E = dense_data.X, dense_data.E
+            y = paddle.to_tensor(batch_property["y"])
+            z_t = (
+                diffgraphformer_utils.PlaceHolder(X=X, E=E, y=y).type_as(X).mask(node_mask)
+            )
+            extra_data_pure = scheduling_diffnmr.compute_extra_data(
+                self.clip,
+                {"X_t": z_t.X, "E_t": z_t.E, "y_t": z_t.y, "node_mask": node_mask},
+                isPure=True,
+            )
+            input_X_pure = paddle.concat(
+                [z_t.X.astype("float32"), extra_data_pure.X], axis=2
+            ).astype(dtype="float32")
+            input_E_pure = paddle.concat(
+                [z_t.E.astype("float32"), extra_data_pure.E], axis=3
+            ).astype(dtype="float32")
+            input_y_pure = paddle.hstack(
+                x=(z_t.y.astype("float32"), extra_data_pure.y)
+            ).astype(dtype="float32")
+            # obtain the condition vector from output of encoder
+            graph_embed = self.clip.graph_encoder(
+                input_X_pure, input_E_pure, input_y_pure, node_mask
+            )
 
-        # 3. 获取文本条件
+
+        # 2. obtain the spectrum embeddings
         spectrum_cond = {}
-        if "spectrum" in batch:
-            spectrum_embed, spectrum_encodings = self.clip.spectrum_encoder(batch_spectrum)
+        if "spectrum_embed" in batch:
+            spectrum_cond["spectrum_embed"] = batch["spectrum_embed"]
+            if self.condition_on_spectrum_encodings:
+                spectrum_cond["spectrum_encodings"] = batch["spectrum_encodings"]
+        elif "spectrum" in batch:
+            condition_H1nmr = paddle.to_tensor(batch_spectrum["H_nmr"])
+            condition_C13nmr = paddle.to_tensor(batch_spectrum["C_nmr"])
+            num_H_peak = paddle.to_tensor(batch_spectrum["num_H_peak"])
+            num_C_peak = paddle.to_tensor(batch_spectrum["num_C_peak"])
+            condition_Spectrum = [condition_H1nmr, num_H_peak, condition_C13nmr, num_C_peak]
+            spectrum_embed, spectrum_encodings = self.clip.spectrum_encoder(condition_Spectrum)
             spectrum_cond["spectrum_embed"] = spectrum_embed
             if self.condition_on_spectrum_encodings:
                 spectrum_cond["spectrum_encodings"] = spectrum_encodings
-        elif "spectrum_embed" in batch:
-            spectrum_cond["spectrum_embed"] = batch["spectrum_embed"]
 
-        # 4. 扩散过程
-        batch_size = moleculargraph_embed.shape[0]
+        # 3. diffusion process
+        batch_size = graph_embed.shape[0]
         times = self.noise_scheduler.sample_random_times(batch_size)
-        moleculargraph_embed *= self.graph_embed_scale
+        graph_embed *= self.graph_embed_scale
 
-        # 5. 计算损失
+        # 4. calculate loss
         loss_dict = self.p_losses(
-            moleculargraph_embed, 
+            graph_embed, 
             times, 
             spectrum_cond=spectrum_cond
         )
 
-        # 6. 返回统一格式的结果字典
+        # 5. retrun restults
         return {
             "loss_dict": loss_dict,
             "pred_dict": {
-                "moleculargraph_embed": moleculargraph_embed,
+                "graph_embed": graph_embed,
                 "spectrum_embed": spectrum_cond.get("spectrum_embed"),
                 "times": times
             },
@@ -1117,24 +1039,23 @@ class DiffPrior(nn.Layer):
 
     @paddle.no_grad()
     def sample(
-        self, spectrum, mask, num_samples_per_batch=2, cond_scale=1.0, timesteps=None
+        self, spectrum_embeds, spectrum_encodings, num_samples_per_batch=2, cond_scale=1.0, timesteps=None, #mask
     ):
         timesteps = default(timesteps, self.sample_timesteps)
 
-        spectrum = repeat(spectrum, "b ... -> (b r) ...", r=num_samples_per_batch)
-        mask = repeat(mask, "b ... -> (b r) ...", r=num_samples_per_batch)
+        spectrum_embeds = repeat(spectrum_embeds, "b ... -> (b r) ...", r=num_samples_per_batch)
+        # mask = repeat(mask, "b ... -> (b r) ...", r=num_samples_per_batch)
 
-        batch_size = tuple(spectrum.shape)[0]
+        batch_size = tuple(spectrum_embeds.shape)[0]
         graph_embed_dim = self.graph_embed_dim
 
-        spectrum_embeds = self.clip.spectrum_encoder(spectrum, mask)
-        spectrum_embeds = spectrum_embeds.reshape([spectrum_embeds.shape[0], -1])
-        spectrum_embeds = self.clip.spectrum_encoder_projector(spectrum_embeds)
+        # spectrum_embeds = self.clip.spectrum_encoder(spectrum, mask)
+        # spectrum_embeds = spectrum_embeds.reshape([spectrum_embeds.shape[0], -1])
+        # spectrum_embeds = self.clip.spectrum_encoder_projector(spectrum_embeds)
 
         spectrum_cond = dict(spectrum_embed=spectrum_embeds)
 
         if self.condition_on_spectrum_encodings:
-            spectrum_encodings = None  # TODO: revise this
             spectrum_cond = {**spectrum_cond, "spectrum_encodings": spectrum_encodings}
 
         graph_embeds = self.p_sample_loop(
@@ -1190,7 +1111,7 @@ class DiffPrior(nn.Layer):
             graph_embed = l2norm(graph_embed) * self.graph_embed_scale
         for i in tqdm(
             reversed(range(0, self.noise_scheduler.num_timesteps)),
-            desc="sampling loop time step",
+            desc="diffprior sampling",
             total=self.noise_scheduler.num_timesteps,
         ):
             times = paddle.full(shape=(batch,), fill_value=i, dtype="int64")
@@ -1224,7 +1145,7 @@ class DiffPrior(nn.Layer):
         x_start = None
         if self.init_graph_embed_l2norm:
             graph_embed = l2norm(graph_embed) * self.graph_embed_scale
-        for time, time_next in tqdm(time_pairs, desc="sampling loop time step"):
+        for time, time_next in tqdm(time_pairs, desc="diffprior sampling"):
             alpha = alphas[time]
             alpha_next = alphas[time_next]
             time_cond = paddle.full(shape=(batch,), fill_value=time, dtype="int64")
