@@ -47,7 +47,7 @@ Nuclear Magnetic Resonance (NMR) spectroscopy is a central characterization meth
             <td  nowrap="nowrap">4</td>
             <td  nowrap="nowrap">~34.15 hours</td>
             <td  nowrap="nowrap"><a href="DiffNMR_DiffGraphFormer.yaml">DiffNMR_DiffGraphFormer</a></td>
-            <td  nowrap="nowrap"><a href="https://paddle-org.bj.bcebos.com/paddlematerial/checkpoints/structure_generation/diffcsp/diffcsp_mp20.zip">checkpoint | log</a></td>
+            <td  nowrap="nowrap"><a href="">checkpoint | log</a></td>
         </tr>  
     </body>
     <body>
@@ -59,7 +59,7 @@ Nuclear Magnetic Resonance (NMR) spectroscopy is a central characterization meth
             <td  nowrap="nowrap">4</td>
             <td  nowrap="nowrap">~6.5 hours</td>
             <td  nowrap="nowrap"><a href="DiffNMR_DiffGraphFormer.yaml">DiffNMR_NMRNet</a></td>
-            <td  nowrap="nowrap"><a href="https://paddle-org.bj.bcebos.com/paddlematerial/checkpoints/structure_generation/diffcsp/diffcsp_mp20.zip">checkpoint | log</a></td>
+            <td  nowrap="nowrap"><a href="">checkpoint | log</a></td>
         </tr>  
     </body>
     <body>
@@ -69,9 +69,9 @@ Nuclear Magnetic Resonance (NMR) spectroscopy is a central characterization meth
             <td  nowrap="nowrap">1.946618</td>
             <td  nowrap="nowrap">66.028621</td>
             <td  nowrap="nowrap">4</td>
-            <td  nowrap="nowrap">~34.15 hours</td>
+            <td  nowrap="nowrap">~30.24 hours</td>
             <td  nowrap="nowrap"><a href="DiffNMR_DiffGraphFormer.yaml">DiffNMR</a></td>
-            <td  nowrap="nowrap"><a href="https://paddle-org.bj.bcebos.com/paddlematerial/checkpoints/structure_generation/diffcsp/diffcsp_mp20.zip">checkpoint | log</a></td>
+            <td  nowrap="nowrap"><a href="">checkpoint | log</a></td>
         </tr>  
     </body>
 </table>
