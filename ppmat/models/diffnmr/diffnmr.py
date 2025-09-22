@@ -27,8 +27,6 @@ from ppmat.metrics.diffnmr_metric import SumExceptBatchKL
 from ppmat.metrics.diffnmr_metric import SumExceptBatchMetric
 from ppmat.models.common import initializer
 from ppmat.models.diffnmr.diffusion_prior import DiffPriorNetwork
-from ppmat.models.diffnmr.diffusion_prior import NoiseScheduler
-from ppmat.models.diffnmr.diffusion_prior import freeze_model_and_make_eval_
 from ppmat.models.diffnmr.graph_transformer import GraphTransformer
 from ppmat.models.diffnmr.graph_transformer import MolecularEncoder
 from ppmat.models.diffnmr.nmr_encoder import NMR_encoder
@@ -36,11 +34,13 @@ from ppmat.models.diffnmr.nmr_encoder import NMR_encoder_H
 from ppmat.models.diffnmr.utils import diffgraphformer_utils
 from ppmat.models.diffnmr.utils.diffprior_utils import default
 from ppmat.models.diffnmr.utils.diffprior_utils import exists
+from ppmat.models.diffnmr.utils.diffprior_utils import freeze_model_and_make_eval_
 from ppmat.models.diffnmr.utils.diffprior_utils import l2norm
 from ppmat.schedulers import scheduling_diffnmr
 from ppmat.schedulers.scheduling_diffnmr import DiscreteUniformTransition
 from ppmat.schedulers.scheduling_diffnmr import MarginalUniformTransition
 from ppmat.schedulers.scheduling_diffnmr import PredefinedNoiseScheduleDiscrete
+from ppmat.schedulers.scheduling_diffprior import NoiseScheduler
 from ppmat.utils import logger
 
 
@@ -621,7 +621,6 @@ class DiffNMR(nn.Layer):
         # set use formula for training and sample or not
         self.flag_use_formula = diffmodel_cfg.get("flag_use_formula", False)
 
-
     def make_src_mask(self, src):
         src_mask = (src != 0).unsqueeze(1).unsqueeze(2)
         return src_mask
@@ -681,10 +680,10 @@ class DiffNMR(nn.Layer):
             embeddings_spectrum, _ = global_H
         else:
             embeddings_spectrum, _ = self.encoder(condition_Spectrum)
-        
+
         if self.connector_flag is True:
             embeddings_spectrum = self.connector.sample(embeddings_spectrum)
-        
+
         input_y = paddle.concat([input_y, embeddings_spectrum], axis=1).astype(
             "float32"
         )
@@ -862,7 +861,6 @@ class DiffPrior(nn.Layer):
             name="_dummy", tensor=paddle.to_tensor(data=[True]), persistable=False
         )
 
-    
     def forward(self, batch):
 
         batch_graph = batch["graph"]
@@ -883,7 +881,9 @@ class DiffPrior(nn.Layer):
             X, E = dense_data.X, dense_data.E
             y = paddle.to_tensor(batch_property["y"])
             z_t = (
-                diffgraphformer_utils.PlaceHolder(X=X, E=E, y=y).type_as(X).mask(node_mask)
+                diffgraphformer_utils.PlaceHolder(X=X, E=E, y=y)
+                .type_as(X)
+                .mask(node_mask)
             )
             extra_data_pure = scheduling_diffnmr.compute_extra_data(
                 self.clip,
@@ -904,7 +904,6 @@ class DiffPrior(nn.Layer):
                 input_X_pure, input_E_pure, input_y_pure, node_mask
             )
 
-
         # 2. obtain the spectrum embeddings
         spectrum_cond = {}
         if "spectrum_embed" in batch:
@@ -916,8 +915,15 @@ class DiffPrior(nn.Layer):
             condition_C13nmr = paddle.to_tensor(batch_spectrum["C_nmr"])
             num_H_peak = paddle.to_tensor(batch_spectrum["num_H_peak"])
             num_C_peak = paddle.to_tensor(batch_spectrum["num_C_peak"])
-            condition_Spectrum = [condition_H1nmr, num_H_peak, condition_C13nmr, num_C_peak]
-            spectrum_embed, spectrum_encodings = self.clip.spectrum_encoder(condition_Spectrum)
+            condition_Spectrum = [
+                condition_H1nmr,
+                num_H_peak,
+                condition_C13nmr,
+                num_C_peak,
+            ]
+            spectrum_embed, spectrum_encodings = self.clip.spectrum_encoder(
+                condition_Spectrum
+            )
             spectrum_cond["spectrum_embed"] = spectrum_embed
             if self.condition_on_spectrum_encodings:
                 spectrum_cond["spectrum_encodings"] = spectrum_encodings
@@ -928,11 +934,7 @@ class DiffPrior(nn.Layer):
         graph_embed *= self.graph_embed_scale
 
         # 4. calculate loss
-        loss_dict = self.p_losses(
-            graph_embed, 
-            times, 
-            spectrum_cond=spectrum_cond
-        )
+        loss_dict = self.p_losses(graph_embed, times, spectrum_cond=spectrum_cond)
 
         # 5. retrun restults
         return {
@@ -940,12 +942,9 @@ class DiffPrior(nn.Layer):
             "pred_dict": {
                 "graph_embed": graph_embed,
                 "spectrum_embed": spectrum_cond.get("spectrum_embed"),
-                "times": times
+                "times": times,
             },
-            "label_dict": {
-                "graph": batch_graph,
-                "property": batch_property
-            }
+            "label_dict": {"graph": batch_graph, "property": batch_property},
         }
 
     def generate_embed_vector(self, batch):
@@ -984,9 +983,15 @@ class DiffPrior(nn.Layer):
         )
         spectrum_srcMask = self.clip.make_src_mask(spectrum_conditionVec)
 
-        clip_spectrum_embeds = self.clip.spectrum_encoder(spectrum_conditionVec, spectrum_srcMask)
-        clip_spectrum_embeds = clip_spectrum_embeds.reshape([clip_spectrum_embeds.shape[0], -1])
-        clip_spectrum_embeds = self.clip.spectrum_encoder_projector(clip_spectrum_embeds)
+        clip_spectrum_embeds = self.clip.spectrum_encoder(
+            spectrum_conditionVec, spectrum_srcMask
+        )
+        clip_spectrum_embeds = clip_spectrum_embeds.reshape(
+            [clip_spectrum_embeds.shape[0], -1]
+        )
+        clip_spectrum_embeds = self.clip.spectrum_encoder_projector(
+            clip_spectrum_embeds
+        )
 
         return clip_graph_embeds, clip_spectrum_embeds
 
@@ -1039,11 +1044,18 @@ class DiffPrior(nn.Layer):
 
     @paddle.no_grad()
     def sample(
-        self, spectrum_embeds, spectrum_encodings, num_samples_per_batch=2, cond_scale=1.0, timesteps=None, #mask
+        self,
+        spectrum_embeds,
+        spectrum_encodings,
+        num_samples_per_batch=2,
+        cond_scale=1.0,
+        timesteps=None,  # mask
     ):
         timesteps = default(timesteps, self.sample_timesteps)
 
-        spectrum_embeds = repeat(spectrum_embeds, "b ... -> (b r) ...", r=num_samples_per_batch)
+        spectrum_embeds = repeat(
+            spectrum_embeds, "b ... -> (b r) ...", r=num_samples_per_batch
+        )
         # mask = repeat(mask, "b ... -> (b r) ...", r=num_samples_per_batch)
 
         batch_size = tuple(spectrum_embeds.shape)[0]
@@ -1193,7 +1205,13 @@ class DiffPrior(nn.Layer):
 
     @paddle.no_grad()
     def p_sample(
-        self, x, t, spectrum_cond=None, self_cond=None, clip_denoised=True, cond_scale=1.0
+        self,
+        x,
+        t,
+        spectrum_cond=None,
+        self_cond=None,
+        clip_denoised=True,
+        cond_scale=1.0,
     ):
         (
             b,

@@ -85,43 +85,6 @@ class BasicMolecularMetrics(object):
                     all_smiles.append(None)
         return valid, len(valid) / len(generated), np.array(num_components), all_smiles
 
-    # def compute_validity(self, generated):
-    #     """
-    #     generated: list of couples (positions, atom_types) for generated molecules
-    #     """
-    #     valid = []
-    #     num_components = []
-    #     all_smiles = []
-    #     for graph in generated:
-    #         atom_types, edge_types = graph
-    #         mol = build_molecule(
-    #           atom_types, edge_types, self.dataset_info.atom_decoder)
-    #         smiles = mol2smiles(mol)
-    #         try:
-    #             mol_frags = Chem.rdmolops.GetMolFrags(
-    #                 mol, asMols=True, sanitizeFrags=True
-    #             )
-    #             num_components.append(len(mol_frags))
-    #         except:
-    #             pass
-    #         if smiles is not None:
-    #             try:
-    #                 mol_frags = Chem.rdmolops.GetMolFrags(
-    #                     mol, asMols=True, sanitizeFrags=True
-    #                 )
-    #                 largest_mol = max(
-    #                     mol_frags, default=mol, key=lambda m: m.GetNumAtoms()
-    #                 )
-    #                 smiles = mol2smiles(largest_mol)
-    #                 valid.append(smiles)
-    #                 all_smiles.append(smiles)
-    #             except Chem.rdchem.AtomValenceException:
-    #                 print("Valence error in GetmolFrags")
-    #                 all_smiles.append(None)
-    #         else:
-    #             all_smiles.append(None)
-    #     return valid, len(valid)/len(generated), np.array(num_components), all_smiles
-
     def compute_uniqueness(self, valid):
         """valid: list of SMILES strings."""
         return list(set(valid)), len(set(valid)) / len(valid)
