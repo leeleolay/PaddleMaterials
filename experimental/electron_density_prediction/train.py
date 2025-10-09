@@ -442,7 +442,7 @@ if __name__ == "__main__":
         "-c",
         "--config",
         type=str,
-        default="./electron_density_prediction/configs/infgcn_md.yaml",
+        default="./configs/md/infgcn_md.yaml",
         help="Path to config file",
     )
 

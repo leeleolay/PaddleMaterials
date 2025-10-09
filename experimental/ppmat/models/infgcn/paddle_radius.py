@@ -1,6 +1,3 @@
-from typing import Optional
-from typing import Tuple
-
 import numpy as np
 import paddle
 
@@ -8,7 +5,7 @@ import paddle
 def radius_graph(
     x: paddle.Tensor,
     r: float,
-    batch: Optional[paddle.Tensor] = None,
+    batch: paddle.Tensor | None = None,
     loop: bool = False,
     max_num_neighbors: int = 32,
 ) -> paddle.Tensor:
@@ -25,10 +22,10 @@ def radius(
     x: paddle.Tensor,
     y: paddle.Tensor,
     r: float,
-    batch_x: Optional[paddle.Tensor] = None,
-    batch_y: Optional[paddle.Tensor] = None,
+    batch_x: paddle.Tensor | None = None,
+    batch_y: paddle.Tensor | None = None,
     max_num_neighbors: int = 32,
-) -> Tuple[paddle.Tensor, paddle.Tensor]:
+) -> tuple[paddle.Tensor, paddle.Tensor]:
     if batch_x is None:
         batch_x = paddle.zeros((x.shape[0],), dtype="int64")
     if batch_y is None:
@@ -116,7 +113,7 @@ def radius_simple(
     batch_x: paddle.Tensor,
     batch_y: paddle.Tensor,
     max_num_neighbors: int = 32,
-) -> Tuple[paddle.Tensor, paddle.Tensor]:
+) -> tuple[paddle.Tensor, paddle.Tensor]:
     batch_size = max(int(batch_x.max().item()), int(batch_y.max().item())) + 1
     x_idx_list, y_idx_list = [], []
 
@@ -180,7 +177,7 @@ def radius_atoms_to_grids(
     batch_x: paddle.Tensor,
     batch_y: paddle.Tensor,
     max_num_neighbors: int = 32,
-) -> Tuple[paddle.Tensor, paddle.Tensor]:
+) -> tuple[paddle.Tensor, paddle.Tensor]:
     batch_size = max(int(batch_x.max().item()), int(batch_y.max().item())) + 1
 
     grid_idx_list, atom_idx_list = [], []
@@ -366,7 +363,7 @@ def radius_grid(
     batch_x: paddle.Tensor,
     batch_y: paddle.Tensor,
     max_num_neighbors: int = 32,
-) -> Tuple[paddle.Tensor, paddle.Tensor]:
+) -> tuple[paddle.Tensor, paddle.Tensor]:
     x_cpu = x.numpy()
     y_cpu = y.numpy()
     batch_x_cpu = batch_x.numpy()

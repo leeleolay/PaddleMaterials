@@ -16,6 +16,7 @@
 import json
 import os
 import time
+import math
 
 import numpy as np
 import paddle
@@ -272,9 +273,12 @@ class DensityDataset(paddle.io.Dataset):
             + z_coord.view(1, 1, -1, 3)
         )
         grid_coord = grid_coord.view(-1, 3)
-        density = paddle.to_tensor(
-            data=[float(s) for s in fileobj.read().split()[:n_grid]], dtype="float32"
-        )
+        # density = paddle.to_tensor(
+        #     data=[float(s) for s in fileobj.read().split()[:n_grid]], dtype="float32"
+        # )
+        arr = self._read_density_stream(fileobj, n_grid)
+        density = paddle.to_tensor(arr, dtype="float32")
+
         volume = paddle.linalg.det(x=cell).abs()
         density = density / volume
         density = (
@@ -286,6 +290,99 @@ class DensityDataset(paddle.io.Dataset):
             .view(-1)
         )
         return g, density, grid_coord, {"shape": shape, "cell": cell}
+
+    # def read_chgcar(self, fileobj):
+    #     """Read atoms and data from CHGCAR file (memory-efficient)."""
+    #     readline = fileobj.readline
+
+    #     # --- header ---
+    #     readline()  # comment/title
+    #     scale = float(readline())
+    #     cell = paddle.empty([3, 3], dtype="float32")
+    #     for i in range(3):
+    #         cell[i] = paddle.to_tensor([float(s) for s in readline().split()], dtype="float32")
+    #     cell = cell * scale
+    #     elements = readline().split()
+    #     n_atoms = [int(s) for s in readline().split()]
+    #     readline()  # Direct/Cartesian or blank
+    #     tot_atoms = sum(n_atoms)
+
+    #     atom_type = paddle.empty([tot_atoms], dtype="int64")
+    #     atom_coord = paddle.empty([tot_atoms, 3], dtype="float32")
+    #     idx = 0
+    #     for elem, n in zip(elements, n_atoms):
+    #         atom_type[idx: idx + n] = self.atom_name2idx[elem]
+    #         for _ in range(n):
+    #             atom_coord[idx] = paddle.to_tensor([float(s) for s in readline().split()], dtype="float32")
+    #             idx += 1
+
+    #     if self.pbc:
+    #         atom_type, atom_coord = pbc_expand(atom_type, atom_coord)
+    #     atom_coord = atom_coord @ cell
+    #     g = Data(x=atom_type, pos=atom_coord)
+
+    #     # --- grid shape ---
+    #     readline()  # usually "CHGCAR" / a blank / a header before grid dims
+    #     shape = [int(s) for s in readline().split()]  # nx ny nz
+    #     nx, ny, nz = shape
+    #     n_grid = nx * ny * nz
+
+    #     # --- grid coords (注意：这本身也很大，确实需要就保留) ---
+    #     x_coord = (paddle.linspace(0, nx - 1, nx).unsqueeze(-1) / nx) * cell[0]
+    #     y_coord = (paddle.linspace(0, ny - 1, ny).unsqueeze(-1) / ny) * cell[1]
+    #     z_coord = (paddle.linspace(0, nz - 1, nz).unsqueeze(-1) / nz) * cell[2]
+    #     grid_coord = (x_coord.view(-1, 1, 1, 3) + y_coord.view(1, -1, 1, 3) + z_coord.view(1, 1, -1, 3)).view(-1, 3)
+
+    #     # --- density（关键：流式读取，不要 fileobj.read().split()） ---
+    #     # 此时 fileobj 的读指针应已在密度首个数字处
+    #     arr = np.fromfile(fileobj, sep=' ', count=n_grid, dtype=np.float32)
+    #     if arr.size != n_grid:
+    #         raise ValueError(f"Expected {n_grid} density values, got {arr.size}")
+    #     density = paddle.to_tensor(arr, dtype="float32")
+
+    #     volume = paddle.linalg.det(cell).abs()
+    #     density = density / volume
+
+    #     # reshape & 轴变换：保持与你原逻辑一致
+    #     density = (
+    #         density.view([nz, ny, nx])
+    #         .transpose(perm=dim2perm(density.view([nz, ny, nx]).ndim, 0, 2))
+    #         .contiguous()
+    #         .view(-1)
+    #     )
+    #     return g, density, grid_coord, {"shape": shape, "cell": cell}
+
+    def _read_density_stream(self, fileobj, n_grid: int, chunk_tokens: int = 1_000_000):
+        out = np.empty(n_grid, dtype=np.float32)
+        filled = 0
+        buf = []
+
+        def _as_float(tok):
+            try:
+                return float(tok)
+            except Exception:
+                return math.nan  # 非数字用 NaN 标记
+
+        for line in fileobj:
+            if filled >= n_grid:
+                break
+            parts = line.split()
+            if not parts:
+                continue
+            # 过滤出数字
+            nums = [_as_float(t) for t in parts]
+            # 丢弃 NaN（非数字 token）
+            nums = [x for x in nums if not math.isnan(x)]
+            if not nums:
+                continue
+
+            take = min(len(nums), n_grid - filled)
+            out[filled:filled+take] = np.array(nums[:take], dtype=np.float32)
+            filled += take
+
+        if filled != n_grid:
+            raise ValueError(f"Expected {n_grid} density values, got {filled}")
+        return out
 
     def read_json(self, fileobj):
         """Read atoms and data from JSON file."""

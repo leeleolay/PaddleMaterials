@@ -71,9 +71,9 @@ Dataset:
     dataset:
       __class_name__: DensityDataset
       __init_params__:
-        root: ./data_qm9
-        split_file: ./datasplits.json
-        atom_file:  ./qm9.json
+        root: /home/liuxuwei01/data_qm9
+        split_file: /home/liuxuwei01/PaddleMaterials/experimental/electron_density_prediction/configs/qm9/data_split.json
+        atom_file:  /home/liuxuwei01/PaddleMaterials/experimental/electron_density_prediction/configs/qm9/qm9.json
         extension: CHGCAR
         compression: lz4
         pbc: false
@@ -83,17 +83,17 @@ Dataset:
       __init_params__:
         shuffle: True
         drop_last: True
-        batch_size: 16
+        batch_size: 8
     loader:
-      num_workers: 4
+      num_workers: 0
       use_shared_memory: True
   val:
     dataset:
       __class_name__: DensityDataset
       __init_params__:
-        root: ./data_qm9
-        split_file: ./datasplits.json
-        atom_file:  ./qm9.json
+        root: /home/liuxuwei01/data_qm9
+        split_file: /home/liuxuwei01/PaddleMaterials/experimental/electron_density_prediction/configs/qm9/data_split.json
+        atom_file:  /home/liuxuwei01/PaddleMaterials/experimental/electron_density_prediction/configs/qm9/qm9.json
         extension: CHGCAR
         compression: lz4
         pbc: false
@@ -103,17 +103,17 @@ Dataset:
       __init_params__:
         shuffle: False
         drop_last: False
-        batch_size: 16
+        batch_size: 8
     loader:
-      num_workers: 4
+      num_workers: 0
       use_shared_memory: True
   test:
     dataset:
       __class_name__: DensityDataset
       __init_params__:
-        root: ./data_qm9
-        split_file: ./datasplits.json
-        atom_file:  ./qm9.json
+        root: /home/liuxuwei01/data_qm9
+        split_file: /home/liuxuwei01/PaddleMaterials/experimental/electron_density_prediction/configs/qm9/data_split.json
+        atom_file:  /home/liuxuwei01/PaddleMaterials/experimental/electron_density_prediction/configs/qm9/qm9.json
         extension: CHGCAR
         compression: lz4
         pbc: false
@@ -124,9 +124,9 @@ Dataset:
       __init_params__:
         shuffle: False
         drop_last: False
-        batch_size: 5
+        batch_size: 8
     loader:
-      num_workers: 16
+      num_workers: 1
       use_shared_memory: True
 
 Predict:
