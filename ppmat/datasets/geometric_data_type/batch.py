@@ -14,6 +14,16 @@
 
 # This code is adapted from https://github.com/jediofgever/pytorch_geometric
 
+from collections.abc import Sequence
+from typing import List
+
+import numpy as np
+import paddle
+
+from ppmat.datasets.geometric_data_type.data import Data
+from ppmat.datasets.geometric_data_type.dataset import IndexType
+# from ppmat.utils.paddle_aux import *
+
 class Batch(Data):
     """A plain old python object modeling a batch of graphs as one big
     (disconnected) graph. With :class:`torch_geometric.data.Data` being the

@@ -22,9 +22,9 @@ import numpy as np
 import paddle
 
 from ppmat.models.common.e3nn import o3
-from ppmat.models.infgcn.paddle_utils import * # noqa: F403
+from ppmat.utils.paddle_aux import dim2perm
 
-from ppmat.data.geometric_data import Data
+from ppmat.datasets.geometric_data_type.data import Data
 
 
 Bohr = 0.529177

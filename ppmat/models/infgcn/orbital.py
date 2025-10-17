@@ -17,7 +17,6 @@ import math
 import paddle
 
 from ppmat.models.common.e3nn import o3
-from ppmat.models.infgcn.paddle_utils import * # noqa: F403
 
 
 class GaussianOrbital(paddle.nn.Layer):
@@ -73,7 +72,86 @@ class GaussianOrbital(paddle.nn.Layer):
         poly = paddle.arange(dtype="float32", end=self.lmax + 1) * paddle.log(x=r)
         log = exponent.unsqueeze(axis=-2) + poly.unsqueeze(axis=-1)
         radial = paddle.exp(x=log.view(*tuple(log.shape)[:-2], -1) + lognorm)
-        return self.lc2lcm(radial) * self.m2lcm(spherical)
+        radial_out = self.lc2lcm(radial)
+        spherical_out = self.m2lcm(spherical)
+        
+        # Debug print tensor types and shapes
+        print(f"radial_out: dtype={radial_out.dtype}, shape={radial_out.shape}")
+        print(f"spherical_out: dtype={spherical_out.dtype}, shape={spherical_out.shape}")
+        
+        # Ensure same dtype
+        if radial_out.dtype != spherical_out.dtype:
+            spherical_out = spherical_out.astype(radial_out.dtype)
+        
+        # 内存优化：分批执行张量乘法
+        try:
+            # 根据可用内存计算最大批大小
+            batch_size = self._calculate_optimal_batch_size(radial_out.shape)
+            if batch_size < radial_out.shape[0]:
+                # 分批处理
+                result = self._multiply_batched(radial_out, spherical_out, batch_size)
+            else:
+                # 直接乘法
+                result = paddle.multiply(radial_out, spherical_out)
+            return result
+        except Exception as e:
+            # 如果乘法失败，提供详细错误信息
+            error_msg = f"""
+            Multiplication failed between:
+            radial_out: shape={radial_out.shape}, dtype={radial_out.dtype}
+            spherical_out: shape={spherical_out.shape}, dtype={spherical_out.dtype}
+            Error: {str(e)}
+            """
+            raise RuntimeError(error_msg) from e
+
+    def _calculate_optimal_batch_size(self, shape):
+        """
+        根据张量形状和可用内存计算最优批大小
+        """
+        # 单个元素的字节数 (float32 = 4 bytes)
+        element_size = 4
+        # 单个张量的总元素数
+        elements_per_tensor = shape[1] * shape[2]
+        # 乘法操作需要2个输入张量和1个输出张量
+        memory_per_batch = elements_per_tensor * element_size * 3
+        
+        # 估计可用内存 (保守估计1GB)
+        available_memory = 1 * 1024 * 1024 * 1024  # 1GB in bytes
+        
+        # 计算最大批大小
+        max_batch_size = max(1, available_memory // memory_per_batch)
+        
+        # 限制最大批大小不超过原始大小的一半，留出其他操作的空间
+        max_batch_size = min(max_batch_size, shape[0] // 2)
+        
+        # 确保批大小至少为1
+        return max(1, max_batch_size)
+
+    def _multiply_batched(self, radial_out, spherical_out, batch_size):
+        """
+        分批执行张量乘法，采用更保守的内存管理策略
+        """
+        n_batches = radial_out.shape[0]
+        # 预分配结果张量
+        result = paddle.zeros_like(radial_out)
+        
+        for i in range(0, n_batches, batch_size):
+            end_idx = min(i + batch_size, n_batches)
+            
+            # 分批处理
+            radial_batch = radial_out[i:end_idx]
+            spherical_batch = spherical_out[i:end_idx]
+            batch_result = paddle.multiply(radial_batch, spherical_batch)
+            
+            # 直接写入预分配的结果张量
+            result[i:end_idx] = batch_result
+            
+            # 清理中间变量
+            del radial_batch, spherical_batch, batch_result
+            if paddle.device.cuda.device_count() > 0 and i % (batch_size * 5) == 0:
+                paddle.device.cuda.empty_cache()
+        
+        return result
 
 
 class BroadcastGTOTensor(paddle.nn.Layer):

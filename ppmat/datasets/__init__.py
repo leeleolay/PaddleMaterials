@@ -41,6 +41,8 @@ from ppmat.datasets.mp2024_dataset import MP2024Dataset
 from ppmat.datasets.mptrj_dataset import MPTrjDataset
 from ppmat.datasets.msd_nmr_dataset import MSDnmrDataset
 from ppmat.datasets.msd_nmr_dataset import MSDnmrinfos
+from ppmat.datasets.density_dataset import DensityDataset
+from ppmat.datasets.small_density_dataset import SmallDensityDataset
 from ppmat.datasets.num_atom_crystal_dataset import NumAtomsCrystalDataset
 from ppmat.datasets.split_mptrj_data import none_to_zero
 from ppmat.datasets.transform import build_transforms
@@ -59,6 +61,8 @@ __all__ = [
     "HighLevelWaterDataset",
     "MSDnmrDataset",
     "MatbenchDataset",
+    "DensityDataset",
+    "SmallDensityDataset",
 ]
 
 INFO_CLASS_REGISTRY: Dict[str, type] = {
@@ -149,9 +153,13 @@ def build_dataloader(cfg: Dict):
     num_workers = loader_config.pop("num_workers", 0)
     use_shared_memory = loader_config.pop("use_shared_memory", True)
 
-    collate_obj = getattr(
-        collate_fn, loader_config.pop("collate_fn", "DefaultCollator")
-    )()
+    # collate_obj = getattr(
+    #     collate_fn, loader_config.pop("collate_fn", "DefaultCollator")
+    # )()
+    collate_fn_name = loader_config.pop("collate_fn", "DefaultCollator")
+    collate_params = loader_config.pop("collate_params", {})
+    collate_cls = getattr(collate_fn, collate_fn_name)
+    collate_obj = collate_cls(**collate_params)
 
     # build sampler
     if cfg.get("split_dataset_ratio") is not None:

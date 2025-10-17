@@ -1,7 +1,7 @@
 Global:
   do_train: True
-  do_eval: True
-  do_test: True
+  do_eval: False
+  do_test: False
   use_voxel: False
 
 Trainer:
@@ -72,8 +72,8 @@ Dataset:
       __class_name__: DensityDataset
       __init_params__:
         root: /home/liuxuwei01/data_cubic
-        split_file: /home/liuxuwei01/PaddleMaterials/experimental/electron_density_prediction/configs/cubic/data_split.json
-        atom_file:  /home/liuxuwei01/PaddleMaterials/experimental/electron_density_prediction/configs/cubic/crystal.json
+        split_file: /home/liuxuwei01/PaddleMaterials/electronic_structure/configs/crystal_data_split.json
+        atom_file:  /home/liuxuwei01/PaddleMaterials/electronic_structure/configs/crystal.json
         extension: json
         compression: xz
         pbc: false
@@ -85,15 +85,16 @@ Dataset:
         drop_last: True
         batch_size: 16
     loader:
-      num_workers: 4
-      use_shared_memory: True
+      num_workers: 0
+      use_shared_memory: False
+      collate_fn: DensityCollator(None) # DensityVoxelCollator # if use voxel
   val:
     dataset:
       __class_name__: DensityDataset
       __init_params__:
         root: /home/liuxuwei01/data_cubic
-        split_file: /home/liuxuwei01/PaddleMaterials/experimental/electron_density_prediction/configs/cubic/data_split.json
-        atom_file:  /home/liuxuwei01/PaddleMaterials/experimental/electron_density_prediction/configs/cubic/crystal.json
+        split_file: /home/liuxuwei01/PaddleMaterials/electronic_structure/configs/crystal_data_split.json
+        atom_file:  /home/liuxuwei01/PaddleMaterials/electronic_structure/configs/crystal.json
         extension: json
         compression: xz
         pbc: false
@@ -103,17 +104,18 @@ Dataset:
       __init_params__:
         shuffle: False
         drop_last: False
-        batch_size: 16
+        batch_size: 6 # recommend >2 <=6, on V100 16G GPU
     loader:
-      num_workers: 4
-      use_shared_memory: True
+      num_workers: 0
+      use_shared_memory: False
+      collate_fn: DensityCollator(None) # DensityVoxelCollator # if use voxel
   test:
     dataset:
       __class_name__: DensityDataset
       __init_params__:
         root: /home/liuxuwei01/data_cubic
-        split_file: /home/liuxuwei01/PaddleMaterials/experimental/electron_density_prediction/configs/cubic/data_split.json
-        atom_file:  /home/liuxuwei01/PaddleMaterials/experimental/electron_density_prediction/configs/cubic/crystal.json
+        split_file: /home/liuxuwei01/PaddleMaterials/electronic_structure/configs/crystal_data_split.json
+        atom_file:  /home/liuxuwei01/PaddleMaterials/electronic_structure/configs/crystal.json
         extension: json
         compression: xz
         pbc: false
@@ -124,10 +126,11 @@ Dataset:
       __init_params__:
         shuffle: False
         drop_last: False
-        batch_size: 5
+        batch_size: 2
     loader:
-      num_workers: 16
-      use_shared_memory: True
+      num_workers: 0
+      use_shared_memory: False
+      collate_fn: DensityCollator(None) # DensityVoxelCollator # if use voxel
 
 Predict:
   eval_with_no_grad: True

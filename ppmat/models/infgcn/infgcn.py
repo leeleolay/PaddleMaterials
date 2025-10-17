@@ -13,19 +13,25 @@
 # limitations under the License.
 
 import paddle
-from paddle_scatter import scatter  # use paddle_scatter instead of torch_scatter
+from paddle_scatter import scatter
 
 from ppmat.models.common.e3nn import o3
 from ppmat.models.common.e3nn.math import soft_one_hot_linspace
 from ppmat.models.common.e3nn.nn import Activation
 from ppmat.models.common.e3nn.nn import Extract
 from ppmat.models.common.e3nn.nn import FullyConnectedNet
-from ppmat.models.infgcn.paddle_utils import * # noqa: F403
-from ppmat.util.paddle_aux import *
 
 from ppmat.models.infgcn.orbital import GaussianOrbital
 from ppmat.datasets.graph_utils.infgcn_graph_utils import radius
 from ppmat.datasets.graph_utils.infgcn_graph_utils import radius_graph
+
+# 导入梯度检查点相关模块
+try:
+    from paddle.distributed.fleet.utils import recompute
+    HAS_RECOMPUTE = True
+except ImportError:
+    HAS_RECOMPUTE = False
+    print("Warning: recompute not available, memory usage may be high")
 
 
 class ScalarActivation(paddle.nn.Layer):
@@ -205,11 +211,44 @@ class GCNLayer(paddle.nn.Layer):
     def forward(self, edge_index, node_feat, edge_feat, edge_embed, dim_size=None):
         src, dst = edge_index
         weight = self.fc(edge_embed)
-        out = self.tp(node_feat[src], edge_feat, weight=weight)  
-        out = scatter(out, dst, dim=0, dim_size=dim_size, reduce="sum")
+        out = self.tp(node_feat[src], edge_feat, weight=weight)
+        
+        # 内存优化：分批执行scatter操作
+        out = self._scatter_batched(out, dst, dim_size, batch_size=5000)
+        
         if self.use_sc:
             out = out + self.sc(node_feat)
         return out
+
+    def _scatter_batched(self, tensor, index, dim_size=None, batch_size=5000):
+        """
+        分批执行scatter操作以避免内存不足
+        """
+        n_edges = tensor.shape[0]
+        if n_edges <= batch_size:
+            # 边数较少时直接scatter
+            return scatter(tensor, index, dim=0, dim_size=dim_size, reduce="sum")
+        
+        # 分批处理
+        result = None
+        for i in range(0, n_edges, batch_size):
+            end_idx = min(i + batch_size, n_edges)
+            batch_tensor = tensor[i:end_idx]
+            batch_index = index[i:end_idx]
+            
+            batch_result = scatter(batch_tensor, batch_index, dim=0, dim_size=dim_size, reduce="sum")
+            
+            if result is None:
+                result = batch_result
+            else:
+                result = result + batch_result
+            
+            # 清理中间变量
+            del batch_tensor, batch_index, batch_result
+            if paddle.device.cuda.device_count() > 0 and i % (batch_size * 10) == 0:
+                paddle.device.cuda.empty_cache()
+        
+        return result
 
 
 def pbc_vec(vec, cell):
@@ -326,10 +365,9 @@ class InfGCN(paddle.nn.Layer):
         self.orbital = GaussianOrbital(
             gauss_start, gauss_end, num_radial, num_spherical
         )
-
     def forward(self, atom_types, atom_coord, grid, batch, infos):
         """
-        Network forward
+        Network forward with memory optimization
         :param atom_types: atom types of (N,)
         :param atom_coord: atom coordinates of (N, 3)
         :param grid: coordinates at grid points of (G, K, 3)
@@ -339,10 +377,15 @@ class InfGCN(paddle.nn.Layer):
         """
         cell = paddle.stack(x=[info["cell"] for info in infos], axis=0).to(batch.place)
         feat = self.embedding(atom_types)
+        
+        # 优化图结构构建 - 分块处理大图
         edge_index = radius_graph(atom_coord, self.cutoff, batch, loop=False)
         src, dst = edge_index
-        edge_vec = atom_coord[src] - atom_coord[dst]
+        
+        # 内存优化：分批处理边向量计算
+        edge_vec = self._compute_edge_vectors_batched(atom_coord, src, dst, batch_size=10000)
         edge_len = edge_vec.norm(axis=-1) + 1e-08
+        
         edge_feat = o3.spherical_harmonics(
             list(range(self.num_spherical + 1)),
             edge_vec / edge_len[..., None],
@@ -357,12 +400,17 @@ class InfGCN(paddle.nn.Layer):
             basis="gaussian",
             cutoff=False,
         ) * (self.radial_embed_size**0.5)
+        
+        # 使用梯度检查点减少内存占用
         for i, gcn in enumerate(self.gcns):
-            feat = gcn(
-                edge_index, feat, edge_feat, edge_embed, dim_size=atom_types.shape[0]
-            )
+            if HAS_RECOMPUTE and i > 0:  # 从第二层开始使用梯度检查点
+                feat = recompute(gcn, edge_index, feat, edge_feat, edge_embed, atom_types.shape[0])
+            else:
+                feat = gcn(edge_index, feat, edge_feat, edge_embed, dim_size=atom_types.shape[0])
+            
             if i != self.num_gcn_layer - 1:
                 feat = self.act(feat)
+        
         n_graph, n_sample = grid.shape[0], grid.shape[1]
         if self.residual:
             grid_flat = grid.view(-1, 3)
@@ -370,7 +418,8 @@ class InfGCN(paddle.nn.Layer):
             grid_dst, node_src = radius(
                 atom_coord, grid_flat, self.grid_cutoff, batch, grid_batch
             )
-            grid_edge = grid_flat[grid_dst] - atom_coord[node_src]
+            grid_edge = self._compute_edge_vectors_batched(atom_coord, node_src, grid_dst, batch_size=5000, 
+                                                         grid_coords=grid_flat)
             if grid_edge.shape[0] != 0:
                 grid_len = paddle.linalg.norm(x=grid_edge, axis=-1) + 1e-08
                 grid_edge_feat = o3.spherical_harmonics(
@@ -386,9 +435,8 @@ class InfGCN(paddle.nn.Layer):
                     number=self.radial_embed_size,
                     basis="gaussian",
                     cutoff=False,
-                ) * (
-                    self.radial_embed_size**0.5
-                )  #
+                ) * (self.radial_embed_size**0.5)
+                
                 residue = self.residue(
                     (node_src, grid_dst),
                     feat,
@@ -400,12 +448,64 @@ class InfGCN(paddle.nn.Layer):
                 residue = paddle.zeros([grid_flat.shape[0], 1], dtype=feat.dtype)
         else:
             residue = 0.0
+        
         sample_vec = grid[batch] - atom_coord.unsqueeze(axis=-2)
         if self.pbc:
             sample_vec = pbc_vec(sample_vec, cell[batch])
+        
         orbital = self.orbital(sample_vec)
         density = (orbital * feat.unsqueeze(axis=1)).sum(axis=-1)
         density = scatter(density, batch, dim=0, reduce="sum")
+        
         if self.residual:
             density = density + residue.view(*tuple(density.shape))
+        
+        # 手动清理中间变量释放内存
+        del edge_vec, edge_feat, edge_embed, sample_vec, orbital
+        if paddle.device.cuda.device_count() > 0:
+            paddle.device.cuda.empty_cache()
+            
         return density
+
+    def _compute_edge_vectors_batched(self, atom_coord, src, dst, batch_size=10000, grid_coords=None):
+        """
+        分批计算边向量以避免内存溢出
+        """
+        n_edges = src.shape[0]
+        if n_edges == 0:
+            # 处理空边的情况
+            shape = (0, 3) if grid_coords is None else (0, grid_coords.shape[-1])
+            return paddle.zeros(shape, dtype=atom_coord.dtype)
+            
+        edge_vectors = []
+        
+        for i in range(0, n_edges, batch_size):
+            end_idx = min(i + batch_size, n_edges)
+            src_batch = src[i:end_idx]
+            dst_batch = dst[i:end_idx]
+            
+            try:
+                if grid_coords is None:
+                    # 原子-原子边
+                    vec = atom_coord[src_batch] - atom_coord[dst_batch]
+                else:
+                    # 网格-原子边
+                    vec = grid_coords[dst_batch] - atom_coord[src_batch]
+                
+                edge_vectors.append(vec)
+                
+            except Exception as e:
+                # 内存不足时减小批大小重试
+                if "out of memory" in str(e).lower():
+                    print(f"内存不足，减小批大小从{batch_size}到{batch_size//2}")
+                    return self._compute_edge_vectors_batched(
+                        atom_coord, src, dst, batch_size//2, grid_coords
+                    )
+                raise
+                
+            # 清理中间变量
+            del vec, src_batch, dst_batch
+            if paddle.device.cuda.device_count() > 0 and i % (batch_size * 10) == 0:
+                paddle.device.cuda.empty_cache()
+        
+        return paddle.concat(edge_vectors, axis=0) if edge_vectors else paddle.zeros((0, 3), dtype=atom_coord.dtype)

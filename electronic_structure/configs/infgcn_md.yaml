@@ -1,6 +1,6 @@
 Global:
   do_train: False
-  do_eval: True
+  do_eval: False
   do_test: True
   use_voxel: False
 
@@ -14,7 +14,7 @@ Trainer:
   log_freq: 20
   start_eval_step: 20
   eval_freq: 20
-    # Pretrained model path, if null, no pretrained model will be loaded
+  # Pretrained model path, if null, no pretrained model will be loaded
   pretrained_model_path: null
   # Resume from checkpoint path, useful for resuming training
   resume_from_checkpoint: null
@@ -79,10 +79,13 @@ Dataset:
       __init_params__:
         shuffle: True
         drop_last: True
-        batch_size: 16
+        batch_size: 8
     loader:
-      num_workers: 4
-      use_shared_memory: True
+      num_workers: 0
+      use_shared_memory: False
+      collate_fn: DensityCollator # DensityVoxelCollator # if use voxel
+      collate_params:
+        n_samples:
   val:
     dataset:
       __class_name__: SmallDensityDataset
@@ -95,10 +98,13 @@ Dataset:
       __init_params__:
         shuffle: False
         drop_last: False
-        batch_size: 16
+        batch_size: 2
     loader:
-      num_workers: 8
-      use_shared_memory: True
+      num_workers: 0
+      use_shared_memory: False
+      collate_fn: DensityCollator # DensityVoxelCollator # if use voxel
+      collate_params:
+        n_samples:
   test:
     dataset:
       __class_name__: SmallDensityDataset
@@ -111,10 +117,13 @@ Dataset:
       __init_params__:
         shuffle: False
         drop_last: False
-        batch_size: 5
+        batch_size: 1
     loader:
-      num_workers: 2
-      use_shared_memory: True
+      num_workers: 0
+      use_shared_memory: False
+      collate_fn: DensityCollator # DensityVoxelCollator # if use voxel
+      collate_params:
+        n_samples:
 
 Predict:
   eval_with_no_grad: True

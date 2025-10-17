@@ -21,7 +21,7 @@ import re
 import paddle
 
 # from .paddle_utils import *
-from ppmat.utils.paddle_aux import *
+# from ppmat.utils.paddle_aux import *
 
 __num_nodes_warn_msg__ = "The number of nodes in your data object can only be inferred by its {} indices, and hence may result in unexpected batch-wise behavior, e.g., in case there exists isolated nodes. Please consider explicitly setting the number of nodes for this data object by assigning it to data.num_nodes."
 

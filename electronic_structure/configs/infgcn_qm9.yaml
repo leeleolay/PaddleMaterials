@@ -1,6 +1,6 @@
 Global:
-  do_train: True
-  do_eval: True
+  do_train: False
+  do_eval: False
   do_test: True
   use_voxel: False
 
@@ -72,8 +72,8 @@ Dataset:
       __class_name__: DensityDataset
       __init_params__:
         root: /home/liuxuwei01/data_qm9
-        split_file: /home/liuxuwei01/PaddleMaterials/experimental/electron_density_prediction/configs/qm9/data_split.json
-        atom_file:  /home/liuxuwei01/PaddleMaterials/experimental/electron_density_prediction/configs/qm9/qm9.json
+        split_file: /home/liuxuwei01/PaddleMaterials/electronic_structure/configs/qm9_data_split.json
+        atom_file:  /home/liuxuwei01/PaddleMaterials/electronic_structure/configs/qm9.json
         extension: CHGCAR
         compression: lz4
         pbc: false
@@ -86,14 +86,15 @@ Dataset:
         batch_size: 8
     loader:
       num_workers: 0
-      use_shared_memory: True
+      use_shared_memory: False
+      collate_fn: DensityCollator(None) # DensityVoxelCollator # if use voxel
   val:
     dataset:
       __class_name__: DensityDataset
       __init_params__:
         root: /home/liuxuwei01/data_qm9
-        split_file: /home/liuxuwei01/PaddleMaterials/experimental/electron_density_prediction/configs/qm9/data_split.json
-        atom_file:  /home/liuxuwei01/PaddleMaterials/experimental/electron_density_prediction/configs/qm9/qm9.json
+        split_file: /home/liuxuwei01/PaddleMaterials/electronic_structure/configs/qm9_data_split.json
+        atom_file:  /home/liuxuwei01/PaddleMaterials/electronic_structure/configs/qm9.json
         extension: CHGCAR
         compression: lz4
         pbc: false
@@ -106,14 +107,15 @@ Dataset:
         batch_size: 8
     loader:
       num_workers: 0
-      use_shared_memory: True
+      use_shared_memory: False
+      collate_fn: DensityCollator(None) # DensityVoxelCollator # if use voxel
   test:
     dataset:
       __class_name__: DensityDataset
       __init_params__:
         root: /home/liuxuwei01/data_qm9
-        split_file: /home/liuxuwei01/PaddleMaterials/experimental/electron_density_prediction/configs/qm9/data_split.json
-        atom_file:  /home/liuxuwei01/PaddleMaterials/experimental/electron_density_prediction/configs/qm9/qm9.json
+        split_file: /home/liuxuwei01/PaddleMaterials/electronic_structure/configs/qm9_data_split.json
+        atom_file:  /home/liuxuwei01/PaddleMaterials/electronic_structure/configs/qm9.json
         extension: CHGCAR
         compression: lz4
         pbc: false
@@ -126,8 +128,9 @@ Dataset:
         drop_last: False
         batch_size: 8
     loader:
-      num_workers: 1
-      use_shared_memory: True
+      num_workers: 0
+      use_shared_memory: Flase
+      collate_fn: DensityCollator(None) # DensityVoxelCollator # if use voxel
 
 Predict:
   eval_with_no_grad: True

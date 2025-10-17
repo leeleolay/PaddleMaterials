@@ -12,167 +12,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# import argparse
-# import os
-# import os.path as osp
-
-# import paddle.distributed as dist
-# import paddle.distributed.fleet as fleet
-# from omegaconf import OmegaConf
-
-# from ppmat.datasets import build_dataloader
-# from ppmat.datasets import set_signal_handlers
-# from ppmat.metrics import build_metric
-# from ppmat.models import build_model
-# from ppmat.optimizer import build_optimizer
-# from ppmat.trainer.base_trainer import BaseTrainer
-# from ppmat.utils import logger
-# from ppmat.utils import misc
-# from ppmat.utils.eager_comp_setting import setting_eager_mode
-
-# if dist.get_world_size() > 1:
-#     fleet.init(is_collective=True)
-
-# if __name__ == "__main__":
-#     parser = argparse.ArgumentParser()
-#     parser.add_argument(
-#         "-c",
-#         "--config",
-#         type=str,
-#         help="Path to config file",
-#     )
-
-#     args, dynamic_args = parser.parse_known_args()
-
-#     # load config and merge with cli args
-#     config = OmegaConf.load(args.config)
-#     cli_config = OmegaConf.from_dotlist(dynamic_args)
-#     config = OmegaConf.merge(config, cli_config)
-
-#     # save config to output_dir, only rank 0 process will do this
-#     if dist.get_rank() == 0:
-#         os.makedirs(config["Trainer"]["output_dir"], exist_ok=True)
-#         config_name = os.path.basename(args.config)
-#         OmegaConf.save(config, osp.join(config["Trainer"]["output_dir"], config_name))
-#     # convert to dict
-#     config = OmegaConf.to_container(config, resolve=True)
-
-#     # init logger
-#     logger_path = osp.join(config["Trainer"]["output_dir"], "run.log")
-#     logger.init_logger(log_file=logger_path)
-#     logger.info(f"Logger saved to {logger_path}")
-
-#     # set random seed
-#     seed = config["Trainer"].get("seed", 42)
-#     misc.set_random_seed(seed)
-#     logger.info(f"Set random seed to {seed}")
-
-#     # set prim eager mode
-#     enabled = config["Global"].get("prim_eager_enabled", False)
-#     white_list = config["Global"].get("prim_backward_white_list", None)
-#     setting_eager_mode(enabled, white_list)
-
-#     # build model from config
-#     model_cfg = config["Model"]
-#     model = build_model(model_cfg)
-
-#     # build dataloader from config
-#     set_signal_handlers()
-#     if config["Global"].get("do_train", True):
-#         train_data_cfg = config["Dataset"].get("train")
-#         assert (
-#             train_data_cfg is not None
-#         ), "train_data_cfg must be defined, when do_train is true"
-#         train_loader = build_dataloader(train_data_cfg)
-#     else:
-#         train_loader = None
-
-#     if config["Global"].get("do_eval", False) or config["Global"].get("do_train", True):
-#         val_data_cfg = config["Dataset"].get("val")
-#         if val_data_cfg is not None:
-#             val_loader = build_dataloader(val_data_cfg)
-#         else:
-#             logger.info("No validation dataset defined.")
-#             val_loader = None
-#     else:
-#         val_loader = None
-
-#     if config["Global"].get("do_test", False):
-#         test_data_cfg = config["Dataset"].get("test")
-#         assert (
-#             test_data_cfg is not None
-#         ), "test_data_cfg must be defined, when do_test is true"
-#         test_loader = build_dataloader(test_data_cfg)
-#     else:
-#         test_loader = None
-
-#     # build optimizer and learning rate scheduler from config
-#     if config.get("Optimizer") is not None and config["Global"].get("do_train", True):
-#         assert (
-#             train_loader is not None
-#         ), "train_loader must be defined when optimizer is defined."
-#         assert (
-#             config["Trainer"].get("max_epochs") is not None
-#         ), "max_epochs must be defined when optimizer is defined."
-#         optimizer, lr_scheduler = build_optimizer(
-#             config["Optimizer"],
-#             model,
-#             config["Trainer"]["max_epochs"],
-#             len(train_loader),
-#         )
-#     else:
-#         optimizer, lr_scheduler = None, None
-
-#     # build metric from config
-#     metric_cfg = config.get("Metric")
-#     if metric_cfg is not None:
-#         metric_func = build_metric(metric_cfg)
-#     else:
-#         metric_func = None
-
-#     # # initialize trainer
-#     trainer = BaseTrainer(
-#         config["Trainer"],
-#         model,
-#         train_dataloader=train_loader,
-#         val_dataloader=val_loader,
-#         optimizer=optimizer,
-#         lr_scheduler=lr_scheduler,
-#         compute_metric_func_dict=metric_func,
-#     )
-
-#     if config["Global"].get("do_train", True):
-#         trainer.train()
-#     if config["Global"].get("do_eval", False):
-#         logger.info("Evaluating on validation set")
-#         time_info, loss_info, metric_info = trainer.eval(val_loader)
-#     if config["Global"].get("do_test", False):
-#         logger.info("Evaluating on test set")
-#         time_info, loss_info, metric_info = trainer.eval(test_loader)
-
-
-
 import argparse
 import os
-import time
+import os.path as osp
 
-import paddle
+import paddle.distributed as dist
+import paddle.distributed.fleet as fleet
 from omegaconf import OmegaConf
-from ppmat.datasets import DensityCollator
-from ppmat.datasets import DensityVoxelCollator
+
 from ppmat.datasets import build_dataloader
+from ppmat.datasets import set_signal_handlers
 from ppmat.metrics import build_metric
 from ppmat.models import build_model
-from ppmat.models.infgcn.paddle_utils import *  # noqa: F403
 from ppmat.optimizer import build_optimizer
 from ppmat.trainer.base_trainer import BaseTrainer
-from ppmat.trainer.trainer_state import TrainerState
 from ppmat.utils import logger
 from ppmat.utils import misc
+from ppmat.utils.eager_comp_setting import setting_eager_mode
 
-# Based on step not epoch
+if dist.get_world_size() > 1:
+    fleet.init(is_collective=True)
 
 
+import paddle
+import time
+from ppmat.trainer.trainer_state import TrainerState
 class InfGCNTrainer(BaseTrainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -304,8 +168,14 @@ class InfGCNTrainer(BaseTrainer):
                 if grid_batch_size is None:
                     preds = self.model(g.x, g.pos, grid_coord, g.batch, infos)
                 else:
+                    # 确保batch_size能整除grid_coord的维度1大小
+                    dim_size = grid_coord.shape[1]
+                    grid_batch_size = min(grid_batch_size, dim_size)
+                    while dim_size % grid_batch_size != 0:
+                        grid_batch_size -= 1
+                    
                     preds = []
-                    for grid in grid_coord.split(grid_batch_size, dim=1):
+                    for grid in grid_coord.split(grid_batch_size, axis=1):
                         preds.append(self.model(g.x, g.pos, grid, g.batch, infos))
                     preds = paddle.concat(x=preds, axis=1)
 
@@ -583,76 +453,81 @@ if __name__ == "__main__":
         "-c",
         "--config",
         type=str,
-        default="./configs/md/infgcn_md.yaml",
         help="Path to config file",
     )
 
-    parser.add_argument("-d", "--device", type=str, default="gpu:0", help="cuda or cpu")
-
     args, dynamic_args = parser.parse_known_args()
-    paddle.set_device(args.device)
 
+    # load config and merge with cli args
     config = OmegaConf.load(args.config)
     cli_config = OmegaConf.from_dotlist(dynamic_args)
     config = OmegaConf.merge(config, cli_config)
 
-    os.makedirs(config["Trainer"]["output_dir"], exist_ok=True)
-    config_name = os.path.basename(args.config)
-    OmegaConf.save(config, os.path.join(config["Trainer"]["output_dir"], config_name))
-
+    # save config to output_dir, only rank 0 process will do this
+    if dist.get_rank() == 0:
+        os.makedirs(config["Trainer"]["output_dir"], exist_ok=True)
+        config_name = os.path.basename(args.config)
+        OmegaConf.save(config, osp.join(config["Trainer"]["output_dir"], config_name))
+    # convert to dict
     config = OmegaConf.to_container(config, resolve=True)
-    logger_path = os.path.join(config["Trainer"]["output_dir"], "run.log")
+
+    # init logger
+    logger_path = osp.join(config["Trainer"]["output_dir"], "run.log")
     logger.init_logger(log_file=logger_path)
     logger.info(f"Logger saved to {logger_path}")
 
+    # set random seed
     seed = config["Trainer"].get("seed", 42)
     misc.set_random_seed(seed)
     logger.info(f"Set random seed to {seed}")
 
+    # set primitive eager mode for debug
+    enabled = config["Global"].get("prim_eager_enabled", False)
+    white_list = config["Global"].get("prim_backward_white_list", None)
+    setting_eager_mode(enabled, white_list)
+
+    # build model from config
     model_cfg = config["Model"]
     model = build_model(model_cfg)
 
-    use_voxel = config["Global"].get("use_voxel", False)
-    train_samples = config["Trainer"].get("train_samples", None)
-    val_samples = config["Trainer"].get("val_samples", None)
-
-    train_data_cfg = config["Dataset"].get("train")
-    if train_data_cfg is None:
-        logger.warning("Training dataset is not defined in the config")
-        train_loader = None
-    else:
+    # build dataloader from config
+    set_signal_handlers()
+    if config["Global"].get("do_train", True):
+        train_data_cfg = config["Dataset"].get("train")
+        assert (
+            train_data_cfg is not None
+        ), "train_data_cfg must be defined, when do_train is true"
         train_loader = build_dataloader(train_data_cfg)
-        if train_loader is not None:
-            if use_voxel:
-                train_loader.collate_fn = DensityVoxelCollator()
-            else:
-                train_loader.collate_fn = DensityCollator(train_samples)
+    else:
+        train_loader = None
 
-    val_data_cfg = config["Dataset"].get("val")
-    if val_data_cfg is None:
-        logger.warning("Validation dataset is not defined in the configuration")
+    if config["Global"].get("do_eval", False) or config["Global"].get("do_train", True):
+        val_data_cfg = config["Dataset"].get("val")
+        if val_data_cfg is not None:
+            val_loader = build_dataloader(val_data_cfg)
+        else:
+            logger.info("No validation dataset defined.")
+            val_loader = None
+    else:
         val_loader = None
-    else:
-        val_loader = build_dataloader(val_data_cfg)
-        if val_loader is not None:
-            if use_voxel:
-                val_loader.collate_fn = DensityVoxelCollator()
-            else:
-                val_loader.collate_fn = DensityCollator(val_samples)
 
-    test_data_cfg = config["Dataset"].get("test")
-    if test_data_cfg is None:
-        logger.warning("Test dataset is not defined in the configuration")
-        test_loader = None
-    else:
+    if config["Global"].get("do_test", False):
+        test_data_cfg = config["Dataset"].get("test")
+        assert (
+            test_data_cfg is not None
+        ), "test_data_cfg must be defined, when do_test is true"
         test_loader = build_dataloader(test_data_cfg)
-        if test_loader is not None:
-            if use_voxel:
-                test_loader.collate_fn = DensityVoxelCollator()
-            else:
-                test_loader.collate_fn = DensityCollator(None)
+    else:
+        test_loader = None
 
-    if config.get("Optimizer") is not None:
+    # build optimizer and learning rate scheduler from config
+    if config.get("Optimizer") is not None and config["Global"].get("do_train", True):
+        assert (
+            train_loader is not None
+        ), "train_loader must be defined when optimizer is defined."
+        assert (
+            config["Trainer"].get("max_epochs") is not None
+        ), "max_epochs must be defined when optimizer is defined."
         optimizer, lr_scheduler = build_optimizer(
             config["Optimizer"],
             model,
@@ -662,13 +537,15 @@ if __name__ == "__main__":
     else:
         optimizer, lr_scheduler = None, None
 
+    # build metric from config
     metric_cfg = config.get("Metric")
     if metric_cfg is not None:
         metric_func = build_metric(metric_cfg)
     else:
         metric_func = None
 
-    trainer = InfGCNTrainer(
+    # # initialize trainer
+    trainer = InfGCNTrainer( #BaseTrainer(
         config["Trainer"],
         model,
         train_dataloader=train_loader,
@@ -678,23 +555,156 @@ if __name__ == "__main__":
         compute_metric_func_dict=metric_func,
     )
 
-    trainer.use_voxel = use_voxel
-
     if config["Global"].get("do_train", True):
         trainer.train()
     if config["Global"].get("do_eval", False):
-        logger.info("Evaluate on the validation set")
+        logger.info("Evaluating on validation set")
         time_info, loss_info, metric_info = trainer.eval(val_loader)
     if config["Global"].get("do_test", False):
-        logger.info("Evaluate on the test set")
-        if "Predict" not in config:
-            num_infer = None
-            num_vis = 2
-            inf_samples = 4096
-        else:
-            num_infer = config["Predict"].get("num_infer", None)
-            num_vis = config["Predict"].get("num_vis", 2)
-            inf_samples = config["Predict"].get("inf_samples", 4096)
-        time_info, loss_info, metric_info = trainer.test(
-            test_loader, num_infer, num_vis, inf_samples
-        )
+        logger.info("Evaluating on test set")
+        time_info, loss_info, metric_info = trainer.eval(test_loader)
+
+
+
+# import argparse
+# from argparse import ArgumentParser
+# import os
+# import time
+
+# import paddle
+# from omegaconf import OmegaConf
+# from ppmat.datasets.density_collator import DensityCollator
+# from ppmat.datasets.density_collator import DensityVoxelCollator
+# from ppmat.datasets import build_dataloader
+# from ppmat.metrics import build_metric
+# from ppmat.models import build_model
+# from ppmat.optimizer import build_optimizer
+# from ppmat.trainer.base_trainer import BaseTrainer
+# from ppmat.trainer.trainer_state import TrainerState
+# from ppmat.utils import logger
+# from ppmat.utils import misc
+
+# Based on step not epoch
+
+# if __name__ == "__main__":
+#     # 配置加载与初始化
+#     parser: ArgumentParser = argparse.ArgumentParser()
+#     parser.add_argument(
+#         "-c",
+#         "--config",
+#         type=str,
+#         default="./configs/md/infgcn_md.yaml",
+#         help="Path to config file",
+#     )
+
+#     parser.add_argument("-d", "--device", type=str, default="gpu:0", help="cuda or cpu")
+
+#     args, dynamic_args = parser.parse_known_args()
+#     paddle.set_device(args.device)
+
+#     config = OmegaConf.load(args.config)
+#     cli_config = OmegaConf.from_dotlist(dynamic_args)
+#     config = OmegaConf.merge(config, cli_config)
+
+#     os.makedirs(config["Trainer"]["output_dir"], exist_ok=True)
+#     config_name = os.path.basename(args.config)
+#     OmegaConf.save(config, os.path.join(config["Trainer"]["output_dir"], config_name))
+
+#     config = OmegaConf.to_container(config, resolve=True)
+#     logger_path = os.path.join(config["Trainer"]["output_dir"], "run.log")
+#     logger.init_logger(log_file=logger_path)
+#     logger.info(f"Logger saved to {logger_path}")
+
+#     seed = config["Trainer"].get("seed", 42)
+#     misc.set_random_seed(seed)
+#     logger.info(f"Set random seed to {seed}")
+
+#     model_cfg = config["Model"]
+#     model = build_model(model_cfg)
+
+#     use_voxel = config["Global"].get("use_voxel", False)
+#     train_samples = config["Trainer"].get("train_samples", None)
+#     val_samples = config["Trainer"].get("val_samples", None)
+
+#     train_data_cfg = config["Dataset"].get("train")
+#     if train_data_cfg is None:
+#         logger.warning("Training dataset is not defined in the config")
+#         train_loader = None
+#     else:
+#         train_loader = build_dataloader(train_data_cfg)
+#         if train_loader is not None:
+#             if use_voxel:
+#                 train_loader.collate_fn = DensityVoxelCollator()
+#             else:
+#                 train_loader.collate_fn = DensityCollator(train_samples)
+
+#     val_data_cfg = config["Dataset"].get("val")
+#     if val_data_cfg is None:
+#         logger.warning("Validation dataset is not defined in the configuration")
+#         val_loader = None
+#     else:
+#         val_loader = build_dataloader(val_data_cfg)
+#         if val_loader is not None:
+#             if use_voxel:
+#                 val_loader.collate_fn = DensityVoxelCollator()
+#             else:
+#                 val_loader.collate_fn = DensityCollator(val_samples)
+
+#     test_data_cfg = config["Dataset"].get("test")
+#     if test_data_cfg is None:
+#         logger.warning("Test dataset is not defined in the configuration")
+#         test_loader = None
+#     else:
+#         test_loader = build_dataloader(test_data_cfg)
+#         if test_loader is not None:
+#             if use_voxel:
+#                 test_loader.collate_fn = DensityVoxelCollator()
+#             else:
+#                 test_loader.collate_fn = DensityCollator(None)
+
+#     if config.get("Optimizer") is not None:
+#         optimizer, lr_scheduler = build_optimizer(
+#             config["Optimizer"],
+#             model,
+#             config["Trainer"]["max_epochs"],
+#             len(train_loader),
+#         )
+#     else:
+#         optimizer, lr_scheduler = None, None
+
+#     metric_cfg = config.get("Metric")
+#     if metric_cfg is not None:
+#         metric_func = build_metric(metric_cfg)
+#     else:
+#         metric_func = None
+
+#     trainer = InfGCNTrainer(
+#         config["Trainer"],
+#         model,
+#         train_dataloader=train_loader,
+#         val_dataloader=val_loader,
+#         optimizer=optimizer,
+#         lr_scheduler=lr_scheduler,
+#         compute_metric_func_dict=metric_func,
+#     )
+
+#     trainer.use_voxel = use_voxel
+
+#     if config["Global"].get("do_train", True):
+#         trainer.train()
+#     if config["Global"].get("do_eval", False):
+#         logger.info("Evaluate on the validation set")
+#         time_info, loss_info, metric_info = trainer.eval(val_loader)
+#     if config["Global"].get("do_test", False):
+#         logger.info("Evaluate on the test set")
+#         if "Predict" not in config:
+#             num_infer = None
+#             num_vis = 2
+#             inf_samples = 4096
+#         else:
+#             num_infer = config["Predict"].get("num_infer", None)
+#             num_vis = config["Predict"].get("num_vis", 2)
+#             inf_samples = config["Predict"].get("inf_samples", 4096)
+#         time_info, loss_info, metric_info = trainer.test(
+#             test_loader, num_infer, num_vis, inf_samples
+#         )
