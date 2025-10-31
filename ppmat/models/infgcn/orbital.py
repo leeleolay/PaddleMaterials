@@ -75,9 +75,9 @@ class GaussianOrbital(paddle.nn.Layer):
         radial_out = self.lc2lcm(radial)
         spherical_out = self.m2lcm(spherical)
         
-        # Debug print tensor types and shapes
-        print(f"radial_out: dtype={radial_out.dtype}, shape={radial_out.shape}")
-        print(f"spherical_out: dtype={spherical_out.dtype}, shape={spherical_out.shape}")
+        # # Debug print tensor types and shapes
+        # print(f"radial_out: dtype={radial_out.dtype}, shape={radial_out.shape}")
+        # print(f"spherical_out: dtype={spherical_out.dtype}, shape={spherical_out.shape}")
         
         # Ensure same dtype
         if radial_out.dtype != spherical_out.dtype:

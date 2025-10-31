@@ -94,8 +94,23 @@ def term_mp(sig_num, frame):
     print("main proc {} exit, kill process group " "{}".format(pid, pgid))
     os.killpg(pgid, signal.SIGKILL)
 
-
 def set_signal_handlers():
+    """
+    Set up signal handlers for safe process group termination.
+
+    Registers SIGINT and SIGTERM signal handlers when:
+    1. The OS supports process groups (os.getpgid exists)
+    2. The current process is the process group leader
+
+    This allows safe termination of the entire process group via:
+    - Ctrl+C (SIGINT) 
+    - Termination signals (SIGTERM)
+
+    Safety Notes:
+    - Only sets handlers when current process is group leader
+    - Prevents accidentally terminating parent processes
+    - Uses term_mp() which kills the entire process group
+    """
     pid = os.getpid()
     try:
         pgid = os.getpgid(pid)

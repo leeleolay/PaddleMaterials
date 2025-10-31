@@ -1,7 +1,7 @@
 Global:
   do_train: False
-  do_eval: False
-  do_test: True
+  do_eval: True
+  do_test: False
   use_voxel: False
 
 Trainer:

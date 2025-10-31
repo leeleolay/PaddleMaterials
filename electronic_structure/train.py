@@ -544,7 +544,7 @@ if __name__ == "__main__":
     else:
         metric_func = None
 
-    # # initialize trainer
+    # initialize trainer
     trainer = InfGCNTrainer( #BaseTrainer(
         config["Trainer"],
         model,
@@ -554,6 +554,7 @@ if __name__ == "__main__":
         lr_scheduler=lr_scheduler,
         compute_metric_func_dict=metric_func,
     )
+    trainer.use_voxel = config["Global"].get("use_voxel", False)
 
     if config["Global"].get("do_train", True):
         trainer.train()
@@ -563,6 +564,17 @@ if __name__ == "__main__":
     if config["Global"].get("do_test", False):
         logger.info("Evaluating on test set")
         time_info, loss_info, metric_info = trainer.eval(test_loader)
+        if "Predict" not in config:
+            num_infer = None
+            num_vis = 2
+            inf_samples = 4096
+        else:
+            num_infer = config["Predict"].get("num_infer", None)
+            num_vis = config["Predict"].get("num_vis", 2)
+            inf_samples = config["Predict"].get("inf_samples", 4096)
+        time_info, loss_info, metric_info = trainer.test(
+            test_loader, num_infer, num_vis, inf_samples
+        )
 
 
 
@@ -573,8 +585,8 @@ if __name__ == "__main__":
 
 # import paddle
 # from omegaconf import OmegaConf
-# from ppmat.datasets.density_collator import DensityCollator
-# from ppmat.datasets.density_collator import DensityVoxelCollator
+# from ppmat.datasets.collate_fn import DensityCollator
+# from ppmat.datasets.collate_fn import DensityVoxelCollator
 # from ppmat.datasets import build_dataloader
 # from ppmat.metrics import build_metric
 # from ppmat.models import build_model
@@ -584,7 +596,6 @@ if __name__ == "__main__":
 # from ppmat.utils import logger
 # from ppmat.utils import misc
 
-# Based on step not epoch
 
 # if __name__ == "__main__":
 #     # 配置加载与初始化
