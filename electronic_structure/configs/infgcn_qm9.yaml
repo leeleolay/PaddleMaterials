@@ -19,8 +19,8 @@ Trainer:
   # Resume from checkpoint path, useful for resuming training
   resume_from_checkpoint: null
   compute_metric_during_train: False
-  train_samples: 1024
-  val_samples: 1024
+  train_samples: 2048
+  val_samples: 2048
   max_grad_norm: 100.0
   batch_size: 16
   use_visualdl: False
@@ -71,7 +71,7 @@ Dataset:
     dataset:
       __class_name__: DensityDataset
       __init_params__:
-        root: /home/liuxuwei01/data_qm9
+        root: /home/liuxuwei01/data_afs/dataset_ES/data_qm9
         split_file: /home/liuxuwei01/PaddleMaterials/electronic_structure/configs/qm9_data_split.json
         atom_file:  /home/liuxuwei01/PaddleMaterials/electronic_structure/configs/qm9.json
         extension: CHGCAR
@@ -83,16 +83,18 @@ Dataset:
       __init_params__:
         shuffle: True
         drop_last: True
-        batch_size: 8
+        batch_size: 4
     loader:
       num_workers: 0
       use_shared_memory: False
-      collate_fn: DensityCollator(None) # DensityVoxelCollator # if use voxel
+      collate_fn: DensityCollator # DensityVoxelCollator # if use voxel
+      collate_params:
+        n_samples: 2048
   val:
     dataset:
       __class_name__: DensityDataset
       __init_params__:
-        root: /home/liuxuwei01/data_qm9
+        root: /home/liuxuwei01/data_afs/dataset_ES/data_qm9
         split_file: /home/liuxuwei01/PaddleMaterials/electronic_structure/configs/qm9_data_split.json
         atom_file:  /home/liuxuwei01/PaddleMaterials/electronic_structure/configs/qm9.json
         extension: CHGCAR
@@ -104,16 +106,18 @@ Dataset:
       __init_params__:
         shuffle: False
         drop_last: False
-        batch_size: 8
+        batch_size: 4
     loader:
       num_workers: 0
       use_shared_memory: False
-      collate_fn: DensityCollator(None) # DensityVoxelCollator # if use voxel
+      collate_fn: DensityCollator # DensityVoxelCollator # if use voxel
+      collate_params:
+        n_samples: 2048
   test:
     dataset:
       __class_name__: DensityDataset
       __init_params__:
-        root: /home/liuxuwei01/data_qm9
+        root: /home/liuxuwei01/data_afs/dataset_ES/data_qm9
         split_file: /home/liuxuwei01/PaddleMaterials/electronic_structure/configs/qm9_data_split.json
         atom_file:  /home/liuxuwei01/PaddleMaterials/electronic_structure/configs/qm9.json
         extension: CHGCAR
@@ -126,11 +130,13 @@ Dataset:
       __init_params__:
         shuffle: False
         drop_last: False
-        batch_size: 8
+        batch_size: 2
     loader:
       num_workers: 0
       use_shared_memory: Flase
-      collate_fn: DensityCollator(None) # DensityVoxelCollator # if use voxel
+      collate_fn: DensityCollator # DensityVoxelCollator # if use voxel
+      collate_params:
+        n_samples: 2048
 
 Predict:
   eval_with_no_grad: True

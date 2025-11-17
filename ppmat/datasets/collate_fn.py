@@ -16,7 +16,6 @@
 from __future__ import annotations
 
 import numbers
-import random
 from collections.abc import Mapping
 from collections.abc import Sequence
 from typing import Any
@@ -85,27 +84,50 @@ class DefaultCollator(object):
 
 
 class DensityCollator:
-    def __init__(self, n_samples=None):
+    def __init__(self, n_samples=None, padding_value=-1.0):
         self.n_samples = n_samples
+        self.padding_value = padding_value
 
     def __call__(self, batch):
         g, densities, grid_coord, infos = zip(*batch)
         g = Batch.from_data_list(g)
+        infos = list(infos)
         if self.n_samples is None:
-            densities = pad_sequence(densities, batch_first=True, padding_value=-1)
+            densities = pad_sequence(
+                densities, batch_first=True, padding_value=self.padding_value
+            )
             grid_coord = pad_sequence(grid_coord, batch_first=True, padding_value=0.0)
-            return g, densities, grid_coord, infos
-        sampled_density, sampled_grid = [], []
-        for d, coord in zip(densities, grid_coord):
-            idx = random.sample(range(d.shape[0]), self.n_samples)
-            sampled_density.append(d[idx])
-            sampled_grid.append(coord[idx])
-        sampled_density = paddle.stack(x=sampled_density, axis=0)
-        sampled_grid = paddle.stack(x=sampled_grid, axis=0)
-        return g, sampled_density, sampled_grid, infos
+            mask = (densities != self.padding_value).astype("float32")
+        else:
+            sampled_density, sampled_grid, mask = [], [], []
+            target_samples = int(self.n_samples)
+            for d, coord in zip(densities, grid_coord):
+                total = int(d.shape[0])
+                replace = total < target_samples
+                indices = np.random.choice(total, target_samples, replace=replace)
+                indices.sort()
+                sampled_density.append(d[indices])
+                sampled_grid.append(coord[indices])
+                mask.append(
+                    paddle.ones_like(x=sampled_density[-1], dtype="float32")
+                )
+            densities = paddle.stack(x=sampled_density, axis=0)
+            grid_coord = paddle.stack(x=sampled_grid, axis=0)
+            mask = paddle.stack(x=mask, axis=0)
+        densities = densities * mask
+        return {
+            "density": densities,
+            "density_mask": mask,
+            "grid_coord": grid_coord,
+            "graph": g,
+            "infos": infos,
+        }
 
 
 class DensityVoxelCollator:
+    def __init__(self, padding_value=-1.0):
+        self.padding_value = padding_value
+
     def __call__(self, batch):
         g, densities, grid_coord, infos = zip(*batch)
         g = Batch.from_data_list(g)
@@ -147,7 +169,15 @@ class DensityVoxelCollator:
             )
         densities = paddle.stack(x=padded_density, axis=0)
         grid_coord = paddle.stack(x=padded_grid, axis=0)
-        return g, densities, grid_coord, infos
+        mask = (densities != self.padding_value).astype("float32")
+        densities = densities * mask
+        return {
+            "density": densities,
+            "density_mask": mask,
+            "grid_coord": grid_coord,
+            "graph": g,
+            "infos": list(infos),
+        }
 
 # utils DensityCollator
 def pad_sequence(sequences, batch_first=False, padding_value=0):
