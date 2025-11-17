@@ -18,6 +18,7 @@ import os
 import numpy as np
 import paddle
 
+from ppmat.utils import logger
 from ppmat.datasets.geometric_data_type.data import Data
 
 ATOM_TYPES = {
@@ -88,7 +89,7 @@ class SmallDensityDataset(paddle.io.Dataset):
         self.grid_coord = self._generate_grid()
 
     def _convert_fft(self, fft_coeff):
-        print(f"Precomputing {self.split} density from FFT coefficients ...")
+        logger.message(f"Precomputing {self.split} density from FFT coefficients ...")
         fft_coeff = paddle.to_tensor(
             data=fft_coeff, dtype="float32", place=paddle.CPUPlace()
         ).to("complex64")
