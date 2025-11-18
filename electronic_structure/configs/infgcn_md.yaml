@@ -71,7 +71,7 @@ Dataset:
     dataset:
       __class_name__: SmallDensityDataset
       __init_params__:
-        root: /home/liuxuwei01/data_afs/dataset_ES/data_md #
+        root: ./dataset_ES/data_md #
         mol_name: ethanol
         split: "train"
     sampler:
@@ -90,7 +90,7 @@ Dataset:
     dataset:
       __class_name__: SmallDensityDataset
       __init_params__:
-        root: /home/liuxuwei01/data_afs/dataset_ES/data_md
+        root: ./dataset_ES/data_md
         mol_name: ethanol
         split: "validation"
     sampler:
@@ -109,7 +109,7 @@ Dataset:
     dataset:
       __class_name__: SmallDensityDataset
       __init_params__:
-        root: /home/liuxuwei01/data_afs/dataset_ES/data_md
+        root: ./dataset_ES/data_md
         mol_name: ethanol
         split: "test"
     sampler:

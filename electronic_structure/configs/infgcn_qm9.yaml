@@ -71,9 +71,9 @@ Dataset:
     dataset:
       __class_name__: DensityDataset
       __init_params__:
-        root: /home/liuxuwei01/data_afs/dataset_ES/data_qm9
-        split_file: /home/liuxuwei01/PaddleMaterials/electronic_structure/configs/qm9_data_split.json
-        atom_file:  /home/liuxuwei01/PaddleMaterials/electronic_structure/configs/qm9.json
+        root: ./dataset_ES/data_qm9
+        split_file: ./electronic_structure/configs/qm9_data_split.json
+        atom_file:  ./electronic_structure/configs/qm9.json
         extension: CHGCAR
         compression: lz4
         pbc: false
@@ -94,9 +94,9 @@ Dataset:
     dataset:
       __class_name__: DensityDataset
       __init_params__:
-        root: /home/liuxuwei01/data_afs/dataset_ES/data_qm9
-        split_file: /home/liuxuwei01/PaddleMaterials/electronic_structure/configs/qm9_data_split.json
-        atom_file:  /home/liuxuwei01/PaddleMaterials/electronic_structure/configs/qm9.json
+        root: ./dataset_ES/data_qm9
+        split_file: ./electronic_structure/configs/qm9_data_split.json
+        atom_file:  ./electronic_structure/configs/qm9.json
         extension: CHGCAR
         compression: lz4
         pbc: false
@@ -117,9 +117,9 @@ Dataset:
     dataset:
       __class_name__: DensityDataset
       __init_params__:
-        root: /home/liuxuwei01/data_afs/dataset_ES/data_qm9
-        split_file: /home/liuxuwei01/PaddleMaterials/electronic_structure/configs/qm9_data_split.json
-        atom_file:  /home/liuxuwei01/PaddleMaterials/electronic_structure/configs/qm9.json
+        root: ./dataset_ES/data_qm9
+        split_file: ./electronic_structure/configs/qm9_data_split.json
+        atom_file:  ./electronic_structure/configs/qm9.json
         extension: CHGCAR
         compression: lz4
         pbc: false

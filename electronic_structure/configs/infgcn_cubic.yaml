@@ -68,9 +68,9 @@ Dataset:
     dataset:
       __class_name__: DensityDataset
       __init_params__:
-        root: /home/liuxuwei01/data_afs/dataset_ES/data_cubic
-        split_file: /home/liuxuwei01/PaddleMaterials/electronic_structure/configs/crystal_data_split.json
-        atom_file:  /home/liuxuwei01/PaddleMaterials/electronic_structure/configs/crystal.json
+        root: ./dataset_ES/data_cubic
+        split_file: ./electronic_structure/configs/crystal_data_split.json
+        atom_file:  ./electronic_structure/configs/crystal.json
         extension: json
         compression: xz
         pbc: false
@@ -91,9 +91,9 @@ Dataset:
     dataset:
       __class_name__: DensityDataset
       __init_params__:
-        root: /home/liuxuwei01/data_afs/dataset_ES/data_cubic
-        split_file: /home/liuxuwei01/PaddleMaterials/electronic_structure/configs/crystal_data_split.json
-        atom_file:  /home/liuxuwei01/PaddleMaterials/electronic_structure/configs/crystal.json
+        root: ./dataset_ES/data_cubic
+        split_file: ./electronic_structure/configs/crystal_data_split.json
+        atom_file:  ./electronic_structure/configs/crystal.json
         extension: json
         compression: xz
         pbc: false
@@ -114,9 +114,9 @@ Dataset:
     dataset:
       __class_name__: DensityDataset
       __init_params__:
-        root: /home/liuxuwei01/data_afs/dataset_ES/data_cubic
-        split_file: /home/liuxuwei01/PaddleMaterials/electronic_structure/configs/crystal_data_split.json
-        atom_file:  /home/liuxuwei01/PaddleMaterials/electronic_structure/configs/crystal.json
+        root: ./dataset_ES/data_cubic
+        split_file: ./electronic_structure/configs/crystal_data_split.json
+        atom_file:  ./electronic_structure/configs/crystal.json
         extension: json
         compression: xz
         pbc: false
