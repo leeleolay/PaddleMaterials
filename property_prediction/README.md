@@ -1,8 +1,8 @@
-# IOMPP-Inorganic Materials Property Prediction
+# Property Prediction
 
 ## 1.Introduction
 
-Inorganic Materials Property Prediction (IMPP) targets rapid, first-principles-level estimation of key crystalline properties—formation energy, band gap, elastic moduli, ionic conductivity, and more—without performing new density-functional-theory calculations. The workflow mirrors modern ML interatomic-potential pipelines but shifts the label space from forces to scalar and tensor observables. Starting from crystal structure files (CIF), an automated converter builds atom–bond graphs enriched with chemical descriptors and symmetry-aware positional encodings. Equivariant graph neural networks, or transformer-based variants, are then trained on tens of thousands of reference entries. By collapsing months of high-throughput DFT time into minutes of GPU inference, IMPP empowers data-driven discovery of semiconductors, catalysts and functional
+Property Prediction (PP) targets rapid, first-principles-level estimation of key crystalline properties—formation energy, band gap, elastic moduli, ionic conductivity, and more—without performing new density-functional-theory calculations. The workflow mirrors modern ML interatomic-potential pipelines but shifts the label space from forces to scalar and tensor observables. Starting from crystal structure files (CIF), an automated converter builds atom–bond graphs enriched with chemical descriptors and symmetry-aware positional encodings. Equivariant graph neural networks, or transformer-based variants, are then trained on tens of thousands of reference entries. By collapsing months of high-throughput DFT time into minutes of GPU inference, PP empowers data-driven discovery of semiconductors, catalysts and functional
 
 ## 2.Models Matrix
 
