@@ -80,9 +80,13 @@ For more information on how to use PaddleMaterials to train and fine tune a mode
 
 ## 📈 Traffic analytics
 
-- Workflow `.github/workflows/traffic-metrics.yml` runs daily at 01:00 UTC (or manually) to collect repository views and clone/download stats via the GitHub traffic API.
-- History is persisted to `output/traffic/traffic_metrics.csv`, and a trend chart is written to `output/traffic/traffic_trend.png`.
-- Clone counts are treated as download counts; unique clone counts are treated as unique downloaders/visitors.
+<!-- traffic:start -->
+| Date | Views | Unique views | Clones | Unique clones |
+| --- | --- | --- | --- | --- |
+| - | - | - | - | - |
+
+![Traffic trend](output/traffic/traffic_trend.png)
+<!-- traffic:end -->
 
 ## 👩‍👩‍👧‍👦 Cooperation
 

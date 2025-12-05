@@ -9,7 +9,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping
+from typing import Dict, Iterable, List, Mapping, Sequence
 
 import matplotlib
 
@@ -104,6 +104,45 @@ def _write_csv(metrics: Dict[str, DailyMetrics], path: Path) -> None:
             )
 
 
+def _latest(metrics: Dict[str, DailyMetrics], limit: int = 7) -> Sequence[DailyMetrics]:
+    if not metrics:
+        return []
+    ordered_dates = sorted(metrics.keys())
+    recent_dates = ordered_dates[-limit:]
+    return [metrics[date_key] for date_key in recent_dates]
+
+
+def _render_table(metrics: Dict[str, DailyMetrics], max_rows: int = 7) -> str:
+    header = "| Date | Views | Unique views | Clones | Unique clones |\n| --- | --- | --- | --- | --- |"
+    if not metrics:
+        return header + "\n| - | - | - | - | - |"
+    rows = [
+        f"| {item.date} | {item.views} | {item.unique_views} | {item.clones} | {item.unique_clones} |"
+        for item in _latest(metrics, max_rows)
+    ]
+    return header + "\n" + "\n".join(rows)
+
+
+def _update_readme(readme_path: Path, metrics: Dict[str, DailyMetrics], image_path: Path) -> None:
+    start_marker = "<!-- traffic:start -->"
+    end_marker = "<!-- traffic:end -->"
+    block = f"{start_marker}\n{_render_table(metrics)}\n\n![Traffic trend]({image_path.as_posix()})\n{end_marker}"
+
+    if not readme_path.exists():
+        print(f"README not found at {readme_path}, skip embedding metrics.")
+        return
+
+    content = readme_path.read_text(encoding="utf-8")
+    if start_marker in content and end_marker in content:
+        pre, rest = content.split(start_marker, 1)
+        _, post = rest.split(end_marker, 1)
+        new_content = pre + block + post
+    else:
+        new_content = content.rstrip() + "\n\n" + block + "\n"
+
+    readme_path.write_text(new_content, encoding="utf-8")
+
+
 def _plot(metrics: Dict[str, DailyMetrics], output_path: Path) -> None:
     if not metrics:
         print("No traffic data available to plot.")
@@ -168,6 +207,11 @@ def main() -> None:
         default=os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN"),
         help="GitHub token with repo access (defaults to GITHUB_TOKEN env).",
     )
+    parser.add_argument(
+        "--readme",
+        default=None,
+        help="Path to README to embed the latest traffic table and chart (optional).",
+    )
     args = parser.parse_args()
 
     if not args.token:
@@ -183,6 +227,8 @@ def main() -> None:
     merged = _merge(existing, latest)
     _write_csv(merged, csv_path)
     _plot(merged, plot_path)
+    if args.readme:
+        _update_readme(Path(args.readme), merged, plot_path)
     print(f"Wrote {csv_path} and {plot_path}")
 
 
