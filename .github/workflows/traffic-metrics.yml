@@ -11,6 +11,8 @@ permissions:
 jobs:
   collect:
     runs-on: ubuntu-latest
+    env:
+      TRAFFIC_TOKEN: ${{ secrets.TRAFFIC_TOKEN || secrets.GITHUB_TOKEN }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -27,13 +29,16 @@ jobs:
 
       - name: Collect traffic metrics
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ env.TRAFFIC_TOKEN }}
+          GITHUB_TOKEN: ${{ env.TRAFFIC_TOKEN }}
           REPO_NAME: ${{ github.repository }}
         run: |
-          python .github/scripts/traffic_metrics.py --repo "${REPO_NAME}" --output-dir output/traffic
+          python .github/scripts/traffic_metrics.py --repo "${REPO_NAME}" --output-dir output/traffic --readme README.md
 
       - name: Commit traffic artifacts
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "chore: update traffic metrics"
-          file_pattern: output/traffic/*
+          file_pattern: |
+            output/traffic/*
+            README.md
