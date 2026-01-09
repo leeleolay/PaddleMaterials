@@ -1,22 +1,47 @@
 # DiffCSP
 
-[COMPLETE AND EFFICIENT GRAPH TRANSFORMERS FOR CRYSTAL MATERIAL PROPERTY PREDICTION](https://arxiv.org/abs/2309.04475)
+[Crystal Structure Prediction by Joint Equivariant Diffusion](https://arxiv.org/abs/2309.04475)
 
 ## Abstract
 
-Crystal structures are characterized by atomic bases within a primitive unit cell that repeats along a regular lattice throughout 3D space. The periodic and infinite nature of crystals poses unique challenges for geometric graph representation learning. Specifically, constructing graphs that effectively capture the complete geometric information of crystals and handle chiral crystals remains an unsolved and challenging problem. In this paper, we introduce a novel approach that utilizes the periodic patterns of unit cells to establish the lattice-based representation for each atom, enabling efficient and expressive graph representations of crystals. Furthermore, we propose ComFormer, a SE(3) transformer designed specifically for crystalline materials. ComFormer includes two variants; namely, iComFormer that employs invariant geometric descriptors of Euclidean distances and angles, and eComFormer that utilizes equivariant vector representations. Experimental results demonstrate the state-of-the-art predictive accuracy of ComFormer variants on various tasks across three widely-used crystal benchmarks.
+DiffCSP frames crystal structure prediction as a denoising diffusion process that jointly recovers lattice parameters and fractional atomic coordinates from noisy compositions. A SE(3)-equivariant score network respects rotational, translational, and permutation symmetries while handling periodic boundary conditions. Reverse-time sampling progressively removes noise to generate stable candidate structures, improving match rate and RMS displacement against ground-truth Materials Project crystals.
 
 ![DiffCSP Overview](../../docs/diffcsp_overview.png)
 
 ## Datasets:
 
+DiffCSP is trained on composition–structure pairs, with CIF strings converted to primitive, Niggli-reduced cells before batching. Fractional coordinates and lattice matrices are extracted on the fly; no property targets beyond the crystal geometry are required.
+
 - MP20:
 
-    MP-20 selects 45,231 stable inorganic materials from Material Projects, which includes the majority of experimentally-generated materials with at most 20 atoms in a unit cell.
+    MP-20 selects 45,231 stable inorganic materials from the Materials Project (≤20 atoms per conventional cell). Structures containing Tc, Pm, or elements with atomic number ≥84 are removed, and high-energy samples (energy above hull >0.1 eV/atom) are filtered from the training pool; all structures are relaxed with a consistent PBE workflow to reduce label noise (see `ppmat.datasets.MP20Dataset` and `jointContribution/mattergen/data-release/mp-20/README.md` for details).
+
+    During preprocessing, MP-20 CSV files are parsed into pymatgen `Structure` objects, optionally reduced to primitive/Niggli form, and then converted into arrays of lattice parameters, fractional coordinates, atom types, and per-structure atom counts (`num_atoms`). These arrays are the direct inputs to DiffCSP’s diffusion process and the `structure_generation/train.py` entry point. No property values (formation energy, band gap, etc.) are used by DiffCSP itself; evaluation is based purely on geometric recovery.
 
     |                                     Dataset                                      | train |  val  | test  |
     | :------------------------------------------------------------------------------: | :---: | :---: | :---: |
     | [MP20](https://paddle-org.bj.bcebos.com/paddlematerial/datasets/mp_20/mp_20.zip) | 27136 | 9047  | 9046  |
+
+## Model
+
+DiffCSP performs joint diffusion on two manifolds: (1) a wrapped Gaussian process over fractional coordinates inside the unit cell and (2) a Gaussian process over lattice matrices.
+
+In the Paddle implementation (`ppmat.models.diffcsp.DiffCSP`), training proceeds as follows:
+
+- given a clean structure array containing `lattice` (or lengths/angles), `frac_coords`, `atom_types`, and `num_atoms`, Gaussian noise is added separately to lattice matrices and fractional coordinates by two schedulers (`lattice_scheduler`, `coord_scheduler`), producing noisy inputs $(\tilde{L}, \tilde{X})$ and noise terms $(\epsilon_L, \epsilon_X)$;  
+- a sinusoidal time embedding of the discrete diffusion step index is computed and passed, along with atom types, $\tilde{X}$, $\tilde{L}$, and `num_atoms`, into a decoder `CSPNet`, which is an SE(3)-equivariant graph neural network designed for crystal diffusion;  
+- for lattice, the decoder directly predicts the noise $\hat{\epsilon}_L$, and an MSE loss against the sampled $\epsilon_L$ is used;  
+- for coordinates, the decoder predicts a score corresponding to the wrapped normal log-density gradient; this score is matched against the analytically tractable target `d_log_p_wrapped_normal` derived from the coordinate noise and scheduler sigmas.
+
+The coordinate scheduler maintains a table of discrete noise levels (`discrete_sigmas` and their normalized variants) so that DiffCSP can rescale both predictions and targets appropriately at each diffusion step. Atom types are kept fixed and treated as conditioning information only; DiffCSP predicts structures given composition rather than generating compositions.
+
+At sampling time, DiffCSP initializes both lattice and fractional coordinates from simple priors (`l_T`, `x_T`) and uses the two schedulers to perform a predictor–corrector reverse-time integration:
+
+1. a “corrector” step based on denoiser predictions refines the current sample at fixed noise level;  
+2. a “predictor” step moves the sample to the next, lower noise level using the analytic reverse SDE/ODE update;  
+3. coordinates are renormalized modulo 1.0 to keep atoms inside the unit cell.
+
+After the final step, DiffCSP returns the denoised fractional coordinates $x_t$ and lattice matrices $L_t$ as the predicted crystal structures. Evaluation uses the match rate (percentage of generated structures matching the ground truth under a structure matcher) and RMS displacement between generated and reference structures, as reported in the original paper.
 
 
 ## Results

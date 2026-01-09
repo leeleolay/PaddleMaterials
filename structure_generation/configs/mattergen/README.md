@@ -8,6 +8,47 @@ The design of functional materials with desired properties is essential in drivi
 
 ![MatterGen Overview](../../docs/mattergen.png)
 
+## Datasets
+
+MatterGen is trained and fine-tuned on crystal structure corpora where each sample provides a CIF string (converted to primitive, Niggli-reduced cells during preprocessing) plus optional property columns used for conditioning. CSV manifests are cached into `./data/*_cache/` on first load to accelerate training, and structures are reconstructed via `BuildStructure` and pymatgen before being converted into graphs for the denoiser.
+
+- **MP-20**: 45,231 stable Materials Project structures with at most 20 atoms per conventional cell. Following the upstream release (see `jointContribution/mattergen/data-release/mp-20/README.md`), samples containing Tc, Pm, or elements with $Z \ge 84$ are removed; all structures are re-relaxed with a consistent PBE DFT workflow; and training data are filtered to energy above hull $E_\text{hull} \le 0.1$ eV/atom. The dataset is stored as CSV files with columns such as:
+
+  - `material_id`: Materials Project identifier (e.g. `mp-10009`),  
+  - `cif`: CIF string for the relaxed structure,  
+  - `formation_energy_per_atom`, `band_gap`, `e_above_hull`, and space-group information,  
+  - additional task-specific columns when available.
+
+  The splits used in this repo match the public MatterGen / CDVAE MP-20 benchmark: train 27,136 · val 9,047 · test 9,046. The official MP-20 CSVs for structure generation can be downloaded from [mp_20.zip](https://paddle-org.bj.bcebos.com/paddlematerial/datasets/mp_20/mp_20.zip) and referenced by the configs via `./data/mp_20_chemical_system/*.csv`.
+
+- **Alex-MP-20**: A large-scale merge of the Alexandria dataset ([Schmidt et al., 2022](https://archive.materialscloud.org/record/2022.126)) with MP-20, used for pretraining and multi-property fine-tuning. As documented in `jointContribution/mattergen/data-release/alex-mp/README.md`, structures containing Tc, Pm, or elements with $Z \ge 84$ are removed, all structures are re-relaxed with PBE, and for training the subset with more than 20 atoms or $E_\text{hull} > 0.1$ eV/atom is discarded. The resulting Alex-MP-20 table adds multiple property columns (e.g. `dft_band_gap`, `dft_mag_density`, `ml_bulk_modulus`, `space_group`, `hhi_score`, `energy_above_hull`) that serve as conditioning signals.
+
+In this directory, each YAML config corresponds to a specific choice of property columns and conditioning scheme. For example, `mattergen_mp20.yaml` trains an unconditional base model on MP-20, whereas `mattergen_alex_mp20_dft_band_gap.yaml` fine-tunes a base model on Alex-MP-20 with DFT band gap as the conditioning variable, and `mattergen_alex_mp20_dft_mag_density_hhi_score.yaml` enables joint multi-property control.
+
+## Model
+
+MatterGen models crystal generation as a diffusion process over lattice matrices, fractional atomic coordinates, and discrete atom types. In the Paddle implementation (`ppmat.models.mattergen.MatterGen` and `MatterGenWithCondition`), three coupled noise processes are defined:
+
+- a *continuous* diffusion on lattice matrices, with symmetry-preserving Gaussian noise (`make_noise_symmetric_preserve_variance`) and a dedicated scheduler;  
+- a *wrapped normal* diffusion on fractional coordinates inside the unit cell, implemented via a wrapped normal score matching loss so that coordinates remain periodic and can be taken modulo 1.0 without discontinuities;  
+- a *discrete* diffusion (D3PM-style) on atom types, where categorical noise is injected into zero-based element indices and a hybrid cross-entropy / score-matching objective is used (`d3pm_hybrid_lambda` controls the balance).
+
+At each training step, clean structures from MP-20 or Alex-MP-20 are perturbed by these three processes at a random diffusion time $t$, and a shared SE(3)-equivariant denoiser (`GemNetTDenoiser`) receives the noisy lattice, noisy fractional coordinates, noisy atom types, and a sinusoidal time embedding. The denoiser is a GemNet-T–like message-passing network over periodic graphs, where:
+
+- nodes correspond to atoms with element embeddings;  
+- edges connect neighbors according to a cutoff and encode distance / angular information as in GemNet;  
+- the time embedding is injected into node and/or edge features so that the network can learn time-dependent scores for each diffusion scale.
+
+The unconditional `MatterGen` learns to reconstruct all three score fields (lattice, coordinates, atom types), with separate loss weights (`lattice_loss_weight`, `coord_loss_weight`, `atom_loss_weight`). The conditional variant `MatterGenWithCondition` augments this with a `SetEmbeddingType` module that encodes one or more property values (e.g. band gap, magnetic density, bulk modulus, chemical system, space group) into a global conditioning vector. Through classifier-free guidance, the model is trained to sometimes drop the conditioning signal (`_USE_UNCONDITIONAL_EMBEDDING`) and at sampling time a guidance scale amplifies the difference between conditional and unconditional scores, enabling strong steering toward the desired property targets.
+
+Sampling starts from pure noise in lattice, coordinates, and atom types and runs a predictor–corrector sampler for a fixed number of steps (typically 1,000). At each time step, the denoiser predicts score fields which are used to:
+
+1. update fractional coordinates via wrapped normal predictor–corrector updates;  
+2. update the lattice via an Ornstein–Uhlenbeck–style continuous-time diffusion step;  
+3. update atom types via a discrete diffusion step using the learned logits.
+
+For evaluation and generation, the mean predictions from the last step are taken as the final structure (lattice, atom types, fractional coordinates), which can then be exported as CIFs and optionally relaxed by DFT to measure stability, novelty, uniqueness, and property fidelity as in the original MatterGen paper.
+
 ## Results
 
 <table>
