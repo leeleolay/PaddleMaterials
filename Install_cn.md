@@ -89,7 +89,7 @@ python property_prediction/predict.py \
 python structure_generation/sample.py \
     --model_name='mattergen_mp20' \
     --weights_name='latest.pdparams' \
-    --save_path='result_mattergen_mp20/' \
+    --output_dir='result_mattergen_mp20/' \
     --mode='by_num_atoms' \
     --num_atoms=4
 ```
@@ -112,11 +112,12 @@ python interatomic_potentials/predict.py \
 
 ```bash
 python electronic_structure/predict.py \
-    --config='electronic_structure/configs/infgcn/infgcn_qm9.yaml' \
-    --checkpoint='path/to/infgcn_qm9.pdparams' \
-    --split='validation' \
-    --index=0 \
-    --output_dir='output/infgcn_qm9/validation_0' \
+    --model_name='infgcn_qm9' \
+    --weights_name='best.pdparams' \
+    --mol_input='electronic_structure/configs/infgcn/example/methane.mol' \
+    --atom_file='electronic_structure/configs/qm9.json' \
+    --mol_grid_shape=8 \
+    --output_dir='output/infgcn_qm9/methane' \
     --save_pred_cube
 ```
 
@@ -129,9 +130,9 @@ python electronic_structure/predict.py \
 
 ```bash
 python spectrum_elucidation/sample.py \
-    --config_path='spectrum_elucidation/configs/diffnmr/DiffNMR.yaml' \
-    --checkpoint_path='path/to/DiffNMR_nless15_best.pdparams' \
-    --save_path='result_diffnmr_nless15/'
+    --model_name='diffnmr_msdnmr_nless15' \
+    --weights_name='best.pdparams' \
+    --output_dir='result_diffnmr_nless15/'
 ```
 
 ### 2.6 谱图增强
@@ -141,7 +142,9 @@ python spectrum_elucidation/sample.py \
 ```bash
 python spectrum_enhancement/predict.py \
     --model_name='sfin_haadf_enhance' \
-    --split='val'
+    --weights_name='best.pdparams' \
+    --input_path='path/to/noisy_image.png' \
+    --output_dir='result_sfin/'
 ```
 
 更多使用说明请参考各任务 README 或 [Get Started](./get_started.md)。
