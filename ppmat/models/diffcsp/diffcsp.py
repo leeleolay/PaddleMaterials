@@ -340,6 +340,8 @@ class CSPNet(paddle.nn.Layer):
 
 
 class DiffCSP(paddle.nn.Layer):
+    supports_num_atoms_sampling = False
+
     """Crystal Structure Prediction by Joint Equivariant Diffusion
 
     https://arxiv.org/abs/2309.04475
