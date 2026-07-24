@@ -16,6 +16,7 @@ import numpy as np
 import paddle
 
 from ppmat.utils.scatter import scatter_argmin
+from ppmat.utils.scatter import scatter_sum
 
 
 def test_scatter_argmin_handles_unsorted_and_empty_groups():
@@ -43,3 +44,18 @@ def test_scatter_argmin_handles_empty_input():
     result = scatter_argmin(values, groups, dim_size=3)
 
     np.testing.assert_array_equal(result.numpy(), [-1, -1, -1])
+
+
+def test_scatter_sum_dim_zero_supports_matrix_values():
+    values = paddle.arange(24, dtype="float32").reshape([4, 2, 3])
+    groups = paddle.to_tensor([0, 1, 0, 1], dtype="int64")
+
+    result = scatter_sum(values, groups, dim=0, dim_size=2)
+
+    expected = np.stack(
+        [
+            values.numpy()[[0, 2]].sum(axis=0),
+            values.numpy()[[1, 3]].sum(axis=0),
+        ]
+    )
+    np.testing.assert_allclose(result.numpy(), expected)
