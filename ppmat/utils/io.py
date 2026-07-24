@@ -14,11 +14,13 @@
 
 import argparse
 import ast
+import datetime
 import hashlib
 import json
 import os
 import os.path as osp
 from typing import List
+from typing import Optional
 
 import numpy as np
 
@@ -125,6 +127,17 @@ def calc_md5(fullname):
     calc_md5sum = md5.hexdigest()
 
     return calc_md5sum
+
+
+def append_timestamp_to_output_dir(
+    config,
+    now: Optional[datetime.datetime] = None,
+):
+    seed = config["Trainer"].get("seed", 42)
+    timestamp = (now or datetime.datetime.now()).strftime("%Y%m%d_%H%M%S")
+    base_output_dir = config["Trainer"]["output_dir"]
+    config["Trainer"]["output_dir"] = f"{base_output_dir}_t_{timestamp}_s_{seed}"
+    return config
 
 
 if __name__ == "__main__":
