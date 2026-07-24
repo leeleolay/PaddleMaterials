@@ -32,6 +32,7 @@ from ppmat.optimizer import build_optimizer
 from ppmat.trainer.base_trainer import BaseTrainer
 from ppmat.utils import logger
 from ppmat.utils import misc
+from ppmat.utils.io import append_timestamp_to_output_dir
 from ppmat.utils.visualization import MolecularVisualization
 
 if dist.get_world_size() > 1:
@@ -55,6 +56,9 @@ if __name__ == "__main__":
     cli_config = OmegaConf.from_dotlist(dynamic_args)
     config = OmegaConf.merge(config, cli_config)
 
+    seed = config["Trainer"].get("seed", 42)
+    append_timestamp_to_output_dir(config)
+
     # save config to output_dir, only rank 0 process will do this
     if dist.get_rank() == 0:
         os.makedirs(config["Trainer"]["output_dir"], exist_ok=True)
@@ -69,22 +73,32 @@ if __name__ == "__main__":
     logger.info(f"Logger saved to {logger_path}")
 
     # set random seed
-    seed = config["Trainer"].get("seed", 42)
     misc.set_random_seed(seed)
     logger.info(f"Set random seed to {seed}")
 
     # load dataloader from config
     set_signal_handlers()
-    if config["Global"].get("do_train", True):
+    do_train = config["Global"].get("do_train", True)
+    do_eval = config["Global"].get("do_eval", False)
+    do_test = config["Global"].get("do_test", False)
+    if not any((do_train, do_eval, do_test)):
+        raise ValueError(
+            "At least one of Global.do_train, Global.do_eval, or Global.do_test "
+            "must be True."
+        )
+
+    # DiffNMR dataset statistics and novelty metrics use the training SMILES even
+    # during evaluation-only and test-only runs.
+    if do_train or do_eval or do_test:
         train_data_cfg = config["Dataset"].get("train")
         assert (
             train_data_cfg is not None
-        ), "train_data_cfg must be defined, when do_train is true"
+        ), "train_data_cfg must be defined for DiffNMR train/eval/test."
         train_loader = build_dataloader(train_data_cfg)
     else:
         train_loader = None
 
-    if config["Global"].get("do_eval", False) or config["Global"].get("do_train", True):
+    if do_eval or do_train:
         val_data_cfg = config["Dataset"].get("val")
         if val_data_cfg is not None:
             val_loader = build_dataloader(val_data_cfg)
@@ -94,7 +108,7 @@ if __name__ == "__main__":
     else:
         val_loader = None
 
-    if config["Global"].get("do_test", False):
+    if do_test:
         test_data_cfg = config["Dataset"].get("test")
         assert (
             test_data_cfg is not None

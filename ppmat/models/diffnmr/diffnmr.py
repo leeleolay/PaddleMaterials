@@ -451,11 +451,12 @@ class DiffNMR(nn.Layer):
         extra_features,
         domain_features,
         clip,
-        connector_cfg = None,
+        connector_cfg=None,
     ) -> None:
         super().__init__()
 
         # configure general variables settings
+        self.conditioning_mode = "spectrum"
         self.T = diffmodel_cfg["diffusion_steps"]
 
         # configure datasets inter-varibles

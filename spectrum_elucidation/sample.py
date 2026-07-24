@@ -14,60 +14,49 @@
 
 import argparse
 
-from ppmat.sampler.base_sampler import MolecularSampler
+from ppmat.sampler import MolecularSampler
 from ppmat.utils import logger
+from ppmat.utils.inference_cli import add_model_loading_arguments
+from ppmat.utils.inference_cli import validate_config_overrides
+from ppmat.utils.inference_cli import validate_model_loading_arguments
 
-if __name__ == "__main__":
 
-    argparse = argparse.ArgumentParser()
-
-    argparse.add_argument("--model_name", type=str, default=None)
-    argparse.add_argument(
-        "--weights_name",
-        type=str,
-        default=None,
-        help="Weights name, e.g., best.pdparams, latest.pdparams.",
+def build_parser():
+    parser = argparse.ArgumentParser(description="Molecular structure sampling")
+    add_model_loading_arguments(parser)
+    parser.add_argument(
+        "--output_dir",
+        default="results",
+        help="Directory in which sampling results are saved.",
     )
-    argparse.add_argument(
-        "--config_path",
-        type=str,
-        default=None,
-        help="Path to the configuration file.",
-    )
-    argparse.add_argument(
-        "--checkpoint_path",
-        type=str,
-        default=None,
-        help="Path to the checkpoint file.",
-    )
-    argparse.add_argument("--save_path", type=str, default="results")
-    argparse.add_argument(
+    parser.add_argument(
         "--mode",
-        type=str,
-        choices=[
-            "by_dataloader",
-            "compute_metric",
-        ],
+        choices=["by_dataloader", "compute_metric"],
         default="by_dataloader",
     )
+    return parser
 
-    args = argparse.parse_args()
+
+def main():
+    parser = build_parser()
+    args, config_overrides = parser.parse_known_args()
+    validate_model_loading_arguments(parser, args)
+    validate_config_overrides(parser, config_overrides)
 
     sampler = MolecularSampler(
         model_name=args.model_name,
         weights_name=args.weights_name,
         config_path=args.config_path,
         checkpoint_path=args.checkpoint_path,
+        config_overrides=config_overrides,
     )
     if args.mode == "compute_metric":
-        metric_result = sampler.compute_metric(
-            save_path=args.save_path,
-        )
+        metric_result = sampler.compute_metric(save_path=args.output_dir)
         for metric_name, metric_value in metric_result.items():
             logger.info(f"{metric_name}: {metric_value}")
-    elif args.mode == "by_dataloader":
-        result = sampler.sample_by_dataloader(
-            save_path=args.save_path,
-        )
     else:
-        raise ValueError(f"Unknown mode: {args.mode}")
+        sampler.sample_by_dataloader(save_path=args.output_dir)
+
+
+if __name__ == "__main__":
+    main()
