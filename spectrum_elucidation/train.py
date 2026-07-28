@@ -30,30 +30,76 @@ from ppmat.models.diffnmr.extra_features_graph import ExtraFeatures
 from ppmat.models.diffnmr.extra_features_molecular_graph import ExtraMolecularFeatures
 from ppmat.optimizer import build_optimizer
 from ppmat.trainer.base_trainer import BaseTrainer
+from ppmat.trainer.utils import append_timestamp_to_output_dir
 from ppmat.utils import logger
 from ppmat.utils import misc
 from ppmat.utils.visualization import MolecularVisualization
 
-if dist.get_world_size() > 1:
-    dist.fleet.init(is_collective=True)
 
-if __name__ == "__main__":
-    # parse arguments
+def read_independent_dataloader_config(config):
+    do_train = config["Global"].get("do_train", True)
+    do_eval = config["Global"].get("do_eval", False)
+    do_test = config["Global"].get("do_test", False)
+    if not any((do_train, do_eval, do_test)):
+        raise ValueError(
+            "At least one of Global.do_train, Global.do_eval, or Global.do_test "
+            "must be True."
+        )
+
+    # DiffNMR dataset statistics and novelty metrics use the training SMILES even
+    # during evaluation-only and test-only runs.
+    train_data_cfg = config["Dataset"].get("train")
+    assert (
+        train_data_cfg is not None
+    ), "train_data_cfg must be defined for DiffNMR train/eval/test."
+    train_loader = build_dataloader(train_data_cfg)
+
+    if do_eval or do_train:
+        val_data_cfg = config["Dataset"].get("val")
+        if val_data_cfg is not None:
+            val_loader = build_dataloader(val_data_cfg)
+        else:
+            logger.info("No validation dataset defined.")
+            val_loader = None
+    else:
+        val_loader = None
+
+    if do_test:
+        test_data_cfg = config["Dataset"].get("test")
+        assert (
+            test_data_cfg is not None
+        ), "test_data_cfg must be defined, when do_test is true"
+        test_loader = build_dataloader(test_data_cfg)
+    else:
+        test_loader = None
+    return train_loader, val_loader, test_loader
+
+
+def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "-c",
         "--config",
         type=str,
-        default="./spectrum_elucidation/configs/DiffNMR.yaml",
+        default="./spectrum_elucidation/configs/diffnmr/DiffNMR.yaml",
         help="Path to config file",
     )
+    return parser.parse_known_args()
 
-    args, dynamic_args = parser.parse_known_args()
+
+if dist.get_world_size() > 1:
+    dist.fleet.init(is_collective=True)
+
+if __name__ == "__main__":
+    args, dynamic_args = parse_args()
 
     # load config and merge with cli args
     config = OmegaConf.load(args.config)
     cli_config = OmegaConf.from_dotlist(dynamic_args)
     config = OmegaConf.merge(config, cli_config)
+
+    seed = config["Trainer"].get("seed", 42)
+    append_timestamp_to_output_dir(config)
 
     # save config to output_dir, only rank 0 process will do this
     if dist.get_rank() == 0:
@@ -69,39 +115,12 @@ if __name__ == "__main__":
     logger.info(f"Logger saved to {logger_path}")
 
     # set random seed
-    seed = config["Trainer"].get("seed", 42)
     misc.set_random_seed(seed)
     logger.info(f"Set random seed to {seed}")
 
     # load dataloader from config
     set_signal_handlers()
-    if config["Global"].get("do_train", True):
-        train_data_cfg = config["Dataset"].get("train")
-        assert (
-            train_data_cfg is not None
-        ), "train_data_cfg must be defined, when do_train is true"
-        train_loader = build_dataloader(train_data_cfg)
-    else:
-        train_loader = None
-
-    if config["Global"].get("do_eval", False) or config["Global"].get("do_train", True):
-        val_data_cfg = config["Dataset"].get("val")
-        if val_data_cfg is not None:
-            val_loader = build_dataloader(val_data_cfg)
-        else:
-            logger.info("No validation dataset defined.")
-            val_loader = None
-    else:
-        val_loader = None
-
-    if config["Global"].get("do_test", False):
-        test_data_cfg = config["Dataset"].get("test")
-        assert (
-            test_data_cfg is not None
-        ), "test_data_cfg must be defined, when do_test is true"
-        test_loader = build_dataloader(test_data_cfg)
-    else:
-        test_loader = None
+    train_loader, val_loader, test_loader = read_independent_dataloader_config(config)
 
     # build datasetinfo
     dataloaders = DataLoaderCollection(train_loader, val_loader, test_loader)

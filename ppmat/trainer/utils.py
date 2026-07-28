@@ -14,7 +14,9 @@
 
 from __future__ import annotations
 
+import datetime
 from typing import Dict
+from typing import Optional
 from typing import Sequence
 from typing import Union
 
@@ -23,6 +25,43 @@ import paddle.distributed as dist
 from packaging import version
 
 from ppmat.utils import logger
+
+
+def append_timestamp_to_output_dir(
+    config,
+    now: Optional[datetime.datetime] = None,
+):
+    """Append a shared timestamp and random seed to the output directory.
+
+    In distributed training, rank 0 creates the timestamp and broadcasts it to
+    all other ranks so every process uses the same output directory.
+
+    Args:
+        config: Training configuration modified in place.
+        now (Optional[datetime.datetime]): Time used to create the timestamp.
+            Defaults to the current local time on rank 0.
+
+    Returns:
+        The modified training configuration.
+    """
+
+    seed = config["Trainer"].get("seed", 42)
+    is_distributed = dist.is_initialized() and dist.get_world_size() > 1
+    if is_distributed:
+        timestamp = (
+            (now or datetime.datetime.now()).strftime("%Y%m%d_%H%M%S")
+            if dist.get_rank() == 0
+            else None
+        )
+        timestamp_list = [timestamp]
+        dist.broadcast_object_list(timestamp_list, src=0)
+        timestamp = timestamp_list[0]
+    else:
+        timestamp = (now or datetime.datetime.now()).strftime("%Y%m%d_%H%M%S")
+
+    base_output_dir = config["Trainer"]["output_dir"]
+    config["Trainer"]["output_dir"] = f"{base_output_dir}_t_{timestamp}_s_{seed}"
+    return config
 
 
 def log_paddle_version():

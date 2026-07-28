@@ -26,53 +26,12 @@ from ppmat.metrics import build_metric
 from ppmat.models import build_model
 from ppmat.optimizer import build_optimizer
 from ppmat.trainer.base_trainer import BaseTrainer
+from ppmat.trainer.utils import append_timestamp_to_output_dir
 from ppmat.utils import logger
 from ppmat.utils import misc
 
-if dist.get_world_size() > 1:
-    fleet.init(is_collective=True)
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "-c",
-        "--config",
-        type=str,
-        default="./structure_generation/configs/diffcsp/diffcsp_mp20.yaml",
-        help="Path to config file",
-    )
-
-    args, dynamic_args = parser.parse_known_args()
-
-    # load config and merge with cli args
-    config = OmegaConf.load(args.config)
-    cli_config = OmegaConf.from_dotlist(dynamic_args)
-    config = OmegaConf.merge(config, cli_config)
-
-    # save config to output_dir, only rank 0 process will do this
-    if dist.get_rank() == 0:
-        os.makedirs(config["Trainer"]["output_dir"], exist_ok=True)
-        config_name = os.path.basename(args.config)
-        OmegaConf.save(config, osp.join(config["Trainer"]["output_dir"], config_name))
-    # convert to dict
-    config = OmegaConf.to_container(config, resolve=True)
-
-    # init logger
-    logger_path = osp.join(config["Trainer"]["output_dir"], "run.log")
-    logger.init_logger(log_file=logger_path)
-    logger.info(f"Logger saved to {logger_path}")
-
-    # set random seed
-    seed = config["Trainer"].get("seed", 42)
-    misc.set_random_seed(seed)
-    logger.info(f"Set random seed to {seed}")
-
-    # build model from config
-    model_cfg = config["Model"]
-    model = build_model(model_cfg)
-
-    # build dataloader from config
-    set_signal_handlers()
+def read_independent_dataloader_config(config):
     if config["Global"].get("do_train", True):
         train_data_cfg = config["Dataset"].get("train")
         assert (
@@ -100,6 +59,59 @@ if __name__ == "__main__":
         test_loader = build_dataloader(test_data_cfg)
     else:
         test_loader = None
+    return train_loader, val_loader, test_loader
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "-c",
+        "--config",
+        type=str,
+        default="./structure_generation/configs/diffcsp/diffcsp_mp20.yaml",
+        help="Path to config file",
+    )
+    return parser.parse_known_args()
+
+
+if dist.get_world_size() > 1:
+    fleet.init(is_collective=True)
+
+if __name__ == "__main__":
+    args, dynamic_args = parse_args()
+
+    # load config and merge with cli args
+    config = OmegaConf.load(args.config)
+    cli_config = OmegaConf.from_dotlist(dynamic_args)
+    config = OmegaConf.merge(config, cli_config)
+
+    seed = config["Trainer"].get("seed", 42)
+    append_timestamp_to_output_dir(config)
+
+    # save config to output_dir, only rank 0 process will do this
+    if dist.get_rank() == 0:
+        os.makedirs(config["Trainer"]["output_dir"], exist_ok=True)
+        config_name = os.path.basename(args.config)
+        OmegaConf.save(config, osp.join(config["Trainer"]["output_dir"], config_name))
+    # convert to dict
+    config = OmegaConf.to_container(config, resolve=True)
+
+    # init logger
+    logger_path = osp.join(config["Trainer"]["output_dir"], "run.log")
+    logger.init_logger(log_file=logger_path)
+    logger.info(f"Logger saved to {logger_path}")
+
+    # set random seed
+    misc.set_random_seed(seed)
+    logger.info(f"Set random seed to {seed}")
+
+    # build model from config
+    model_cfg = config["Model"]
+    model = build_model(model_cfg)
+
+    # build dataloader from config
+    set_signal_handlers()
+    train_loader, val_loader, test_loader = read_independent_dataloader_config(config)
 
     # build optimizer and learning rate scheduler from config
     if config.get("Optimizer") is not None and config["Global"].get("do_train", True):
