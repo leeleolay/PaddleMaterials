@@ -139,7 +139,7 @@ def set_signal_handlers():
             signal.signal(signal.SIGTERM, term_mp)
 
 
-def build_dataloader(cfg: Dict):
+def build_dataloader(cfg: Dict, vocab=None):
     """Build dataloader from config.
 
     Args:
@@ -161,6 +161,8 @@ def build_dataloader(cfg: Dict):
     if "transforms" in init_params:
         init_params["transforms"] = build_transforms(init_params.pop("transforms"))
 
+    if vocab is not None:
+        init_params["vocab"] = vocab
     dataset = eval(cls_name)(**init_params)
 
     loader_config = cfg.get("loader")
