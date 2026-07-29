@@ -20,9 +20,7 @@ def _write_md17_data(data_dir):
         ],
         dtype=np.float64,
     )
-    positions = np.stack(
-        [base_positions + frame * 0.01 for frame in range(4)]
-    )
+    positions = np.stack([base_positions + frame * 0.01 for frame in range(4)])
     energies = np.array([-1.0, -2.0, -3.0, -4.0], dtype=np.float64)
     forces = np.arange(4 * 4 * 3, dtype=np.float64).reshape(4, 4, 3)
 
@@ -96,8 +94,7 @@ def test_md17_split_cache_and_collation(tmp_path):
         expected = np.concatenate(
             [
                 np.asarray(samples[0]["graph"].edge_feat[key]),
-                np.asarray(samples[1]["graph"].edge_feat[key])
-                + first_num_edges,
+                np.asarray(samples[1]["graph"].edge_feat[key]) + first_num_edges,
             ]
         )
         np.testing.assert_array_equal(batch["graph"].edge_feat[key], expected)

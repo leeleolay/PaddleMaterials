@@ -13,19 +13,40 @@
 # limitations under the License.
 
 import paddle
-from paddle_scatter import scatter
-
-from ppmat.models.common.e3nn import o3
-from ppmat.models.common.e3nn.math import soft_one_hot_linspace
-from ppmat.models.common.e3nn.nn import Activation
-from ppmat.models.common.e3nn.nn import Extract
-from ppmat.models.common.e3nn.nn import FullyConnectedNet
-from ppmat.models.common.orbital import GaussianOrbital
-from ppmat.models.common.activation import ScalarActivation
-from ppmat.models.common.activation import NormActivation
 
 from ppmat.datasets.graph_utils.infgcn_graph_utils import radius
-from ppmat.datasets.graph_utils.infgcn_graph_utils import radius_graph
+from ppmat.models.common.activation import NormActivation
+from ppmat.models.common.activation import ScalarActivation
+from ppmat.models.common.e3nn import o3
+from ppmat.models.common.e3nn.math import soft_one_hot_linspace
+from ppmat.models.common.e3nn.nn import FullyConnectedNet
+from ppmat.models.common.orbital import GaussianOrbital
+from ppmat.utils.scatter import scatter
+
+
+def _to_tensor(value, dtype, device):
+    if isinstance(value, paddle.Tensor):
+        return value.astype(dtype).to(device)
+    return paddle.to_tensor(value, dtype=dtype).to(device)
+
+
+def _randomly_truncate_atom_edges(edge_index, max_num_neighbors=32):
+    if edge_index.shape[1] == 0:
+        return edge_index
+
+    num_nodes = int(paddle.max(edge_index).item()) + 1
+    order = paddle.argsort(edge_index[0] * num_nodes + edge_index[1])
+    edge_index = edge_index[:, order]
+    source = edge_index[0]
+    unique_sources, counts = paddle.unique(source, return_counts=True)
+    keep_mask = paddle.ones_like(source, dtype="bool")
+    for node, count in zip(unique_sources, counts):
+        count = int(count.item())
+        if count > max_num_neighbors:
+            edge_ids = paddle.nonzero(source == node, as_tuple=True)[0]
+            permutation = paddle.randperm(count)
+            keep_mask[edge_ids[permutation[max_num_neighbors:]]] = False
+    return edge_index[:, keep_mask]
 
 
 class GCNLayer(paddle.nn.Layer):
@@ -54,8 +75,9 @@ class GCNLayer(paddle.nn.Layer):
         .. math::
             z_u=x_u\\otimes \\sum_v w_{uv}y_v=w_u (x_u\\otimes y)
 
-        Here, uvw are radial (channel) indices of the first input, second input, and output, respectively.
-        Notice that in our model, the second input is always the spherical harmonics of the edge vector,
+        Here, uvw are radial (channel) indices of the first input, second input,
+        and output, respectively. Notice that in our model, the second input is
+        always the spherical harmonics of the edge vector,
         so the index v can be safely ignored.
 
         :param irreps_in: irreducible representations of input node features
@@ -66,8 +88,10 @@ class GCNLayer(paddle.nn.Layer):
         :param radial_hidden_size: hidden size of the radial network
         :param is_fc: whether to use fully connected tensor product
         :param use_sc: whether to use self-connection
-        :param irrep_normalization: representation normalization passed to the `o3.FullyConnectedTensorProduct`
-        :param path_normalization: path normalization passed to the `o3.FullyConnectedTensorProduct`
+        :param irrep_normalization: representation normalization passed to the
+            `o3.FullyConnectedTensorProduct`
+        :param path_normalization: path normalization passed to the
+            `o3.FullyConnectedTensorProduct`
         """
         super(GCNLayer, self).__init__()
         self.irreps_in = o3.Irreps(irreps_in)
@@ -107,7 +131,8 @@ class GCNLayer(paddle.nn.Layer):
                 irrep_normalization=irrep_normalization,
                 path_normalization=path_normalization,
             )
-        self.fc = FullyConnectedNet( # activation function , it will be automatically normalized by a scaling factor
+        # The activation is automatically normalized by a scaling factor.
+        self.fc = FullyConnectedNet(
             [radial_embed_size]
             + num_radial_layer * [radial_hidden_size]
             + [self.tp.weight_numel],
@@ -119,11 +144,15 @@ class GCNLayer(paddle.nn.Layer):
 
     def forward(self, edge_index, node_feat, edge_feat, edge_embed, dim_size=None):
         src, dst = edge_index
-        weight = self.fc(edge_embed) # FFN
-        out = self.tp(node_feat[src], edge_feat, weight=weight) # Tensor Product [num_edges, tp.irreps_out.dim]
-        
-        out = scatter(out, dst, dim=0, dim_size=dim_size, reduce="sum") # message aggregation
-        
+        weight = self.fc(edge_embed)  # FFN
+        out = self.tp(
+            node_feat[src], edge_feat, weight=weight
+        )  # Tensor Product [num_edges, tp.irreps_out.dim]
+
+        out = scatter(
+            out, dst, dim=0, dim_size=dim_size, reduce="sum"
+        )  # message aggregation
+
         if self.use_sc:
             out = out + self.sc(node_feat)
         return out
@@ -145,7 +174,7 @@ def pbc_vec(vec, cell):
 class InfGCN(paddle.nn.Layer):
     def __init__(
         self,
-        n_atom_type,
+        vocab,
         num_radial,
         num_spherical,
         radial_embed_size,
@@ -166,9 +195,10 @@ class InfGCN(paddle.nn.Layer):
     ):
         """
         Implement the InfGCN model for electron density estimation
-        :param n_atom_type: number of atom types
+        :param vocab: vocabularies used by the model
         :param num_radial: number of radial basis
-        :param num_spherical: maximum number of spherical harmonics for each radial basis,
+        :param num_spherical: maximum number of spherical harmonics for each
+            radial basis,
                 number of spherical basis will be (num_spherical + 1)^2
         :param radial_embed_size: embedding size of the edge length
         :param radial_hidden_size: hidden size of the radial network
@@ -176,14 +206,18 @@ class InfGCN(paddle.nn.Layer):
         :param num_gcn_layer: number of InfGCN layers
         :param cutoff: cutoff distance for building the molecular graph
         :param grid_cutoff: cutoff distance for building the grid-atom graph
-        :param is_fc: whether the InfGCN layer should use fully connected tensor product
+        :param is_fc: whether the InfGCN layer should use fully connected
+            tensor product
         :param gauss_start: start coefficient of the Gaussian radial basis
         :param gauss_end: end coefficient of the Gaussian radial basis
-        :param activation: activation type for the InfGCN layer, can be ['scalar', 'norm']
+        :param activation: activation type for the InfGCN layer, can be
+            ['scalar', 'norm']
         :param residual: whether to use the residue prediction layer
         :param pbc: whether the data satisfy the periodic boundary condition
         """
         super(InfGCN, self).__init__()
+        self.vocab = vocab
+        n_atom_type = vocab["atom"]["num_embeddings"]
         self.n_atom_type = n_atom_type
         self.num_radial = num_radial
         self.num_spherical = num_spherical
@@ -243,58 +277,69 @@ class InfGCN(paddle.nn.Layer):
                 is_fc=True,
                 use_sc=False,
                 **kwargs,
-        )
+            )
         self.orbital = GaussianOrbital(
             gauss_start, gauss_end, num_radial, num_spherical
         )
         self._criterion = paddle.nn.MSELoss(reduction="mean")
 
-    def forward(self, batch):
-        """
-        Expect a dict batch containing:
-            - density: electronic density true labels [BS, Grids]
-            - density_mask: optional mask for sampled grid points
-            - grid_coord: [B, G, 3] grid coordinates: BS, Grids, Coord
-            - graph: PGL Batch graph with batch/pos/ptr/x
-             - batch: map node to graph, number infer to index of batch
-             - pos: coord of atom [n, 3]
-             - ptr: refer to start ptr for index of batch in total atom numbers
-             - x: node feat represent to atom type
-            - infos: list of dicts, length list = BS, dict:
-             - cell: lattice vector [3*3]
-             - shape: grid shape, 3 dimension
-             - file_name: orginal file name
+    def forward(self, data, return_loss=True, return_prediction=True):
+        """Run field prediction through the PaddleMaterials model protocol.
+
+        Args:
+            data: Collated field sample containing ``graph``, ``grid_coord``,
+                optional ``density_mask`` and ``info``, and the supervised
+                target under :attr:`target_name` when loss is requested.
+            return_loss: Whether to compute and return the supervised loss.
+            return_prediction: Whether to expose the predicted field.
         """
 
-        # 1.prepare dataset
-        density = batch["density"] # true label
-        mask = batch["density_mask"]
-        grid = batch["grid_coord"].astype("float32")
-        graph = batch["graph"] # input of model
-        infos = batch.get("infos", None)
+        assert (
+            return_loss or return_prediction
+        ), "At least one of return_loss or return_prediction must be True."
 
-        # 2. preprocess for devices location
+        mask = data.get("density_mask")
+        grid = data["grid_coord"]
+        graph = data["graph"]
+        info = data.get("info")
+
+        # Move model inputs to the active device.
         device = paddle.get_device()
-        graph = graph.to(device)
-        grid = grid.astype("float32").to(device)
-        if density is not None:
-            density = density.astype("float32").to(device)
+        atom_types = _to_tensor(graph.node_feat["x"], "int64", device)
+        atom_coord = _to_tensor(graph.node_feat["pos"], "float32", device)
+        atom_edges = _to_tensor(graph.edges, "int64", device).transpose([1, 0])
+        graph_batch = _to_tensor(graph.graph_node_id, "int64", device)
+        grid = _to_tensor(grid, "float32", device)
         if mask is not None:
-            mask = mask.astype("float32").to(device)
-        prepared_infos = self._prepare_infos(infos, device)
+            mask = _to_tensor(mask, "float32", device)
+        cell = self._prepare_cell(info, device)
 
-        # 3. forward
-        pred = self._forward_density(graph.x, graph.pos, grid, graph.batch, prepared_infos)
+        # Predict the field independently of target availability.
+        pred = self._forward_density(
+            atom_types,
+            atom_coord,
+            atom_edges,
+            grid,
+            graph_batch,
+            cell,
+        )
 
-        # 4. mask pred
-        loss_dict = {}
+        # Mask padded grid positions consistently for loss and prediction.
         masked_pred = pred
         if mask is not None:
             mask = mask.astype(pred.dtype)
             masked_pred = pred * mask
 
-        # 5.calculate loss and NMAE
-        if density is not None:
+        # Calculate loss and NMAE only when requested.
+        loss_dict = {}
+        if return_loss:
+            density = data[self.target_name]
+            if density is None:
+                raise ValueError(
+                    f"data[{self.target_name!r}] must not be None when "
+                    "return_loss is True."
+                )
+            density = _to_tensor(density, "float32", device)
             if mask is not None:
                 label_masked = density * mask
                 denom = paddle.sum(mask) + self.loss_eps
@@ -313,65 +358,72 @@ class InfGCN(paddle.nn.Layer):
             loss_dict["loss"] = loss
             loss_dict["mae"] = mae
 
-        pred_dict = {self.target_name: masked_pred}
+        pred_dict = {}
+        if return_prediction:
+            pred_dict[self.target_name] = masked_pred
         return {"loss_dict": loss_dict, "pred_dict": pred_dict}
 
-    def _prepare_infos(self, infos, device):
-        if infos is None:
+    def _prepare_cell(self, info, device):
+        if not self.pbc:
             return None
-        prepared_infos = []
-        for info in infos:
-            cur = dict(info) if isinstance(info, dict) else info
-            if isinstance(cur, dict) and "cell" in cur and hasattr(cur["cell"], "to"):
-                cur["cell"] = cur["cell"].to(device)
-            prepared_infos.append(cur)
-        return prepared_infos
+        if info is None or "cell" not in info:
+            raise KeyError("Periodic InfGCN input requires info['cell'].")
+        cell = _to_tensor(info["cell"], "float32", device)
+        if len(cell.shape) == 2:
+            cell = cell.unsqueeze(0)
+        if len(cell.shape) != 3 or list(cell.shape[-2:]) != [3, 3]:
+            raise ValueError(
+                "info['cell'] must have shape [batch_size, 3, 3], but got "
+                f"{list(cell.shape)}."
+            )
+        return cell
 
-    def _forward_density(self, atom_types, atom_coord, grid, batch, infos):
+    def _forward_density(self, atom_types, atom_coord, atom_edges, grid, batch, cell):
         """
         Network forward with memory optimization
         :param atom_types: atom types of (N,)
         :param atom_coord: atom coordinates of (N, 3)
+        :param atom_edges: candidate atom edges of (2, E)
         :param grid: coordinates at grid points of (G, K, 3)
         :param batch: batch index for each node of (N,)
-        :param infos: list of dictionary containing additional information
+        :param cell: optional batched cell vectors of (G, 3, 3)
         :return: predicted value at each grid point of (G, K)
         """
-
-        # cell = None
-        # if infos is not None and len(infos) > 0 and "cell" in infos[0]:
-        #     cell = paddle.stack(x=[info["cell"] for info in infos], axis=0).to(batch.place)
-        cell = paddle.stack(x=[info["cell"] for info in infos], axis=0).to(batch.place) #[BS, 3, 3]
         feat = self.embedding(atom_types)
-        
-        edge_index = radius_graph(atom_coord, self.cutoff, batch, loop=False)
+
+        # Preserve original random max-32 atom-neighbor truncation on every forward.
+        edge_index = _randomly_truncate_atom_edges(atom_edges)
         src, dst = edge_index
-        edge_vec = atom_coord[src] - atom_coord[dst] # coord vector
-        edge_len = edge_vec.norm(axis=-1) + 1e-08 # L2 norm, equal to distance
-        
-        edge_feat = o3.spherical_harmonics( # angular features(directional), [D_edge_index, 2l+1]
-            list(range(self.num_spherical + 1)), # degree of the spherical harmonics
-            edge_vec / edge_len[..., None], # e.g. edge vector
-            normalize=False, # whether to normalize the x to unit vectors that lie on the sphere for input
-            normalization="integral", # normalization of the output tensors
+        edge_vec = atom_coord[src] - atom_coord[dst]  # coord vector
+        edge_len = edge_vec.norm(axis=-1) + 1e-08  # L2 norm, equal to distance
+
+        # Angular features have shape [num_edges, 2 * degree + 1].
+        edge_feat = o3.spherical_harmonics(
+            list(range(self.num_spherical + 1)),  # degree of the spherical harmonics
+            edge_vec / edge_len[..., None],  # e.g. edge vector
+            normalize=False,  # Input vectors are already normalized.
+            normalization="integral",  # normalization of the output tensors
         )
 
-        edge_embed = soft_one_hot_linspace( # radial features, [D_edge_index, radial_embed_size]
-            edge_len,
-            start=0.0,
-            end=self.cutoff,
-            number=self.radial_embed_size, # The number of radial basis functions.
-            basis="gaussian", # Uses Gaussian functions as the radial basis.
-            cutoff=False,# Disables the cutoff/smoothing function at the boundary.
-        ) * (self.radial_embed_size**0.5) # enhance signal feature due to normalization of output
-        
+        edge_embed = (
+            soft_one_hot_linspace(  # radial features, [D_edge_index, radial_embed_size]
+                edge_len,
+                start=0.0,
+                end=self.cutoff,
+                number=self.radial_embed_size,  # The number of radial basis functions.
+                basis="gaussian",  # Uses Gaussian functions as the radial basis.
+                cutoff=False,  # Disables the cutoff/smoothing function at the boundary.
+            )
+            * (self.radial_embed_size**0.5)
+        )  # enhance signal feature due to normalization of output
+
         for i, gcn in enumerate(self.gcns):
             feat = gcn(
                 edge_index, feat, edge_feat, edge_embed, dim_size=atom_types.shape[0]
             )
             if i != self.num_gcn_layer - 1:
                 feat = self.act(feat)
-        
+
         n_graph, n_sample = grid.shape[0], grid.shape[1]
         if self.residual:
             grid_flat = grid.view(-1, 3)
@@ -396,7 +448,7 @@ class InfGCN(paddle.nn.Layer):
                     basis="gaussian",
                     cutoff=False,
                 ) * (self.radial_embed_size**0.5)
-                
+
                 residue = self.residue(
                     (node_src, grid_dst),
                     feat,
@@ -408,16 +460,22 @@ class InfGCN(paddle.nn.Layer):
                 residue = paddle.zeros([grid_flat.shape[0], 1], dtype=feat.dtype)
         else:
             residue = 0.0
-        
-        sample_vec = grid[batch] - atom_coord.unsqueeze(axis=-2) # The displacement (relative position) vectors from each atom to each sampled grid point. [N_atom, N_grid, 3]
-        if self.pbc and cell is not None:
-            sample_vec = pbc_vec(sample_vec, cell)
-        
-        orbital = self.orbital(sample_vec) # Map the displacement vector at each grid point to a set of Gaussian-type orbital (GTO) basis function values, i.e., a discrete basis expansion of (\psi_{n\ell m}(\mathbf{r})). [N_atom, N_grid,batch, (lmax+1)^2 * num_gauss]
-        density = (orbital * feat.unsqueeze(axis=1)).sum(axis=-1) # linear combination [n_atom, n_grid]
-        density = scatter(density, batch, dim=0, reduce="sum") # molecular/cell density
-        
+
+        # Displacement vectors from each atom to each sampled grid point have
+        # shape [num_atoms, num_grid_points, 3].
+        sample_vec = grid[batch] - atom_coord.unsqueeze(axis=-2)
+        if cell is not None:
+            sample_vec = pbc_vec(sample_vec, cell[batch])
+
+        # Expand displacement vectors in the Gaussian-type orbital basis:
+        # [num_atoms, num_grid_points, (lmax + 1)^2 * num_gaussians].
+        orbital = self.orbital(sample_vec)
+        density = (orbital * feat.unsqueeze(axis=1)).sum(
+            axis=-1
+        )  # linear combination [n_atom, n_grid]
+        density = scatter(density, batch, dim=0, reduce="sum")  # molecular/cell density
+
         if self.residual:
             density = density + residue.view(*tuple(density.shape))
-            
+
         return density

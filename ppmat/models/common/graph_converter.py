@@ -25,16 +25,36 @@ from typing import Union
 import numpy as np
 import paddle
 import pgl
+from cvve import Structure as CVVEStructure
 from p_tqdm import p_map
 from pymatgen.analysis import local_env
 from pymatgen.analysis.graphs import StructureGraph
+from pymatgen.core.periodic_table import Element
 from pymatgen.core.structure import Structure
 from pymatgen.optimization.neighbors import find_points_in_spheres
 from rdkit import Chem
-from rdkit.Chem.rdchem import BondType as BT
 
 from ppmat.utils import logger
 from ppmat.utils.crystal import lattice_params_to_matrix
+
+
+def _normalize_coordinate_unit(coordinate_unit: str) -> str:
+    if not isinstance(coordinate_unit, str):
+        raise TypeError("coordinate_unit must be a string.")
+    coordinate_unit = coordinate_unit.strip().lower()
+    if coordinate_unit not in {"angstrom", "bohr"}:
+        raise ValueError(
+            "coordinate_unit must be either 'angstrom' or 'bohr', but got "
+            f"{coordinate_unit!r}."
+        )
+    return coordinate_unit
+
+
+def _atomic_number_from_symbol(symbol: str) -> int:
+    symbol = str(symbol)
+    if symbol.startswith("X") and symbol[1:].isdigit():
+        return int(symbol[1:])
+    return int(Element(symbol).Z)
 
 
 class FindPointsInSpheres:
@@ -379,12 +399,10 @@ class MolecularGraphConverter:
     """Convert RDKit Mol into PGL Graph.
 
     Args:
+        vocab (Dict): Registered vocabularies containing ``atom`` and ``bond``
+            roles.
         remove_h (bool): Controls whether hydrogen atoms are removed before building
-            the molecular graph. Defaults to False。
-        atom_vocab (Optional[Dict[str,int]]): A dictionary mapping atomic symbols
-            (e.g., "C", "O", "N") to unique integer indices for one-hot encoding.
-        bond_vocab (Optional[Tuple[BT,...]]): A tuple defining the bond types
-            (e.g., SINGLE, DOUBLE, AROMATIC) and their order for one-hot encoding.
+            the molecular graph. Defaults to True.
         add_self_loops (bool): Adds self-loops to the graph (edges connecting each
             node to itself).
         num_cpus (Optional[int]): Number of CPUs for parallel graph construction.
@@ -393,44 +411,13 @@ class MolecularGraphConverter:
 
     def __init__(
         self,
-        atom_vocab: Optional[Dict[str, int]] = None,
-        bond_vocab: Optional[Tuple[BT, ...]] = None,
+        vocab: Dict,
         remove_h: bool = True,
         add_self_loops: bool = False,
         edge_mode: str = "bidirectional",
         num_cpus: Optional[int] = None,
     ) -> None:
-        if atom_vocab is None:
-            if remove_h is False:
-                atom_vocab = {
-                    "H": 0,
-                    "C": 1,
-                    "N": 2,
-                    "O": 3,
-                    "F": 4,
-                    "P": 5,
-                    "S": 6,
-                    "Cl": 7,
-                    "Br": 8,
-                    "I": 9,
-                }
-            else:
-                atom_vocab = {
-                    "C": 0,
-                    "N": 1,
-                    "O": 2,
-                    "F": 3,
-                    "P": 4,
-                    "S": 5,
-                    "Cl": 6,
-                    "Br": 7,
-                    "I": 8,
-                }
-        if bond_vocab is None:
-            bond_vocab = (BT.SINGLE, BT.DOUBLE, BT.TRIPLE, BT.AROMATIC)
-
-        self.atom_vocab = dict(atom_vocab)
-        self.bond_vocab = tuple(bond_vocab)
+        self.vocab = vocab
         self.remove_h = remove_h
         self.add_self_loops = add_self_loops
         self.edge_mode = edge_mode
@@ -440,8 +427,7 @@ class MolecularGraphConverter:
     def build_one(
         mol: Chem.Mol,
         remove_h: bool,
-        atom_vocab: Dict[str, int],
-        bond_vocab: Tuple[BT, ...],
+        vocab: Dict,
         add_self_loops: bool,
         edge_mode: str = "bidirectional",
     ) -> Optional[pgl.Graph]:
@@ -454,20 +440,27 @@ class MolecularGraphConverter:
         if N == 0:
             return None
 
+        atom_vocab = vocab["atom"]
+        atom_token_to_id = atom_vocab["token_to_id"]
+        num_atom_embeddings = int(atom_vocab["num_embeddings"])
+        bond_vocab = vocab["bond"]
+        bond_token_to_id = bond_vocab["token_to_id"]
+        num_bond_embeddings = int(bond_vocab["num_embeddings"])
+        no_bond_id = bond_token_to_id["NO_BOND"]
+
         # 1) Node Features: One-hot encoding of atomic symbols.
         idxs: List[int] = []
         for atom in mol.GetAtoms():
             sym = atom.GetSymbol()
-            if sym not in atom_vocab:
+            if sym not in atom_token_to_id:
                 return None  # Unknown Elements: Can be replaced with an extended
                 # vocabulary or placeholder <unk>
-            idxs.append(atom_vocab[sym])
+            idxs.append(atom_token_to_id[sym])
         idxs_np = np.asarray(idxs, dtype=np.int64)  # [N]
-        x = np.eye(len(atom_vocab), dtype=np.float32)[idxs_np]  # [N, num_atom_types]
+        x = np.eye(num_atom_embeddings, dtype=np.float32)[idxs_np]
 
         # 2) Build the edges first (construct edge_index/edge_attr)
         rows, cols, etypes = [], [], []
-        bt2id = {bt: i + 1 for i, bt in enumerate(bond_vocab)}  # 0 for empty values
 
         def push(u, v, et):
             rows.append(u)
@@ -476,7 +469,7 @@ class MolecularGraphConverter:
 
         for b in mol.GetBonds():
             u, v = b.GetBeginAtomIdx(), b.GetEndAtomIdx()
-            et = bt2id.get(bond_name(b.GetBondType()), 0)
+            et = bond_token_to_id.get(bond_name(b.GetBondType()), no_bond_id)
             if edge_mode == "directed":
                 push(u, v, et)
             elif edge_mode == "undirected":
@@ -490,52 +483,31 @@ class MolecularGraphConverter:
 
         if len(rows) == 0:
             edge_index = np.empty((2, 0), dtype=np.int64)
-            edge_attr = np.empty((0, len(bond_vocab) + 1), dtype=np.float32)
+            edge_attr = np.empty((0, num_bond_embeddings), dtype=np.float32)
         else:
             row_np = np.asarray(rows, dtype=np.int64)
             col_np = np.asarray(cols, dtype=np.int64)
             et_np = np.asarray(etypes, dtype=np.int64)
-            edge_attr = np.eye(len(bond_vocab) + 1, dtype=np.float32)[et_np]  # [E, K]
+            edge_attr = np.eye(num_bond_embeddings, dtype=np.float32)[et_np]
             # Deterministic ordering by (row, col)
             order = np.argsort(row_np * max(1, N) + col_np, kind="mergesort")
             row_np, col_np, edge_attr = row_np[order], col_np[order], edge_attr[order]
             edge_index = np.stack([row_np, col_np], axis=0)  # [2, E]
 
-        # 3）Hydrogen removal on the graph (masking+relabeling). The Mol keep unchanged.
-        if remove_h:
-            h_id = atom_vocab.get("H", None)
-            if h_id is not None:
-                to_keep_nodes = idxs_np != h_id  # keep only non-H atoms
-                edge_index, edge_attr = subgraph(
-                    subset=to_keep_nodes,
-                    edge_index=edge_index,
-                    edge_attr=edge_attr,
-                    relabel_nodes=True,
-                    num_nodes=N,
-                )
-                # Remove the H channel from node features and filter rows to kept nodes
-                keep_cols = np.array(
-                    [i for i in range(len(atom_vocab)) if i != h_id], dtype=np.int64
-                )
-                x = x[to_keep_nodes][:, keep_cols]
-            else:
-                # If "H" is not in the vocab, we leave the graph/features as-is.
-                pass
-
-        # 4) (Optional) Add self-loops based on the updated node count
+        # 3) (Optional) Add self-loops based on the updated node count
         N_new = int(x.shape[0])
         edges_e2 = edge_index.T.astype(np.int64)  # [E,2]
         if add_self_loops and N_new > 0:
             self_e2 = np.stack([np.arange(N_new), np.arange(N_new)], axis=1).astype(
                 np.int64
             )
-            self_ea = np.eye(len(bond_vocab) + 1, dtype=np.float32)[
-                np.zeros((N_new,), dtype=np.int64)
+            self_ea = np.eye(num_bond_embeddings, dtype=np.float32)[
+                np.full((N_new,), no_bond_id, dtype=np.int64)
             ]
             edges_e2 = np.concatenate([edges_e2, self_e2], axis=0)
             edge_attr = np.concatenate([edge_attr, self_ea], axis=0)
 
-        # 5) Return a PGL graph. (If running in worker processes, consider returning
+        # 4) Return a PGL graph. (If running in worker processes, consider returning
         #    NumPy arrays and wrapping into pgl.Graph)
         return pgl.Graph(
             num_nodes=int(x.shape[0]),
@@ -552,8 +524,7 @@ class MolecularGraphConverter:
                 MolecularGraphConverter.build_one,
                 mols,
                 [self.remove_h] * len(mols),
-                [self.atom_vocab] * len(mols),
-                [self.bond_vocab] * len(mols),
+                [self.vocab] * len(mols),
                 [self.add_self_loops] * len(mols),
                 [self.edge_mode] * len(mols),
                 num_cpus=self.num_cpus,
@@ -565,23 +536,21 @@ class MolecularGraphConverter:
             return MolecularGraphConverter.build_one(
                 mols,
                 self.remove_h,
-                self.atom_vocab,
-                self.bond_vocab,
+                self.vocab,
                 self.add_self_loops,
                 self.edge_mode,
             )
 
 
 class RadiusGraphConverter:
-    """Convert RDKit molecules into PGL radius graphs.
+    """Convert atomic geometries into PGL radius graphs.
 
-    The converter is used by SphereNet-style molecular datasets. It accepts an
-    RDKit ``Mol`` or a list of RDKit ``Mol`` objects and returns PGL graph data
-    with atom numbers, positions, radius edges, and optional SphereNet triplet
-    indices cached in ``graph.edge_feat``.
+    The existing callable interface accepts an RDKit ``Mol`` or a list of them.
+    ``from_arrays`` and ``from_structure`` provide equivalent paths for normalized
+    atomic arrays and cvve/pymatgen structures.
 
     Args:
-        cutoff: Neighbor cutoff distance in Angstrom.
+        cutoff: Neighbor cutoff distance in ``coordinate_unit``.
         atom_vocab: Mapping from atomic number to feature index for optional PGL
             node features.
         add_self_loops: Whether to add self-loop edges.
@@ -590,6 +559,11 @@ class RadiusGraphConverter:
         include_direction: Whether to include unit direction in PGL edge features.
         return_triplet_indices: Whether to cache SphereNet triplet indices.
         num_cpus: Number of CPUs for parallel graph construction.
+        coordinate_unit: Unit shared by positions and ``cutoff``.
+        inclusive_cutoff: Whether atom pairs exactly at ``cutoff`` are connected.
+        vocab: Optional Dataset vocabulary. Its
+            ``atom.atomic_number_to_id`` mapping overrides ``atom_vocab`` and
+            is used to build ``node_feat["x"]``.
     """
 
     def __init__(
@@ -602,11 +576,22 @@ class RadiusGraphConverter:
         include_direction: bool = False,
         return_triplet_indices: bool = False,
         num_cpus: Optional[int] = None,
+        coordinate_unit: str = "angstrom",
+        inclusive_cutoff: bool = False,
+        vocab: Optional[Dict] = None,
     ) -> None:
+        self.require_atom_vocab = vocab is not None
+        if vocab is not None:
+            try:
+                atom_vocab = vocab["atom"]["atomic_number_to_id"]
+            except (KeyError, TypeError) as exc:
+                raise KeyError("vocab must define atom.atomic_number_to_id.") from exc
         if atom_vocab is None:
             atom_vocab = {1: 0, 6: 1, 7: 2, 8: 3, 9: 4}
         if edge_mode not in {"directed", "undirected", "bidirectional"}:
             raise ValueError(f"Unknown edge_mode: {edge_mode}")
+        if not isinstance(inclusive_cutoff, bool):
+            raise TypeError("inclusive_cutoff must be a boolean.")
 
         self.cutoff = float(cutoff)
         self.atom_vocab = dict(atom_vocab)
@@ -616,6 +601,8 @@ class RadiusGraphConverter:
         self.include_direction = include_direction
         self.return_triplet_indices = return_triplet_indices
         self.num_cpus = 1 if num_cpus is None else int(num_cpus)
+        self.coordinate_unit = _normalize_coordinate_unit(coordinate_unit)
+        self.inclusive_cutoff = inclusive_cutoff
 
     def __call__(
         self, molecule: Union[Chem.Mol, List[Chem.Mol]]
@@ -643,6 +630,59 @@ class RadiusGraphConverter:
             return None
 
         atomic_numbers, positions = self.get_molecule_array(molecule)
+        return self.from_arrays(
+            atomic_numbers,
+            positions,
+            coordinate_unit="angstrom",
+        )
+
+    def from_arrays(
+        self,
+        atomic_numbers: np.ndarray,
+        positions: np.ndarray,
+        coordinate_unit: Optional[str] = None,
+        node_features: Optional[Dict[str, np.ndarray]] = None,
+    ) -> Optional[pgl.Graph]:
+        """Build a radius graph from atomic numbers and Cartesian positions.
+
+        Args:
+            atomic_numbers: Atomic numbers with shape ``[num_nodes]``.
+            positions: Cartesian positions with shape ``[num_nodes, 3]``.
+            coordinate_unit: Unit of ``positions``. When omitted, the converter's
+                configured unit is assumed.
+            node_features: Additional per-node arrays merged into
+                ``graph.node_feat``.
+        """
+
+        if coordinate_unit is not None:
+            coordinate_unit = _normalize_coordinate_unit(coordinate_unit)
+            if coordinate_unit != self.coordinate_unit:
+                raise ValueError(
+                    f"Atomic positions use {coordinate_unit!r}, but the graph "
+                    f"converter expects {self.coordinate_unit!r}."
+                )
+
+        atomic_numbers = np.asarray(atomic_numbers, dtype=np.int64)
+        positions = np.asarray(positions, dtype=np.float32)
+        if atomic_numbers.ndim != 1:
+            raise ValueError(
+                "atomic_numbers must have shape [num_nodes], but got "
+                f"{atomic_numbers.shape}."
+            )
+        if positions.ndim != 2 or positions.shape[1] != 3:
+            raise ValueError(
+                "positions must have shape [num_nodes, 3], but got "
+                f"{positions.shape}."
+            )
+        if atomic_numbers.shape[0] != positions.shape[0]:
+            raise ValueError(
+                "atomic_numbers and positions must contain the same number of "
+                f"nodes, but got {atomic_numbers.shape[0]} and "
+                f"{positions.shape[0]}."
+            )
+        if not np.isfinite(positions).all():
+            raise ValueError("positions must contain only finite values.")
+
         num_nodes = positions.shape[0]
         if num_nodes == 0:
             return None
@@ -651,13 +691,76 @@ class RadiusGraphConverter:
         triplet_indices = None
         if self.return_triplet_indices:
             triplet_indices = self.get_triplet_indices(edge_index)
-        return self.build_pgl_graph(
+        graph = self.build_pgl_graph(
             atomic_numbers,
             positions,
             edge_index,
             distances,
             directions,
             triplet_indices,
+        )
+        if node_features is not None:
+            if not isinstance(node_features, dict):
+                raise TypeError("node_features must be a dictionary or None.")
+            for name, feature in node_features.items():
+                feature = np.asarray(feature)
+                if feature.ndim == 0 or feature.shape[0] != num_nodes:
+                    raise ValueError(
+                        f"Node feature {name!r} must have leading dimension "
+                        f"{num_nodes}, but got {feature.shape}."
+                    )
+                graph.node_feat[name] = feature
+        return graph
+
+    def from_structure(
+        self,
+        structure: Union[CVVEStructure, Structure],
+        node_features: Optional[Dict[str, np.ndarray]] = None,
+    ) -> Optional[pgl.Graph]:
+        """Build a radius graph from a cvve or pymatgen structure."""
+
+        if isinstance(structure, CVVEStructure):
+            atomic_numbers = np.asarray(
+                [_atomic_number_from_symbol(symbol) for symbol in structure.symbols],
+                dtype=np.int64,
+            )
+            return self.from_arrays(
+                atomic_numbers,
+                structure.cartesian_positions(),
+                coordinate_unit=structure.position_unit,
+                node_features=node_features,
+            )
+        if isinstance(structure, Structure):
+            return self.from_arrays(
+                np.asarray(structure.atomic_numbers, dtype=np.int64),
+                structure.cart_coords,
+                coordinate_unit="angstrom",
+                node_features=node_features,
+            )
+        raise TypeError(
+            "structure must be a cvve.Structure or pymatgen.Structure, but got "
+            f"{type(structure)}."
+        )
+
+    def from_structures(
+        self,
+        structures: Sequence[Union[CVVEStructure, Structure]],
+    ) -> List[Optional[pgl.Graph]]:
+        """Build radius graphs from cvve or pymatgen structures."""
+
+        if not isinstance(structures, (list, tuple)):
+            raise TypeError("structures must be a list or tuple.")
+        if not structures:
+            return []
+        if self.num_cpus == 1:
+            return [self.from_structure(structure) for structure in structures]
+        return p_map(
+            self.from_structure,
+            structures,
+            num_cpus=self.num_cpus,
+            desc="Building graphs",
+            dynamic_ncols=True,
+            mininterval=0.2,
         )
 
     def get_molecule_array(self, molecule: Chem.Mol) -> Tuple[np.ndarray, np.ndarray]:
@@ -695,7 +798,10 @@ class RadiusGraphConverter:
 
         displacement = positions[:, None, :] - positions[None, :, :]
         distance_matrix = np.linalg.norm(displacement, axis=-1)
-        mask = distance_matrix < self.cutoff
+        if self.inclusive_cutoff:
+            mask = distance_matrix <= self.cutoff
+        else:
+            mask = distance_matrix < self.cutoff
         np.fill_diagonal(mask, False)
         targets, sources = np.where(mask)
 
@@ -740,9 +846,14 @@ class RadiusGraphConverter:
         idxs = []
         for z in atomic_numbers:
             if int(z) not in self.atom_vocab:
+                if self.require_atom_vocab:
+                    raise KeyError(
+                        f"Atomic number {int(z)} is missing from the atom vocabulary."
+                    )
                 return node_feat
             idxs.append(self.atom_vocab[int(z)])
         idxs = np.asarray(idxs, dtype=np.int64)
+        node_feat["x"] = idxs
         node_feat["feat"] = np.eye(len(self.atom_vocab), dtype=np.float32)[idxs]
         return node_feat
 
@@ -764,9 +875,7 @@ class RadiusGraphConverter:
             edge_feat["direction"] = directions
             edge_feats.append(directions)
         if edge_feats:
-            edge_feat["feat"] = np.concatenate(edge_feats, axis=-1).astype(
-                np.float32
-            )
+            edge_feat["feat"] = np.concatenate(edge_feats, axis=-1).astype(np.float32)
         if triplet_indices is not None:
             edge_feat.update(triplet_indices)
 
@@ -777,9 +886,7 @@ class RadiusGraphConverter:
             edge_feat=edge_feat,
         )
 
-    def get_triplet_indices(
-        self, edge_index: np.ndarray
-    ) -> Dict[str, np.ndarray]:
+    def get_triplet_indices(self, edge_index: np.ndarray) -> Dict[str, np.ndarray]:
         edge_index = np.asarray(edge_index, dtype=np.int64)
         sources, targets = edge_index
         num_atoms = int(edge_index.max()) + 1 if edge_index.size else 0

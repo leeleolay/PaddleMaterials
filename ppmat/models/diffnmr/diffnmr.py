@@ -27,6 +27,9 @@ from ppmat.metrics.diffnmr_metric import SumExceptBatchKL
 from ppmat.metrics.diffnmr_metric import SumExceptBatchMetric
 from ppmat.models.common import initializer
 from ppmat.models.diffnmr.diffusion_prior import DiffPriorNetwork
+from ppmat.models.diffnmr.extra_features_graph import DummyExtraFeatures
+from ppmat.models.diffnmr.extra_features_graph import ExtraFeatures
+from ppmat.models.diffnmr.extra_features_molecular_graph import ExtraMolecularFeatures
 from ppmat.models.diffnmr.graph_transformer import GraphTransformer
 from ppmat.models.diffnmr.graph_transformer import MolecularEncoder
 from ppmat.models.diffnmr.nmr_encoder import NMR_encoder
@@ -44,14 +47,36 @@ from ppmat.schedulers.scheduling_diffprior import NoiseScheduler
 from ppmat.utils import logger
 
 
+def _build_graph_features(dataset_infos, diffmodel_cfg):
+    """Build model-owned graph features and their input/output dimensions."""
+    feature_type = diffmodel_cfg.get("extra_features")
+    extra_features = (
+        ExtraFeatures(feature_type, dataset_infos)
+        if feature_type is not None
+        else DummyExtraFeatures()
+    )
+    domain_features = ExtraMolecularFeatures(dataset_infos)
+
+    output_dims = {
+        "X": dataset_infos.num_atom_types,
+        "E": int(dataset_infos.edge_types.shape[0]),
+        "y": 0,
+    }
+    input_dims = copy.deepcopy(output_dims)
+    input_dims["y"] += 1 + int(diffmodel_cfg.get("conditdim", 0))
+
+    for features in (extra_features, domain_features):
+        for field, size in features.output_dims.items():
+            input_dims[field] += size
+    return extra_features, domain_features, input_dims, output_dims
+
+
 class MolecularGraphFormer(nn.Layer):
     def __init__(
         self,
         encoder_cfg,
         decoder_cfg,
         diffmodel_cfg,
-        extra_features=None,
-        domain_features=None,
         dataset_infos=None,
         visualization_tools=None,
     ) -> None:
@@ -61,13 +86,15 @@ class MolecularGraphFormer(nn.Layer):
         self.T = diffmodel_cfg["diffusion_steps"]
 
         # configure datasets inter-varibles
-        input_dims = dataset_infos.input_dims
-        output_dims = dataset_infos.output_dims
+        (
+            self.extra_features,
+            self.domain_features,
+            input_dims,
+            output_dims,
+        ) = _build_graph_features(dataset_infos, diffmodel_cfg)
         self.dataset_info = dataset_infos
 
         self.visualization_tools = visualization_tools
-        self.extra_features = extra_features
-        self.domain_features = domain_features
 
         # configure noise scheduler
         self.noise_schedule = PredefinedNoiseScheduleDiscrete(
@@ -78,7 +105,7 @@ class MolecularGraphFormer(nn.Layer):
         # configure model
         self.con_input_dim = copy.deepcopy(input_dims)
         self.con_input_dim["y"] = 12
-        self.con_output_dim = dataset_infos.output_dims
+        self.con_output_dim = output_dims
 
         self.encoder = MolecularEncoder(
             n_layers=encoder_cfg["num_layers"],
@@ -261,21 +288,28 @@ class NMRNetCLIP(nn.Layer):
         self,
         graph_encoder: dict,
         spectrum_encoder: dict,
+        vocab,
         dataset_infos=None,
-        extra_features=None,
-        domain_features=None,
+        diffmodel_cfg=None,
         **kwargs,
     ):
         super().__init__()
         self.name = kwargs.get("__name__")
+        self.vocab = vocab
+        peakwidthemb_num = vocab["peakwidth"]["num_embeddings"]
+        splitemb_num = vocab["split"]["num_embeddings"]
+        integralemb_num = vocab["integral"]["num_embeddings"]
 
         self.dataset_info = dataset_infos
-        self.extra_features = extra_features
-        self.domain_features = domain_features
-
-        self.con_input_dim = copy.deepcopy(dataset_infos.input_dims)
+        (
+            self.extra_features,
+            self.domain_features,
+            input_dims,
+            output_dims,
+        ) = _build_graph_features(dataset_infos, diffmodel_cfg or {})
+        self.con_input_dim = copy.deepcopy(input_dims)
         self.con_input_dim["y"] = 12
-        self.con_output_dim = dataset_infos.output_dims
+        self.con_output_dim = output_dims
 
         self.graph_encoder = MolecularEncoder(
             n_layers=graph_encoder["n_layers_GT"],
@@ -310,8 +344,9 @@ class NMRNetCLIP(nn.Layer):
                 n_head=spectrum_encoder["n_head"],
                 num_layers=spectrum_encoder["n_layers"],
                 drop_prob=spectrum_encoder["drop_prob"],
-                peakwidthemb_num=spectrum_encoder["peakwidthemb_num"],
-                integralemb_num=spectrum_encoder["integralemb_num"],
+                peakwidthemb_num=peakwidthemb_num,
+                splitemb_num=splitemb_num,
+                integralemb_num=integralemb_num,
             )
         else:
             self.flag_onlyH = False
@@ -324,14 +359,15 @@ class NMRNetCLIP(nn.Layer):
                 n_head=spectrum_encoder["n_head"],
                 num_layers=spectrum_encoder["n_layers"],
                 drop_prob=spectrum_encoder["drop_prob"],
-                peakwidthemb_num=spectrum_encoder["peakwidthemb_num"],
-                integralemb_num=spectrum_encoder["integralemb_num"],
+                peakwidthemb_num=peakwidthemb_num,
+                splitemb_num=splitemb_num,
+                integralemb_num=integralemb_num,
             )
         # for init model weights
         self.spectrum_encoder.apply(self._init_weights)
 
-        self.seq_len_H1 = spectrum_encoder["seq_len_H1"]  # TODO remove later
-        self.seq_len_C13 = spectrum_encoder["seq_len_C13"]  # TODO remove later
+        self.seq_len_H1 = dataset_infos.seq_len_H1
+        self.seq_len_C13 = dataset_infos.seq_len_C13
         self.tem = 2  # TODO remove later
 
         # for Prior Training
@@ -448,24 +484,28 @@ class DiffNMR(nn.Layer):
         decoder_cfg,
         diffmodel_cfg,
         dataset_infos,
-        extra_features,
-        domain_features,
-        clip,
-        connector_cfg = None,
+        vocab,
+        clip=None,
+        connector_cfg=None,
     ) -> None:
         super().__init__()
+        self.vocab = vocab
+        peakwidthemb_num = vocab["peakwidth"]["num_embeddings"]
+        splitemb_num = vocab["split"]["num_embeddings"]
+        integralemb_num = vocab["integral"]["num_embeddings"]
 
         # configure general variables settings
+        self.conditioning_mode = "spectrum"
         self.T = diffmodel_cfg["diffusion_steps"]
 
         # configure datasets inter-varibles
-        input_dims = dataset_infos.input_dims
-        output_dims = dataset_infos.output_dims
+        (
+            self.extra_features,
+            self.domain_features,
+            input_dims,
+            output_dims,
+        ) = _build_graph_features(dataset_infos, diffmodel_cfg)
         self.dataset_info = dataset_infos
-
-        self.dataset_info = dataset_infos
-        self.extra_features = extra_features
-        self.domain_features = domain_features
 
         # configure noise scheduler
         self.noise_schedule = PredefinedNoiseScheduleDiscrete(
@@ -485,8 +525,9 @@ class DiffNMR(nn.Layer):
                 n_head=encoder_cfg["n_head"],
                 num_layers=encoder_cfg["n_layers"],
                 drop_prob=encoder_cfg["drop_prob"],
-                peakwidthemb_num=encoder_cfg["peakwidthemb_num"],
-                integralemb_num=encoder_cfg["integralemb_num"],
+                peakwidthemb_num=peakwidthemb_num,
+                splitemb_num=splitemb_num,
+                integralemb_num=integralemb_num,
             )
         else:
             self.flag_onlyH = False
@@ -499,8 +540,9 @@ class DiffNMR(nn.Layer):
                 n_head=encoder_cfg["n_head"],
                 num_layers=encoder_cfg["n_layers"],
                 drop_prob=encoder_cfg["drop_prob"],
-                peakwidthemb_num=encoder_cfg["peakwidthemb_num"],
-                integralemb_num=encoder_cfg["integralemb_num"],
+                peakwidthemb_num=peakwidthemb_num,
+                splitemb_num=splitemb_num,
+                integralemb_num=integralemb_num,
             )
         # load spectrum encoder model from pretrained model
         state_dict = paddle.load(encoder_cfg["pretrained_path"])
@@ -600,7 +642,6 @@ class DiffNMR(nn.Layer):
 
         self.best_val_nll = 1e8
         self.val_counter = 0
-        self.vocabDim = decoder_cfg["vocab_dim"]
 
         self.val_nll = NLL()
         self.val_X_kl = SumExceptBatchKL()
@@ -614,8 +655,8 @@ class DiffNMR(nn.Layer):
         self.test_X_logp = SumExceptBatchMetric()
         self.test_E_logp = SumExceptBatchMetric()
 
-        self.seq_len_H1 = encoder_cfg["seq_len_H1"]  # TODO remove later
-        self.seq_len_C13 = encoder_cfg["seq_len_C13"]  # TODO remove later
+        self.seq_len_H1 = dataset_infos.seq_len_H1
+        self.seq_len_C13 = dataset_infos.seq_len_C13
         self.tem = 2  # TODO remove later
 
         # set use formula for training and sample or not
@@ -728,72 +769,6 @@ class DiffNMR(nn.Layer):
         }
 
         return result
-
-    @paddle.no_grad()
-    def sample(self, batch, i):
-        batch_graph, other_data = batch
-
-        # transfer to dense graph from sparse graph
-        if batch_graph.edges.T.numel() == 0:
-            print("Found a batch with no edges. Skipping.")
-            return None
-
-        # process data
-        (
-            dense_data,
-            noisy_data,
-            node_mask,
-            extra_data,
-            input_X,
-            input_E,
-            input_y,
-        ) = self.preprocess_data(batch_graph, other_data)
-        X, E = dense_data.X, dense_data.E
-
-        # set condition
-        batch_length = X.shape[0]
-        conditionVec = other_data["conditionVec"]
-        y_condition = conditionVec.reshape(batch_length, self.vocabDim)
-
-        # forward of the model
-        pred = self.forward_MultiModalModel(
-            input_X, input_E, input_y, node_mask, y_condition
-        )
-
-        # evaluate the loss especially in the inference stage
-        loss = self.train_loss(
-            masked_pred_X=pred.X,
-            masked_pred_E=pred.E,
-            pred_y=pred.y,
-            true_X=X,
-            true_E=E,
-            true_y=other_data["y"],
-        )
-
-        batch_length = other_data["y"].shape[0]
-        conditionAll = other_data["conditionVec"]
-        conditionAll = conditionAll.reshape(batch_length, self.vocabDim)
-
-        nll = scheduling_diffnmr.compute_val_loss(
-            self,
-            pred,
-            noisy_data,
-            dense_data.X,
-            dense_data.E,
-            other_data["y"],
-            node_mask,
-            condition=conditionAll,
-            test=False,
-        )
-        loss["nll"] = nll
-
-        # save the data for visualization
-        self.val_y_collection.append(other_data["conditionVec"])
-        self.val_atomCount.append(paddle.to_tensor(other_data["atom_count"]))
-        self.val_data_X.append(X)
-        self.val_data_E.append(E)
-
-        return loss
 
 
 # PP-DiffNMR

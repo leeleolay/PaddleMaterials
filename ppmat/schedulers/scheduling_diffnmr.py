@@ -521,6 +521,17 @@ def sample_discrete_feature_noise(limit_dist, node_mask):
     return ph.mask(node_mask)
 
 
+def _encode_spectrum_condition(model, condition):
+    """Encode the four-branch NMR condition through the declared interface."""
+
+    if model.flag_onlyH:
+        embedding, _ = model.encoder(condition)
+        return embedding, None
+
+    embedding, (token_encoding, _) = model.encoder(condition)
+    return embedding, token_encoding
+
+
 @paddle.no_grad()
 def step(
     model, s, t, X_t, E_t, y_t, node_mask, conditionVec, batch_X, batch_E, batch_y
@@ -564,16 +575,18 @@ def step(
         [noisy_data["y_t"].astype("float32"), extra_data.y.astype(dtype="float32")]
     )
 
-    from ppmat.models.diffnmr.diffnmr import DiffNMR
-
-    if isinstance(model, DiffNMR):
-        if model.flag_onlyH is True:
-            global_H, _ = model.encoder(conditionVec)
-            embeddings_spectrum = global_H
-        else:
-            embeddings_spectrum, (spectrum_encoding, _) = model.encoder(conditionVec)
+    if getattr(model, "conditioning_mode", None) == "spectrum":
+        embeddings_spectrum, spectrum_encoding = _encode_spectrum_condition(
+            model, conditionVec
+        )
         if model.connector_flag is True:
-            embeddings_spectrum = model.connector.sample(embeddings_spectrum, spectrum_encoding)
+            if spectrum_encoding is None:
+                raise NotImplementedError(
+                    "Connector sampling requires the joint H1/C13 spectrum encoder."
+                )
+            embeddings_spectrum = model.connector.sample(
+                embeddings_spectrum, spectrum_encoding
+            )
         input_y = paddle.concat([input_y, embeddings_spectrum], axis=1).astype(
             "float32"
         )
@@ -1006,14 +1019,8 @@ def reconstruction_logp(model, t, X, E, node_mask, condition_Spectrum):
     )
 
     ###########################################################
-    from ppmat.models.diffnmr.diffnmr import DiffNMR
-
-    if model.__class__ is DiffNMR:
-        if model.flag_onlyH is True:
-            global_H, _ = model.encoder(condition_Spectrum)
-            embeddings_spectrum = global_H
-        else:
-            embeddings_spectrum = model.encoder(condition_Spectrum)
+    if getattr(model, "conditioning_mode", None) == "spectrum":
+        embeddings_spectrum, _ = _encode_spectrum_condition(model, condition_Spectrum)
         input_y = paddle.concat([input_y, embeddings_spectrum], axis=1).astype(
             "float32"
         )

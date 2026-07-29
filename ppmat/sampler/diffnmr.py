@@ -14,6 +14,7 @@
 
 import copy
 import os
+import os.path as osp
 import time
 from typing import Dict
 from typing import List
@@ -31,24 +32,22 @@ from tqdm import tqdm
 from ppmat.datasets import build_dataloader
 from ppmat.datasets import build_dataset_infos
 from ppmat.datasets import set_signal_handlers
-from ppmat.datasets.msd_nmr_dataset import DataLoaderCollection
-from ppmat.datasets.transform import build_post_transforms
 from ppmat.metrics import DiffNMRStreamingAdapter
-from ppmat.metrics import build_metric
+from ppmat.models import MODEL_REGISTRY
 from ppmat.models import build_model
-from ppmat.models import build_model_from_name
-from ppmat.models.diffnmr.extra_features_graph import DummyExtraFeatures
-from ppmat.models.diffnmr.extra_features_graph import ExtraFeatures
-from ppmat.models.diffnmr.extra_features_molecular_graph import ExtraMolecularFeatures
 from ppmat.models.diffnmr.utils import diffgraphformer_utils
+from ppmat.sampler.base import BaseSampler
 from ppmat.schedulers import scheduling_diffnmr
+from ppmat.utils import download
 from ppmat.utils import logger
 from ppmat.utils import save_load
+from ppmat.utils.resource import resolve_model_config_path
 from ppmat.utils.visualization import MolecularVisualization
+from ppmat.vocab import build_vocab
 
 
-class MolecularSampler:
-    """Molecular Sampler.
+class DiffNMRSampler(BaseSampler):
+    """DiffNMR Sampler.
 
     This class provides an interface for sampling structures using pre-trained deep
     learning models. Supports two initialization modes:
@@ -87,137 +86,135 @@ class MolecularSampler:
         weights_name: Optional[str] = None,
         config_path: Optional[str] = None,
         checkpoint_path: Optional[str] = None,
+        config_overrides: Optional[List[str]] = None,
     ):
-        # if model_name is not None, then config_path and checkpoint_path must be
-        # provided
+        package_config_dir = None
         if model_name is None:
-            assert (
-                config_path is not None and checkpoint_path is not None
-            ), "config_path and checkpoint_path must be provided when model_name is "
-            "None."
+            assert config_path is not None and checkpoint_path is not None, (
+                "config_path and checkpoint_path must be provided when model_name is "
+                "None."
+            )
 
             logger.info(f"Loading model from {config_path} and {checkpoint_path}.")
 
-            config = OmegaConf.load(config_path)
-            config = OmegaConf.to_container(config, resolve=True)
-
-            model_config = config.get("Model", None)
-            assert model_config is not None, "Model config must be provided."
-
-            # TODO: optimize in the future
-            set_signal_handlers()
-            train_data_cfg = config["Dataset"].get("train")
-            train_loader = build_dataloader(train_data_cfg)
-
-            val_data_cfg = config["Dataset"].get("val")
-            val_loader = build_dataloader(val_data_cfg)
-
-            test_data_cfg = config["Dataset"].get("test")
-            test_loader = build_dataloader(test_data_cfg)
-
-            # build datasetinfo
-            dataloaders = DataLoaderCollection(train_loader, val_loader, test_loader)
-            dataset_infos = build_dataset_infos(
-                dataloaders=dataloaders, cfg=config, recompute_statistics=False
-            )
-            train_smiles = dataset_infos.train_smiles
-
-            # extra features
-            if (
-                config["Model"]["__init_params__"]["diffmodel_cfg"]["extra_features"]
-                is not None
-            ):
-                extra_features = ExtraFeatures(
-                    config["Model"]["__init_params__"]["diffmodel_cfg"][
-                        "extra_features"
-                    ],
-                    dataset_infos=dataset_infos,
-                )
-                domain_features = ExtraMolecularFeatures(
-                    dataset_infos=dataset_infos,
-                )
-            else:
-                extra_features = DummyExtraFeatures()
-                domain_features = DummyExtraFeatures()
-            fallback_loader = train_loader or val_loader or test_loader
-            dataset_infos.compute_input_output_dims(
-                dataloader=fallback_loader,
-                extra_features=extra_features,
-                domain_features=domain_features,
-                conditionDim=config["Model"]["__init_params__"]["diffmodel_cfg"][
-                    "conditdim"
-                ],
-            )
-
-            # CLIP for sample metric
-            model_cfg = config["CLIP"]
-            self.clip = build_model(
-                model_cfg,
-                extra_features=extra_features,
-                domain_features=domain_features,
-                dataset_infos=dataset_infos,
-            )
-
-            # visualization tools
-            self.visualization_tools = MolecularVisualization(
-                dataset_infos=dataset_infos,
-                output_dir=config["Trainer"]["output_dir"],
-            )
-
-            model_cfg = config["Model"]
-            model = build_model(
-                model_cfg,
-                extra_features=extra_features,
-                domain_features=domain_features,
-                dataset_infos=dataset_infos,
-                visualization_tools=self.visualization_tools,
-                clip=self.clip,
-            )
-
-            self.pretrained_model_path = (
+            config_base_dir = os.path.dirname(os.path.abspath(config_path))
+            checkpoint_dir = (
                 checkpoint_path
-                if checkpoint_path is not None
-                else config.get("pretrained_model_path", None)
+                if checkpoint_path and os.path.isdir(checkpoint_path)
+                else None
             )
-            self.pretrained_weight_name = (
-                weights_name
-                if weights_name is not None
-                else config.get("pretrained_weight_name", None)
+            config = OmegaConf.load(config_path)
+            if config_overrides:
+                cli_config = OmegaConf.from_dotlist(config_overrides)
+                config = OmegaConf.merge(config, cli_config)
+            config = OmegaConf.to_container(config, resolve=True)
+            self._resolve_package_paths(
+                config,
+                config_base_dir=config_base_dir,
+                checkpoint_dir=checkpoint_dir,
             )
+        else:
+            logger.info(f"Loading registered model: {model_name}")
+            extracted_path = download.get_weights_path_from_url(
+                MODEL_REGISTRY[model_name]
+            )
+            config_path = resolve_model_config_path(model_name, extracted_path)
+            package_config_dir = os.path.dirname(config_path)
+            checkpoint_path = package_config_dir
+            config = OmegaConf.load(config_path)
+            if config_overrides:
+                cli_config = OmegaConf.from_dotlist(config_overrides)
+                config = OmegaConf.merge(config, cli_config)
+            config = OmegaConf.to_container(config, resolve=True)
+            self._resolve_package_paths(
+                config,
+                config_base_dir=package_config_dir,
+                checkpoint_dir=None,
+            )
+
+        model_config = config.get("Model", None)
+        assert model_config is not None, "Model config must be provided."
+        self.vocab = build_vocab(config.get("Vocabulary"))
+
+        set_signal_handlers()
+        sample_loader = build_dataloader(config["Sampler"]["data"], vocab=self.vocab)
+
+        # Build dataset infos without constructing full train/val/test dataloaders.
+        dataset_info_config = copy.deepcopy(config)
+        dataset_infos = build_dataset_infos(
+            dataloaders=None,
+            cfg=dataset_info_config,
+            vocab=self.vocab,
+            recompute_statistics=False,
+        )
+        # CLIP for sample metric
+        model_cfg = config["CLIP"]
+        self.clip = build_model(
+            model_cfg,
+            vocab=self.vocab,
+            dataset_infos=dataset_infos,
+        )
+
+        # visualization tools
+        self.visualization_tools = MolecularVisualization(
+            dataset_infos=dataset_infos,
+            output_dir=config["Trainer"]["output_dir"],
+        )
+
+        model_cfg = config["Model"]
+        model = build_model(
+            model_cfg,
+            vocab=self.vocab,
+            dataset_infos=dataset_infos,
+            visualization_tools=self.visualization_tools,
+            clip=self.clip,
+        )
+
+        self.pretrained_model_path = (
+            checkpoint_path
+            if checkpoint_path is not None
+            else config.get("pretrained_model_path", None)
+        )
+        self.pretrained_weight_name = weights_name
+        if self.pretrained_weight_name is None:
+            self.pretrained_weight_name = config.get("pretrained_weight_name", None)
+        if (
+            self.pretrained_weight_name is None
+            and self.pretrained_model_path is not None
+            and os.path.isdir(self.pretrained_model_path)
+        ):
+            sampler_pretrained_path = config.get("Sampler", {}).get(
+                "pretrained_model_path", None
+            )
+            if sampler_pretrained_path is not None:
+                self.pretrained_weight_name = os.path.basename(sampler_pretrained_path)
+        if self.pretrained_model_path is not None:
             save_load.load_pretrain(
                 model, self.pretrained_model_path, self.pretrained_weight_name
             )
 
-        else:
-            logger.info("Since model_name is given, downloading it...")
-            model, config = build_model_from_name(model_name, weights_name)
-
-        self.model = model
-        self.config = config
-
-        self.model.eval()
-
         # sample config
         sample_config = config.get("Sampler", None)
-        self.sample_config = sample_config
+        super().__init__(
+            model=model,
+            config=config,
+            sample_config=sample_config,
+        )
+        self._sample_loader = sample_loader
         self.samp_per_val = sample_config["sample_every_val"]
         self.visual_num = sample_config["visual_num"]
         self.chains_left_to_save = sample_config["chains_to_save"]
         self.number_chain_steps = sample_config["number_chain_steps"]
         self.sample_batch_iters = sample_config["sample_batch_iters"]
         self.metric_dict_sample = sample_config.get("out_dict", None)
-        self.flag_retrival_sampling = sample_config.get("flag_retrival_sampling", False)
+        self.flag_retrieval_sampling = sample_config.get(
+            "flag_retrieval_sampling", False
+        )
         self.flag_use_formula = sample_config.get("flag_use_formula", False)
-        self.flag_retrival_initilization = sample_config.get(
-            "flag_retrival_initilization", False
+        self.flag_retrieval_initialization = sample_config.get(
+            "flag_retrieval_initialization", False
         )
         self.num_candidates = sample_config.get("num_candidates", 1)
-
-        self.post_transforms_cfg = self.sample_config.get("post_transforms", None)
-        if self.post_transforms_cfg is not None:
-            self.post_transforms = build_post_transforms(self.post_transforms_cfg)
-        else:
-            self.post_transforms = None
 
         # runtime info
         self.rank = (
@@ -226,67 +223,131 @@ class MolecularSampler:
             else 0
         )
         self.output_dir = self.config.get("Sampler", {}).get("output_dir", "./outputs")
-        os.makedirs(self.output_dir, exist_ok=True)
+        self._set_output_dir(self.output_dir)
 
-        if self.clip is not None:
-            setattr(self.model, "clip", self.clip)
-
-        self.molecular_vectors, self.smiles_list = self._init_retrieval_bank(
-            self.sample_config,
-        )
+        if self.flag_retrieval_sampling or self.flag_retrieval_initialization:
+            self.molecular_vectors, self.smiles_list = self._init_retrieval_bank(
+                self.sample_config,
+            )
+        else:
+            self.molecular_vectors, self.smiles_list = None, None
 
         self.streaming = DiffNMRStreamingAdapter(
             t_scale=float(self.sample_config.get("t_scale", 1.0)),
             dataset_infos=dataset_infos,
+            sample_metrics=self.metric_dict_sample,
         )
         self.streaming.bind(
             model=self.model,
             dataset_infos=dataset_infos,
             clip=self.clip,
-            train_smiles=train_smiles,
             num_candidate=self.num_candidates,
         )
-        setattr(self.model, "streaming_adapter", self.streaming)
+
+    @staticmethod
+    def _resolve_pretrained_paths(
+        config: Dict,
+        config_base_dir: Optional[str],
+        checkpoint_dir: Optional[str] = None,
+    ):
+        DiffNMRSampler._resolve_package_paths(config, config_base_dir, checkpoint_dir)
+
+    @staticmethod
+    def _resolve_package_paths(
+        config: Dict,
+        config_base_dir: Optional[str],
+        checkpoint_dir: Optional[str] = None,
+    ):
+        def resolve_path(path):
+            if path is None or osp.isabs(path) or path.startswith("http"):
+                return path
+
+            if checkpoint_dir is not None:
+                candidate = osp.join(checkpoint_dir, osp.basename(path))
+                if osp.exists(candidate):
+                    return candidate
+
+            if config_base_dir is not None:
+                if path.startswith("./checkpoints/") or path.startswith("checkpoints/"):
+                    candidate = osp.join(
+                        config_base_dir, "checkpoints", osp.basename(path)
+                    )
+                    if osp.exists(candidate):
+                        return candidate
+                candidate = osp.normpath(osp.join(config_base_dir, path))
+                if osp.exists(candidate):
+                    return candidate
+
+            return path
+
+        def visit(obj):
+            if isinstance(obj, dict):
+                for key, value in obj.items():
+                    if key in {
+                        "pretrained_path",
+                        "pretrained_model_path",
+                        "retrieval_database_path",
+                        "path",
+                        "datadir",
+                    } and isinstance(value, str):
+                        resolved_path = resolve_path(value)
+                        obj[key] = resolved_path
+                    else:
+                        visit(value)
+            elif isinstance(obj, list):
+                for item in obj:
+                    visit(item)
+
+        visit(config)
+
+        sampler_config = config.get("Sampler", {})
+        retrieval_enabled = sampler_config.get(
+            "flag_retrieval_sampling", False
+        ) or sampler_config.get("flag_retrieval_initialization", False)
+        retrieval_path = sampler_config.get("retrieval_database_path")
+        if retrieval_enabled and (
+            retrieval_path is None or not osp.isfile(retrieval_path)
+        ):
+            raise FileNotFoundError(
+                "Retrieval sampling requires an existing "
+                "Sampler.retrieval_database_path."
+            )
+
+    def _set_output_dir(self, output_dir: str):
+        self.output_dir = output_dir
+        os.makedirs(self.output_dir, exist_ok=True)
+        if self.visualization_tools is not None:
+            self.visualization_tools.result_path = osp.join(self.output_dir, "graph")
 
     def compute_metric(
         self,
         save_path=None,
     ):
-        self.output_dir = save_path if save_path is not None else self.output_dir
-        metrics_cfg = self.sample_config.get("metrics")
-        assert metrics_cfg is not None, "metrics config must be provided."
-        metrics_fn = build_metric(metrics_cfg)
-
-        total_results = self.sample_by_dataloader(
+        if save_path is not None:
+            self._set_output_dir(save_path)
+        return self.sample_by_dataloader(
             self.output_dir,
         )
 
-        metric = metrics_fn(total_results)
-        return metric
-
-    def post_process(self, data):
-        if self.post_transforms is None:
-            return data
-        return self.post_transforms(data)
-
-    def sample(self, data, sample_params=None):
-        if sample_params is None:
-            sample_params = {}
-        assert isinstance(sample_params, dict), "sample_params must be a dict or None."
-        pred_data = self.model.sample(data, **sample_params)
-        pred_data = self.post_process(pred_data)
-        return pred_data
+    @staticmethod
+    def _clamp_keep_chain(keep_chain: int, n_nodes: Union[int, paddle.Tensor]):
+        if keep_chain <= 0:
+            return 0
+        if isinstance(n_nodes, int):
+            return min(keep_chain, n_nodes)
+        return min(keep_chain, int(n_nodes.shape[0]))
 
     def sample_by_dataloader(
         self,
         save_path=None,
+        data_loader=None,
     ):
-        self.output_dir = save_path if save_path is not None else self.output_dir
-        dataset_cfg = self.sample_config["data"]
-        data_loader = build_dataloader(dataset_cfg)
-
-        # build_molecule_cfg = self.sample_config["build_molecule_cfg"]
-        # molecule_converter = BuildMolecule(**build_molecule_cfg)
+        if save_path is not None:
+            self._set_output_dir(save_path)
+        if data_loader is None:
+            data_loader = getattr(self, "_sample_loader", None)
+        if data_loader is None:
+            data_loader = build_dataloader(self.sample_config["data"], vocab=self.vocab)
 
         logger.info(f"Total iterations: {len(data_loader)}")
         logger.info("Start sampling process...")
@@ -302,7 +363,7 @@ class MolecularSampler:
         metric_dict = self.sample_epoch(
             data_loader,
             epoch_id,
-            keep_onehot=self.flag_retrival_sampling,
+            keep_onehot=self.flag_retrieval_sampling,
             num_candidates=self.num_candidates,
         )
 
@@ -320,6 +381,7 @@ class MolecularSampler:
                         else f" | {k}(metric): {v:.5f}"
                     )
             logger.info(msg)
+        return metric_dict
 
     @paddle.no_grad()
     def sample_epoch(
@@ -344,9 +406,8 @@ class MolecularSampler:
             Trainer / Runner object that holds the diffusion ``model``, runtime
             configs, logging utilities, etc.
         dataloader : paddle.io.DataLoader
-            Yields tuples ``(graph, aux_data)`` where `graph` is a *pgl* style
-            MiniBatchGraph and `aux_data` is a dict containing scalar labels,
-            condition vectors and atom counts. TODO: recheck details.
+            Yields batch dictionaries containing a PGL ``graph`` plus
+            ``property`` and ``spectrum`` dictionaries.
         epoch_id : int
             Current epoch index – propagated to the metric logger so that saved
             artefacts (csv / images) are grouped by epoch.
@@ -420,22 +481,25 @@ class MolecularSampler:
             dense_data = dense_data.mask(node_mask)  # remove padding rows
 
             # basic batch tensors
-            batch_atomCount = paddle.to_tensor(
+            batch_atomCount = self._as_tensor(
                 batch_property["atom_count"]
             )  # [B] number of atoms
-            batch_y = paddle.to_tensor(batch_property["y"])  # labels (unused here)
+            batch_y = self._as_tensor(batch_property["y"])  # labels (unused here)
             batch_X, batch_E = dense_data.X, dense_data.E  # one‑hot Node / Edge
             bs = len(batch_y)  # batch size
 
             # 2.b build four‑branch NMR condition tensor list
-            if hasattr(self.model, "seq_len_H1"):
-                cond_H = paddle.to_tensor(batch_spectrum["H_nmr"])
-                cond_C = paddle.to_tensor(batch_spectrum["C_nmr"])
-                num_H_peak = paddle.to_tensor(batch_spectrum["num_H_peak"])
-                num_C_peak = paddle.to_tensor(batch_spectrum["num_C_peak"])
+            if getattr(self.model, "conditioning_mode", None) == "spectrum":
+                cond_H = self._as_tensor(batch_spectrum["H_nmr"])
+                cond_C = self._as_tensor(batch_spectrum["C_nmr"])
+                num_H_peak = self._as_tensor(batch_spectrum["num_H_peak"])
+                num_C_peak = self._as_tensor(batch_spectrum["num_C_peak"])
                 batch_nmr = [cond_H, num_H_peak, cond_C, num_C_peak]
             else:
-                batch_nmr = None  # TODO: re‑implement for single‑branch condition
+                raise NotImplementedError(
+                    "DiffNMRSampler currently supports only spectrum-conditioned "
+                    "models with four H1/C13 condition branches."
+                )
 
             # 2.c call `sample_batch` `num_candidates` times
             for c_idx in range(num_candidates):
@@ -457,9 +521,9 @@ class MolecularSampler:
                     flag_useformula=self.flag_use_formula,
                     iter_idx=c_idx,
                 )
-                if self.flag_retrival_initilization:
+                if self.flag_retrieval_initialization:
                     kwargs.update(
-                        retrival_initilization=self.flag_retrival_initilization,
+                        retrieval_initialization=self.flag_retrieval_initialization,
                         clip=self.clip,
                         molecular_vectors=self.molecular_vectors,
                         smiles_list=self.smiles_list,
@@ -478,18 +542,9 @@ class MolecularSampler:
                 if c_idx == 0:
                     samples["pred"].extend(mol_pred)
                     samples["true"].extend(mol_true)
-                # samples["n_all"] += len(batch_y) # TODO right?
 
             # 2‑d) meta‑info used by retrieval metrics
-            if batch_nmr is not None:
-                samples["batch_condition"] = [None for _ in range(4)]
-                for i, t in enumerate(batch_nmr):
-                    if samples["batch_condition"][i] is None:
-                        samples["batch_condition"][i] = paddle.to_tensor(t)
-                    else:
-                        samples["batch_condition"][i] = paddle.concat(
-                            [samples["batch_condition"][i], paddle.to_tensor(t)], axis=0
-                        )
+            self._append_batch_conditions(samples, batch_nmr)
             samples["node_mask_meta"].extend(batch_atomCount)
             samples["n_all"] += bs
 
@@ -514,6 +569,27 @@ class MolecularSampler:
 
         return metric_dict
 
+    @staticmethod
+    def _append_batch_conditions(samples, batch_condition):
+        """Append one batch of NMR conditions without losing earlier batches."""
+
+        tensors = [DiffNMRSampler._as_tensor(value) for value in batch_condition]
+        if not samples["batch_condition"]:
+            samples["batch_condition"] = tensors
+            return
+        if len(samples["batch_condition"]) != len(tensors):
+            raise ValueError(
+                "Inconsistent number of NMR condition branches across batches."
+            )
+        samples["batch_condition"] = [
+            paddle.concat([previous, current], axis=0)
+            for previous, current in zip(samples["batch_condition"], tensors)
+        ]
+
+    @staticmethod
+    def _as_tensor(value):
+        return value if isinstance(value, paddle.Tensor) else paddle.to_tensor(value)
+
     @paddle.no_grad()
     def sample_batch(
         self,
@@ -531,7 +607,7 @@ class MolecularSampler:
         num_nodes: Union[int, paddle.Tensor] = None,
         flag_useformula: bool = False,
         return_onehot: bool = False,
-        retrival_initilization: bool = False,
+        retrieval_initialization: bool = False,
         clip: paddle.nn.Layer = None,
         molecular_vectors: paddle.Tensor = None,
         smiles_list: List = None,
@@ -561,7 +637,7 @@ class MolecularSampler:
         batch_y : paddle.Tensor
             Additional labels (if any) required by the model.
         iter_idx : int
-            Current iteration index for obtain candidates for retrival.
+            Current iteration index for obtain candidates for retrieval.
         num_nodes : int | paddle.Tensor | None
             Number of nodes per graph. When *None* the model samples from its own
             learned distribution.
@@ -571,7 +647,7 @@ class MolecularSampler:
         return_onehot : bool
             Whether to return the *padded* one‑hot tensors (`X_hot`, `E_hot`) in
             addition to discrete index lists – required by molVec retrieval.
-        retrival_initilization : bool, default False
+        retrieval_initialization : bool, default False
             Whether to enable **retrieval‑based initialization**.
             If True, the model will fetch the closest reference molecules
             (using `molecular_vectors`) and use them as the first step of
@@ -602,9 +678,12 @@ class MolecularSampler:
             n_nodes = model.node_dist.sample_n(batch_size)
         elif isinstance(num_nodes, int):
             n_nodes = paddle.full([batch_size], num_nodes, dtype="int64")
+        elif isinstance(num_nodes, paddle.Tensor):
+            n_nodes = num_nodes
         else:
-            n_nodes = paddle.to_tensor(num_nodes)  # assume Tensor
+            n_nodes = paddle.to_tensor(num_nodes)
 
+        keep_chain = self._clamp_keep_chain(keep_chain, n_nodes)
         n_max: int = int(paddle.max(n_nodes).item())  # ***largest graph size***
 
         # `node_mask[b, i] == True` if node *i* is real for graph *b*
@@ -618,13 +697,18 @@ class MolecularSampler:
         )
         X_t, E_t, y_t = z_T.X, z_T.E, z_T.y
 
-        chain_X = paddle.zeros([number_chain_steps, keep_chain, n_max], dtype="int64")
-        chain_E = paddle.zeros(
-            [number_chain_steps, keep_chain, n_max, n_max], dtype="int64"
-        )
+        if keep_chain > 0:
+            chain_X = paddle.zeros(
+                [number_chain_steps, keep_chain, n_max], dtype="int64"
+            )
+            chain_E = paddle.zeros(
+                [number_chain_steps, keep_chain, n_max, n_max], dtype="int64"
+            )
+        else:
+            chain_X = chain_E = None
 
         # 3. Retrieval Initialization(Optional)
-        if retrival_initilization and batch_condition is not None:
+        if retrieval_initialization and batch_condition is not None:
             logger.info("Sampling Initializing using Retrieval Method.")
             output = clip.spectrum_encoder(batch_condition)
 
@@ -659,7 +743,7 @@ class MolecularSampler:
                 smiles = result_smiles[i]
                 current_node_mask = node_mask[i]
                 node_tensor_onehot, adjacency_matrix_onehot = graphs_from_mol(
-                    smiles, current_node_mask, i, X_t, E_t
+                    smiles, current_node_mask, i, X_t, E_t, self.vocab
                 )
                 node_list.append(node_tensor_onehot)
                 adj_matrix_list.append(adjacency_matrix_onehot)
@@ -702,9 +786,10 @@ class MolecularSampler:
                 X_t = batch_X
 
             # save intermediate frames for the first `keep_chain` graphs
-            write_index = (s_int * number_chain_steps) // model.T
-            chain_X[write_index] = discrete_sampled_s.X[:keep_chain]
-            chain_E[write_index] = discrete_sampled_s.E[:keep_chain]
+            if keep_chain > 0:
+                write_index = (s_int * number_chain_steps) // model.T
+                chain_X[write_index] = discrete_sampled_s.X[:keep_chain]
+                chain_E[write_index] = discrete_sampled_s.E[:keep_chain]
 
         # 5. Collapse padding → obtain discrete indices; optionally keep one‑hot
         # Make a *clone* of `sampled_s` so that collapsing will not overwrite the
@@ -779,15 +864,15 @@ class MolecularSampler:
                 )
                 assert chain_X.shape[0] == (number_chain_steps + 10)
 
-            # 7.b use visulize tools
-            num_mols = chain_X.shape[1]
-            # draw animation of diffusion process of generated molecules
-            for i in range(num_mols):
-                chain_X_np = chain_X[:, i, :].numpy()
-                chain_E_np = chain_E[:, i, :, :].numpy()
-                self.visualization_tools.visualize_chain(
-                    batch_id, i, chain_X_np, chain_E_np
-                )
+                # 7.b use visulize tools
+                num_mols = chain_X.shape[1]
+                # draw animation of diffusion process of generated molecules
+                for i in range(num_mols):
+                    chain_X_np = chain_X[:, i, :].numpy()
+                    chain_E_np = chain_E[:, i, :, :].numpy()
+                    self.visualization_tools.visualize_chain(
+                        batch_id, i, chain_X_np, chain_E_np
+                    )
             # draw picture of predicted and true molecules
             self.visualization_tools.visualizeNmr(
                 batch_id,
@@ -807,7 +892,7 @@ class MolecularSampler:
         """
         if not cfg:
             return None, None
-        path = cfg.get("retrival_database_path", None)
+        path = cfg.get("retrieval_database_path", None)
         if path is None or not os.path.exists(path):
             logger.warning(f"[retrieval_bank] path missing or not found: {path}")
             return None, None
@@ -844,7 +929,7 @@ class MolecularSampler:
         return paddle.concat(similarities, axis=1)  # [batch_size, N]
 
 
-def graphs_from_mol(smiles, node_mask, i, X, E):
+def graphs_from_mol(smiles, node_mask, i, X, E, vocab):
     """
     Convert an SMILES string into graph presentation (node features & adjacency).
 
@@ -878,19 +963,9 @@ def graphs_from_mol(smiles, node_mask, i, X, E):
 
     num_trueAtoms = paddle.sum(node_mask)
 
-    # dictionary to map atom symbols to integer values
-    atom_encoder = {
-        "C": 0,
-        "N": 1,
-        "O": 2,
-        "F": 3,
-        "P": 4,
-        "S": 5,
-        "Cl": 6,
-        "Br": 7,
-        "I": 8,
-    }
-    atom_encoder_len = len(atom_encoder)  # Number of distinct atom types
+    atom_encoder = vocab["atom"]["token_to_id"]
+    atom_encoder_len = vocab["atom"]["num_embeddings"]
+    bond_encoder = vocab["bond"]["token_to_id"]
     # print(f'graphs_from_mol_smiles{smiles}')
     # initialize the node list
     node_list = []
@@ -930,7 +1005,7 @@ def graphs_from_mol(smiles, node_mask, i, X, E):
         node_tensor_onehot = X[i]
 
     adjacency_matrix = np.full((num_atoms_max, num_atoms_max), -1, dtype="int")
-    adjacency_matrix[:num_atoms, :num_atoms] = 0
+    adjacency_matrix[:num_atoms, :num_atoms] = bond_encoder["NO_BOND"]
 
     for bond in mol.GetBonds():
         start_idx = bond.GetBeginAtomIdx()
@@ -939,25 +1014,25 @@ def graphs_from_mol(smiles, node_mask, i, X, E):
         # determine bond type
         bond_type = bond.GetBondType()
         if bond_type == Chem.rdchem.BondType.SINGLE:
-            bond_value = 1
+            bond_value = bond_encoder["SINGLE"]
         elif bond_type == Chem.rdchem.BondType.DOUBLE:
-            bond_value = 2
+            bond_value = bond_encoder["DOUBLE"]
         elif bond_type == Chem.rdchem.BondType.TRIPLE:
-            bond_value = 3
+            bond_value = bond_encoder["TRIPLE"]
         elif bond_type == Chem.rdchem.BondType.AROMATIC:
-            bond_value = 4
+            bond_value = bond_encoder["AROMATIC"]
         else:
-            bond_value = 0
+            bond_value = bond_encoder["NO_BOND"]
 
         # populate adjacency matrix (symmetric)
         adjacency_matrix[start_idx, end_idx] = bond_value
         adjacency_matrix[end_idx, start_idx] = bond_value
 
     # Convert adjacency_matrix to one-hot
-    max_bond_type = 4  # Maximum bond type value (single, double, triple, aromatic)
     adjacency_matrix_tensor = paddle.to_tensor(adjacency_matrix, dtype="int64")
     adjacency_matrix_onehot = F.one_hot(
-        adjacency_matrix_tensor.clip(min=0), num_classes=max_bond_type + 1
+        adjacency_matrix_tensor.clip(min=0),
+        num_classes=vocab["bond"]["num_embeddings"],
     ).astype("float32")
     adjacency_matrix_onehot[
         adjacency_matrix_tensor == -1

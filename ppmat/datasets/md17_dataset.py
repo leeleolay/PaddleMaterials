@@ -52,31 +52,34 @@ class MD17Dataset(Dataset):
       for training, the next 1,000 for validation, and all remaining frames for
       testing.
 
-    | Molecule (``name``) | NPZ file | Frames | Atoms | Train | Val | Test |
-    |---------------------|----------|-------:|------:|------:|----:|-----:|
-    | ``aspirin`` | ``md17_aspirin.npz`` | 211,762 | 21 | 1,000 | 1,000 | 209,762 |
-    | ``benzene_old`` | ``md17_benzene2017.npz`` | 627,983 | 12 | 1,000 | 1,000 | 625,983 |
-    | ``ethanol`` | ``md17_ethanol.npz`` | 555,092 | 9 | 1,000 | 1,000 | 553,092 |
-    | ``malonaldehyde`` | ``md17_malonaldehyde.npz`` | 993,237 | 9 | 1,000 | 1,000 | 991,237 |
-    | ``naphthalene`` | ``md17_naphthalene.npz`` | 326,250 | 18 | 1,000 | 1,000 | 324,250 |
-    | ``salicylic`` | ``md17_salicylic.npz`` | 320,231 | 16 | 1,000 | 1,000 | 318,231 |
-    | ``toluene`` | ``md17_toluene.npz`` | 442,790 | 15 | 1,000 | 1,000 | 440,790 |
-    | ``uracil`` | ``md17_uracil.npz`` | 133,770 | 12 | 1,000 | 1,000 | 131,770 |
+    | Molecule (``name``) | Frames | Atoms | Train | Val | Test |
+    |---------------------|-------:|------:|------:|----:|-----:|
+    | ``aspirin`` | 211,762 | 21 | 1,000 | 1,000 | 209,762 |
+    | ``benzene_old`` | 627,983 | 12 | 1,000 | 1,000 | 625,983 |
+    | ``ethanol`` | 555,092 | 9 | 1,000 | 1,000 | 553,092 |
+    | ``malonaldehyde`` | 993,237 | 9 | 1,000 | 1,000 | 991,237 |
+    | ``naphthalene`` | 326,250 | 18 | 1,000 | 1,000 | 324,250 |
+    | ``salicylic`` | 320,231 | 16 | 1,000 | 1,000 | 318,231 |
+    | ``toluene`` | 442,790 | 15 | 1,000 | 1,000 | 440,790 |
+    | ``uracil`` | 133,770 | 12 | 1,000 | 1,000 | 131,770 |
+
+    Files follow ``md17_<name>.npz``; ``benzene_old`` uses
+    ``md17_benzene2017.npz``.
 
     **Data Format**
     Each molecule is stored in one compressed NumPy ``.npz`` file. Let
     ``num_frames`` denote the number of trajectory frames and ``num_atoms``
     the fixed number of atoms in that molecule.
 
-    | NPZ key | Shape | Description | Unit |
-    |---------|-------|-------------|------|
-    | ``z`` | ``[num_atoms]`` | Atomic numbers shared by all frames | Dimensionless |
-    | ``R`` | ``[num_frames, num_atoms, 3]`` | Cartesian positions | Angstrom |
-    | ``E`` | ``[num_frames, 1]`` | Total molecular energies | kcal/mol |
-    | ``F`` | ``[num_frames, num_atoms, 3]`` | Cartesian atomic forces | kcal/(mol Angstrom) |
-    | ``name`` | Scalar | Molecule name metadata | - |
-    | ``theory`` | Scalar | Electronic-structure method metadata | - |
-    | ``type``, ``md5`` | Scalar | Archive metadata | - |
+    | Key | Shape | Meaning and unit |
+    |-----|-------|------------------|
+    | ``z`` | ``[num_atoms]`` | Atomic numbers; dimensionless |
+    | ``R`` | ``[num_frames, num_atoms, 3]`` | Positions; Angstrom |
+    | ``E`` | ``[num_frames, 1]`` | Total energy; kcal/mol |
+    | ``F`` | ``[num_frames, num_atoms, 3]`` | Forces; kcal/(mol Angstrom) |
+    | ``name`` | Scalar | Molecule name |
+    | ``theory`` | Scalar | Electronic-structure method |
+    | ``type``, ``md5`` | Scalar | Archive metadata |
 
     Only ``z``, ``R``, ``E``, and ``F`` are consumed by this loader. Atomic
     numbers are converted to ``int64``; positions, energies, and forces are
@@ -94,10 +97,10 @@ class MD17Dataset(Dataset):
         split (Optional[str], optional): Dataset split selected from ``"train"``,
             ``"val"``, and ``"test"``. Set to ``None`` to use every trajectory
             frame. Defaults to None.
-        build_molecule_cfg (Optional[Dict], optional): Configuration for
-            constructing RDKit molecules from atomic numbers and positions. The
-            default uses ``format="dict"`` without sanitization or hydrogen
-            modification. Defaults to None.
+        build_molecule_cfg (Optional[Dict], optional): Keyword arguments passed
+            to ``BuildMolecule`` when constructing RDKit molecules from atomic
+            numbers and positions. The default uses ``format="dict"`` with no
+            sanitization or hydrogen modification. Defaults to None.
         build_graph_cfg (Optional[Dict], optional): Configuration for the
             molecular graph converter. This argument is required because MD17
             samples always return a graph. Defaults to None.
@@ -271,9 +274,9 @@ class MD17Dataset(Dataset):
                 "pos": np.asarray(positions[sample_ids], dtype=np.float32),
             }
             property_data = {
-                "energy": np.asarray(
-                    data["E"][sample_ids], dtype=np.float32
-                ).reshape(-1),
+                "energy": np.asarray(data["E"][sample_ids], dtype=np.float32).reshape(
+                    -1
+                ),
                 "force": np.asarray(data["F"][sample_ids], dtype=np.float32),
             }
         return raw_data, property_data, sample_ids
@@ -291,9 +294,7 @@ class MD17Dataset(Dataset):
     def __getitem__(self, idx: int):
         data = {
             "graph": self.load_from_cache(self.graphs[idx]),
-            "energy": np.asarray(
-                [self.property_data["energy"][idx]], dtype=np.float32
-            ),
+            "energy": np.asarray([self.property_data["energy"][idx]], dtype=np.float32),
             "force": ConcatData(self.property_data["force"][idx]),
             "id": int(self.sample_ids[idx]),
         }

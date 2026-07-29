@@ -24,9 +24,10 @@ from typing import Dict
 from typing import Optional
 
 import numpy as np
-import pandas as pd
 import paddle.distributed as dist
+import pandas as pd
 from paddle.io import Dataset
+
 from ppmat.datasets.build_molecule import BuildMolecule
 from ppmat.models import build_graph_converter
 from ppmat.utils import download
@@ -60,26 +61,24 @@ class QM9Dataset(Dataset):
     The dataset is structured as comma-separated values (CSV) files with one
     molecule per row. The split files are `train.csv`, `val.csv`, and `test.csv`.
 
-    | Column Name                | Description                                      | Example Value  |
-    |----------------------------|--------------------------------------------------|----------------|
-    | `file_name`                | Original QM9 xyz file name                       | qm9_000001.xyz |
-    | `standard_xyz`             | Standard XYZ string without Mulliken charges     | xyz_str        |
-    | `mulliken_xyz`             | XYZ string with Mulliken partial charges         | xyz_charge_str |
-    | `molecule_id`              | 1-based QM9 molecule identifier                  | 1              |
-    | `num_atoms`                | Number of atoms in the molecule                  | 5              |
-    | `A`, `B`, `C`              | Rotational constants                             | 157.7118       |
-    | `mu`                       | Dipole moment                                    | 0.0            |
-    | `alpha`                    | Isotropic polarizability                         | 13.21          |
-    | `homo`, `lumo`, `gap`      | HOMO, LUMO, and HOMO-LUMO gap                    | -0.3877        |
-    | `r2`                       | Electronic spatial extent                        | 35.3641        |
-    | `zpve`                     | Zero point vibrational energy                    | 0.044749       |
-    | `U0`, `U`, `H`, `G`        | Thermochemical energies                          | -40.47893      |
-    | `Cv`                       | Heat capacity                                    | 6.469          |
-    | `vibrational_frequencies`  | Space-separated vibrational frequencies          | 1341.307 ...   |
-    | `canonical_smiles`         | Canonical SMILES string                          | C              |
-    | `isomeric_smiles`          | Isomeric SMILES string                           | C              |
-    | `canonical_inchi`          | Canonical InChI string                           | InChI=1S/CH4/h1H4 |
-    | `isomeric_inchi`           | Isomeric InChI string                            | InChI=1S/CH4/h1H4 |
+    | Column | Description |
+    |--------|-------------|
+    | `file_name` | Original QM9 XYZ filename |
+    | `standard_xyz` | XYZ string without Mulliken charges |
+    | `mulliken_xyz` | XYZ string with Mulliken partial charges |
+    | `molecule_id` | One-based QM9 molecule identifier |
+    | `num_atoms` | Number of atoms in the molecule |
+    | `A`, `B`, `C` | Rotational constants |
+    | `mu` | Dipole moment |
+    | `alpha` | Isotropic polarizability |
+    | `homo`, `lumo`, `gap` | Frontier orbital energies and gap |
+    | `r2` | Electronic spatial extent |
+    | `zpve` | Zero-point vibrational energy |
+    | `U0`, `U`, `H`, `G` | Thermochemical energies |
+    | `Cv` | Heat capacity |
+    | `vibrational_frequencies` | Space-separated vibrational frequencies |
+    | `canonical_smiles`, `isomeric_smiles` | SMILES representations |
+    | `canonical_inchi`, `isomeric_inchi` | InChI representations |
 
     **Example Row:**
     ```csv
@@ -94,9 +93,10 @@ class QM9Dataset(Dataset):
             QM9. The property_names should be selected from
             ["A", "B", "C", "mu", "alpha", "homo", "lumo", "gap", "r2",
             "zpve", "U0", "U", "H", "G", "Cv"]. Defaults to None.
-        build_molecule_cfg (Dict, optional): Configs for building molecular
-            structures from xyz strings. If not specified, the default setting
-            will be used. Defaults to None.
+        build_molecule_cfg (Dict, optional): Keyword arguments passed to
+            ``BuildMolecule`` when building molecular structures from XYZ
+            strings. If not specified, the default setting will be used.
+            Defaults to None.
         build_graph_cfg (Dict, optional): Configs for building molecular graphs
             from structures. Defaults to None.
         transforms (Optional[Callable], optional): Preprocess transforms for each
@@ -305,8 +305,8 @@ class QM9Dataset(Dataset):
         logger.info(f"Read {len(data)} molecules from {path}")
 
         data = {key: data[key].tolist() for key in data if "Unnamed" not in key}
-        data["molecule"] = data.pop("standard_xyz") # adapted for this qm9 split file
-        data["id"] = data["molecule_id"] # adapted for this qm9 split file
+        data["molecule"] = data.pop("standard_xyz")  # adapted for this qm9 split file
+        data["id"] = data["molecule_id"]  # adapted for this qm9 split file
         num_samples = 0
         for key in data:
             num_samples = max(num_samples, len(data[key]))

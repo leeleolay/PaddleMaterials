@@ -540,8 +540,8 @@ class SamplingMolecularMetrics(nn.Layer):
 
         # online counters
         self.gen_n = _NHistogram(dataset_infos.max_n_nodes)
-        self.gen_nodes = _NodeHistogram(dataset_infos.output_dims["X"])
-        self.gen_edges = _EdgeHistogram(dataset_infos.output_dims["E"])
+        self.gen_nodes = _NodeHistogram(dataset_infos.num_atom_types)
+        self.gen_edges = _EdgeHistogram(int(dataset_infos.edge_types.shape[0]))
         self.gen_val = _ValencyHistogram(dataset_infos.max_n_nodes)
 
         # MAEs
