@@ -1,0 +1,338 @@
+# Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+import os
+
+import numpy as np
+import paddle
+import pgl
+import pytest
+
+from ppmat.models.megnet.megnet import MEGNetPlus
+from ppmat.models.megnet.megnet_cinn import MEGNetTensorCore
+from ppmat.models.megnet.megnet_cinn import _segment_softmax
+from ppmat.models.megnet.megnet_cinn import compile_megnet
+from ppmat.models.megnet.megnet_cinn import compile_megnet_cinn
+from ppmat.models.megnet.megnet_cinn import graph_to_tensor_batch
+from ppmat.models.megnet.megnet_cinn import pack_pgl_graph
+
+
+@pytest.fixture(autouse=True)
+def _cpu_device():
+    original_device = paddle.get_device()
+    paddle.set_device("cpu")
+    yield
+    paddle.set_device(original_device)
+
+
+def _make_graph(atom_types, edges, bond_dist):
+    return pgl.Graph(
+        np.asarray(edges, dtype=np.int64),
+        num_nodes=len(atom_types),
+        node_feat={
+            "atom_types": np.asarray(atom_types, dtype=np.int64),
+        },
+        edge_feat={
+            "bond_dist": np.asarray(bond_dist, dtype=np.float32),
+        },
+    )
+
+
+def _make_graphs():
+    graph_a = _make_graph(
+        atom_types=[1, 8, 14],
+        edges=[
+            [0, 1],
+            [1, 0],
+            [1, 2],
+            [2, 1],
+            [0, 2],
+            [2, 0],
+        ],
+        bond_dist=[1.0, 1.0, 1.5, 1.5, 2.0, 2.0],
+    )
+    graph_b = _make_graph(
+        atom_types=[6, 7],
+        edges=[[0, 1], [1, 0]],
+        bond_dist=[1.2, 1.2],
+    )
+    return graph_a, graph_b
+
+
+def _make_model(dim_state_embedding=2):
+    paddle.seed(2026)
+    return MEGNetPlus(
+        dim_node_embedding=4,
+        dim_edge_embedding=6,
+        dim_state_embedding=dim_state_embedding,
+        nblocks=2,
+        hidden_layer_sizes_input=(8, 4),
+        hidden_layer_sizes_conv=(8, 8, 4),
+        hidden_layer_sizes_output=(8, 4),
+        nlayers_set2set=1,
+        niters_set2set=2,
+        bond_expansion_cfg={
+            "rbf_type": "Gaussian",
+            "initial": 0.0,
+            "final": 5.0,
+            "num_centers": 6,
+            "width": 0.5,
+        },
+    )
+
+
+def _assert_allclose(actual, expected, atol=1e-6, rtol=1e-6):
+    np.testing.assert_allclose(actual.numpy(), expected.numpy(), atol=atol, rtol=rtol)
+
+
+def test_graph_to_tensor_batch_preserves_pgl_batch_contract():
+    graph_a, graph_b = _make_graphs()
+    graph = pgl.Graph.batch([graph_a, graph_b])
+
+    packed = graph_to_tensor_batch(graph)
+
+    assert not graph.is_tensor()
+    np.testing.assert_array_equal(packed.atom_types.numpy(), [1, 8, 14, 6, 7])
+    np.testing.assert_array_equal(packed.node_graph_id.numpy(), [0, 0, 0, 1, 1])
+    np.testing.assert_array_equal(
+        packed.edge_graph_id.numpy(), [0, 0, 0, 0, 0, 0, 1, 1]
+    )
+    np.testing.assert_array_equal(packed.edge_src.numpy(), [0, 1, 1, 2, 0, 2, 3, 4])
+    np.testing.assert_array_equal(packed.edge_dst.numpy(), [1, 0, 2, 1, 2, 0, 4, 3])
+    assert packed.state_attr.shape == [2, 2]
+    np.testing.assert_array_equal(packed.state_attr.numpy(), np.zeros([2, 2]))
+
+
+@pytest.mark.parametrize("batch_size", [1, 2])
+def test_tensor_core_matches_eager_forward(batch_size):
+    graph_a, graph_b = _make_graphs()
+    graph = graph_a if batch_size == 1 else pgl.Graph.batch([graph_a, graph_b])
+    model = _make_model()
+    model.eval()
+    core = MEGNetTensorCore(model)
+    core.eval()
+
+    packed = graph_to_tensor_batch(graph)
+    expected = model._forward({"graph": graph})
+    actual = core(*packed)
+
+    assert actual.shape == [batch_size, 1]
+    _assert_allclose(actual, expected)
+
+
+def test_tensor_core_matches_eager_gradients_and_optimizer_step():
+    graph_a, graph_b = _make_graphs()
+    reference_graph = pgl.Graph.batch([graph_a, graph_b])
+    tensor_graph = pgl.Graph.batch(_make_graphs())
+
+    reference_model = _make_model()
+    tensor_model = _make_model()
+    tensor_model.set_state_dict(reference_model.state_dict())
+    reference_model.train()
+    tensor_model.train()
+    tensor_core = MEGNetTensorCore(tensor_model)
+    tensor_core.train()
+
+    target = paddle.to_tensor([[0.25], [-0.75]], dtype="float32")
+    reference_output = reference_model._forward({"graph": reference_graph})
+    tensor_output = tensor_core(*graph_to_tensor_batch(tensor_graph))
+    reference_loss = paddle.nn.functional.mse_loss(reference_output, target)
+    tensor_loss = paddle.nn.functional.mse_loss(tensor_output, target)
+    reference_loss.backward()
+    tensor_loss.backward()
+
+    _assert_allclose(tensor_output, reference_output)
+    _assert_allclose(tensor_loss, reference_loss)
+    reference_parameters = dict(reference_model.named_parameters())
+    tensor_parameters = dict(tensor_model.named_parameters())
+    assert reference_parameters.keys() == tensor_parameters.keys()
+    for name, reference_parameter in reference_parameters.items():
+        tensor_parameter = tensor_parameters[name]
+        if reference_parameter.grad is None:
+            assert tensor_parameter.grad is None
+            continue
+        _assert_allclose(
+            tensor_parameter.grad,
+            reference_parameter.grad,
+            atol=2e-6,
+            rtol=2e-6,
+        )
+
+    reference_optimizer = paddle.optimizer.SGD(
+        learning_rate=1e-3, parameters=reference_model.parameters()
+    )
+    tensor_optimizer = paddle.optimizer.SGD(
+        learning_rate=1e-3, parameters=tensor_model.parameters()
+    )
+    reference_optimizer.step()
+    tensor_optimizer.step()
+    for name, reference_parameter in reference_parameters.items():
+        _assert_allclose(
+            tensor_parameters[name],
+            reference_parameter,
+            atol=2e-6,
+            rtol=2e-6,
+        )
+
+
+def test_segment_softmax_is_stable_across_graph_score_ranges():
+    values = paddle.to_tensor(
+        [[1000.0], [999.0], [-1000.0], [-1001.0]], dtype="float32"
+    )
+    segment_ids = paddle.to_tensor([0, 0, 1, 1], dtype="int64")
+
+    actual = _segment_softmax(
+        values,
+        segment_ids,
+        out_size=paddle.to_tensor(2, dtype="int64"),
+    )
+    expected = np.asarray(
+        [[0.7310586], [0.2689414], [0.7310586], [0.2689414]],
+        dtype=np.float32,
+    )
+
+    np.testing.assert_allclose(actual.numpy(), expected, atol=1e-6, rtol=1e-6)
+
+
+def test_tensor_convenience_apis():
+    graph_a, graph_b = _make_graphs()
+    packed = pack_pgl_graph([graph_a, graph_b])
+    model = _make_model()
+    model.eval()
+    core = MEGNetTensorCore(model)
+    core.eval()
+
+    assert int(packed.node_count) == 5
+    assert int(packed.edge_count) == 8
+    assert int(packed.graph_count) == 2
+
+    expected = core(*packed)
+    _assert_allclose(core.forward_graph([graph_a, graph_b]), expected)
+    _assert_allclose(core.forward_tensor(packed), expected)
+    _assert_allclose(core.predict_tensor(packed), expected)
+
+
+def test_compile_accepts_original_megnet_model():
+    graph_a, _ = _make_graphs()
+    model = _make_model()
+    model.eval()
+    compiled = compile_megnet(model, backend=None, full_graph=True)
+    compiled.eval()
+
+    packed = graph_to_tensor_batch(graph_a)
+    expected = model._forward({"graph": graph_a})
+    actual = compiled(*packed)
+    _assert_allclose(actual, expected)
+
+
+def test_non_default_state_dimension_is_explicitly_packed():
+    graph_a, _ = _make_graphs()
+    model = _make_model(dim_state_embedding=4)
+    model.eval()
+    core = MEGNetTensorCore(model)
+    core.eval()
+
+    packed = graph_to_tensor_batch(graph_a, state_dim=4)
+    assert packed.state_attr.shape == [1, 4]
+    expected = core.forward_tensor(packed)
+    assert expected.shape == [1, 1]
+    assert core.forward_graph(graph_a).shape == [1, 1]
+
+    with pytest.raises(ValueError, match="expected 4"):
+        core.forward_tensor(graph_to_tensor_batch(graph_a))
+    with pytest.raises(ValueError, match="batch dimension"):
+        core.forward_tensor(
+            packed,
+            state_attr=paddle.zeros([2, 4], dtype="float32"),
+        )
+
+    static_core = compile_megnet(core, backend=None, full_graph=True)
+    static_core.eval()
+    _assert_allclose(static_core(*packed), expected)
+
+
+def test_dynamic_shape_pir_static_matches_tensor_eager():
+    model = _make_model()
+    model.eval()
+    core = MEGNetTensorCore(model)
+    core.eval()
+    static_core = compile_megnet(core, backend=None, full_graph=True)
+    static_core.eval()
+
+    graph_a, graph_b = _make_graphs()
+    for graph in (graph_a, pgl.Graph.batch([graph_a, graph_b])):
+        packed = graph_to_tensor_batch(graph)
+        expected = core(*packed)
+        actual = static_core(*packed)
+        _assert_allclose(actual, expected)
+
+
+def test_static_core_can_be_exported_and_reloaded(tmp_path):
+    model = _make_model()
+    model.eval()
+    core = MEGNetTensorCore(model)
+    core.eval()
+    static_core = compile_megnet(core, backend=None, full_graph=True)
+    static_core.eval()
+
+    graph_a, _ = _make_graphs()
+    packed = graph_to_tensor_batch(graph_a)
+    expected = static_core(*packed)
+    export_path = str(tmp_path / "megnet_tensor_core")
+    paddle.jit.save(static_core, export_path)
+    loaded = paddle.jit.load(export_path)
+    actual = loaded(*packed)
+
+    _assert_allclose(actual, expected)
+
+
+@pytest.mark.skipif(
+    os.environ.get("PPMAT_RUN_CINN_TESTS") != "1",
+    reason="Set PPMAT_RUN_CINN_TESTS=1 to run the GPU CINN smoke test.",
+)
+def test_dynamic_shape_cinn_inference_matches_tensor_eager():
+    if not paddle.is_compiled_with_cuda():
+        pytest.skip("Paddle was not compiled with CUDA.")
+    if not paddle.base.is_compiled_with_cinn():
+        pytest.skip("Paddle was not compiled with CINN.")
+
+    paddle.set_device("gpu:0")
+    model = _make_model()
+    model.eval()
+    core = MEGNetTensorCore(model)
+    core.eval()
+    compiled = compile_megnet_cinn(core, full_graph=True)
+    compiled.eval()
+
+    graph_a, graph_b = _make_graphs()
+    for graph in (graph_a, pgl.Graph.batch([graph_a, graph_b])):
+        packed = graph_to_tensor_batch(graph)
+        expected = core(*packed)
+        actual = compiled(*packed)
+        _assert_allclose(actual, expected)
+
+
+def test_graph_to_tensor_batch_validates_required_features():
+    graph = pgl.Graph(
+        np.asarray([[0, 1], [1, 0]], dtype=np.int64),
+        num_nodes=2,
+        node_feat={"atom_types": np.asarray([1, 8], dtype=np.int64)},
+    )
+
+    with pytest.raises(
+        ValueError, match=r"graph\.edge_feat\['bond_dist'\] is required"
+    ):
+        graph_to_tensor_batch(graph)
