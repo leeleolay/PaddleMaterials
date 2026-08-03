@@ -166,6 +166,51 @@ probe measured forward and loss error `0.0`, maximum parameter-gradient error
 `9.31e-10`, and post-SGD parameter error `0.0`. That direct SGD probe is kept as
 an independent optimizer sanity check; the formal three-step canary uses Adam.
 
+## MP2018 Training Smoke
+
+The repository downloader was exercised against the official MP2018 archive.
+It verified MD5 `216202f16a5081358798e15c060facee` and reused the local archive;
+the archive SHA-256 is
+`97be46b691d7cae77ee1da5416425a33bba1bf364fecd799bdbc7de0af02c9fe`.
+
+A deterministic smoke subset selects the smallest valid structures among the
+first 128 records of each official split, with source index as the tie breaker:
+
+- train: 8 samples, SHA-256
+  `934c50dc971e6fe16344afe94fd7c3f2e8aa8e06a65edf6923066a13e2841d7c`;
+- validation: 4 samples, SHA-256
+  `1332dae3d91d724a7c9bd68c78e9889bc374cca8b2e6fac0827d5caf9d56cdfe`.
+
+Structures and radius graphs were built with one CPU worker and a 4.0 Angstrom
+cutoff. Fresh-cache and cache-reload samples have identical labels and graph
+hashes. The repository `property_prediction/train.py` entry point then ran the
+production MEGNet configuration for two Adam updates, saved `epoch_1`, `latest`,
+and `best` checkpoints, and evaluated the four-sample validation subset. The
+observed per-step losses were `1.529762` and `3.021938`; validation MAE was
+`0.841166 eV/atom`. Resuming `latest` advanced TrainerState from global step 2
+to step 3 and produced a readable second checkpoint. Loading `best.pdparams`
+back into `MEGNetPlus` produced eager/Tensor-Core predictions within
+`2.24e-8` normalized absolute error.
+
+A separate real-data CINN smoke canary used the production MEGNet configuration
+and Adam settings for batches of two graphs (`N=9`, `E=140`) and one graph (`N=5`,
+`E=76`). Across both steps, the maximum errors were:
+
+- normalized prediction: `7.45e-9`;
+- loss: `1.49e-8`;
+- parameter gradient: `5.96e-8`;
+- post-Adam parameter: `2.61e-7`.
+
+The first production-configuration CINN invocation, including compilation, took
+`186.76s`; the second dynamic-shape invocation took `0.0107s`. These timings are
+diagnostic single-run measurements, not a benchmark. The manifest, resolved
+configs, logs, checkpoints, and detailed reports are local validation artifacts
+under `output/reproduction/megnet/mp2018/`; `output/` is ignored by Git by
+design, so these files are not distributed by the source commit. The exact
+resolved CLI configurations are preserved beside each run as YAML, while a
+fresh checkout must regenerate the two subsets using the selection rule and
+source/archive hashes above before repeating the smoke.
+
 ## Follow-up Phases
 
 Phase 2 should add an opt-in predictor/config integration, cache or export the
@@ -173,6 +218,7 @@ compiled inference program, measure warm and steady-state latency, and validate
 representative MP-2018 graph-size distributions.
 
 Phase 3 should integrate the Tensor core with the public Trainer contract and
-validate real-dataset loading, checkpoint/resume, a longer fixed-seed curve,
-and final metrics. AMP, distributed training, schedulers, and production-sized
-MEGNet configurations remain untested.
+validate a longer fixed-seed curve and final metrics. The MP2018 smoke above
+validates the existing eager Trainer and a separate Tensor-only CINN training
+harness; it is not end-to-end CINN Trainer support. AMP, distributed training,
+and production schedules remain untested.
