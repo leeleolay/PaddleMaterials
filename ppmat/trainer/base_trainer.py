@@ -102,7 +102,6 @@ class BaseTrainer:
             config.get("execution_backend", None),
             owner="Trainer",
         )
-        self._execution_prepared_modes = set()
 
         if optimizer is None:
             self.use_amp = False
@@ -279,8 +278,6 @@ class BaseTrainer:
         if self.execution_backend == "eager":
             return
         mode = execution_mode(self.model)
-        if mode in self._execution_prepared_modes:
-            return
         context = paddle.no_grad() if mode == "eval" else contextlib.nullcontext()
         with context:
             prepare_execution(
@@ -289,7 +286,6 @@ class BaseTrainer:
                 sample_batch,
                 owner="Trainer",
             )
-        self._execution_prepared_modes.add(mode)
 
     def get_num_trainable_parameters(self):
         """
@@ -745,10 +741,6 @@ class BaseTrainer:
             self.model.before_train(self)
 
         self.state = TrainerState()
-        # A new train invocation may load a different checkpoint.  The model
-        # invalidates its compiled runtime when weights are replaced; mirror
-        # that lifecycle at the workflow boundary as well.
-        self._execution_prepared_modes.clear()
         # load model checkpoint, usually used for resume training
         resume_from_checkpoint = (
             resume_from_checkpoint

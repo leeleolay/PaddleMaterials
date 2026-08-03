@@ -89,9 +89,10 @@ Predictor.
 
 `BaseTrainer` warms the first real collated batch after pretrained/resume
 weights are loaded, and `BasePredictor` warms the first converted graph. The
-compiled object is deliberately not serialized; loading a checkpoint creates a
-fresh runtime for the restored parameters. Train/eval runtimes are kept
-separate because dropout and static graph mode are mode-dependent.
+compiled object is deliberately not serialized. A new process builds a fresh
+runtime, while checkpoint values loaded into an existing process are visible
+through the same parameter objects without recompilation. Train/eval runtimes
+are kept separate because dropout and static graph mode are mode-dependent.
 
 Paddle 3.3.1 still cannot infer CINN symbolic shapes for these graph reduction
 operators:

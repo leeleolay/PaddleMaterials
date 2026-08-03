@@ -26,8 +26,9 @@ model.prepare_execution(sample_input)
 
 Models remain the sole owners of trainable parameters. Compiled callables are
 kept outside the registered layer tree, so enabling CINN does not add prefixes
-or other entries to checkpoint state keys. Loading a checkpoint invalidates the
-process-local runtime and lazily compiles a new one from the restored model.
+or other entries to checkpoint state keys. Paddle loads checkpoint values into
+the existing parameter objects, so an already compiled process-local runtime
+can consume restored weights without recompilation.
 
 ## Supported Property-Prediction Models
 
@@ -151,18 +152,21 @@ mode. Training warmup keeps the runtime differentiable; the first loss backward
 then exercises the compiled training path. Eval and Predictor warmup run under
 `no_grad`. Warmup restores RNG state, non-trainable parameters, and buffers, so
 compilation does not consume dropout randomness or commit BatchNorm
-running-stat updates.
+running-stat updates. The model owns this warmup state together with runtime
+invalidation; Trainer and Predictor do not keep a second lifecycle cache.
 
 Predictor passes the converted public input unchanged to warmup. PGL graph
-construction and model-specific discrete indexing remain in Python, while
-distance/angle/torsion calculations, basis functions, message passing,
-readout, losses, gradients, and optimizer updates stay in the Tensor/CINN
-portion where supported.
+construction and model-specific discrete indexing remain in Python. Packing
+tensorizes only the fields consumed by each core instead of every PGL
+feature. Distance/angle/torsion calculations, basis functions, message passing,
+and readout run in the CINN numerical core. Loss construction, backward
+invocation, and optimizer updates remain in the standard Paddle Trainer flow;
+gradients propagate through the compiled core.
 
 Checkpoint files contain the ordinary model and optimizer state only. Resume
-and Predictor loading therefore remain compatible with eager checkpoints, but
-each restored process compiles fresh train/eval callables from its first real
-input.
+and Predictor loading therefore remain compatible with eager checkpoints. A
+new process compiles train/eval callables from its first real input, while an
+existing compatible runtime observes newly loaded parameter and buffer values.
 
 ## Validation Levels
 
@@ -221,6 +225,14 @@ oracle. Forward behavior is covered for the zero-triplet case; gradient and
 Adam parity are covered on graphs containing valid triplets. Treat two-node
 zero-triplet training as unsupported on this validated version rather than
 inferring support from the forward test.
+
+SphereNet keeps its masked empty-triplet sentinel for CINN evaluation and
+prediction. During training, an entirely empty-triplet batch uses SphereNet's
+existing eager path because the static sentinel produces zero gradients for
+angle/torsion projection parameters that eager leaves unused. This preserves
+Adam state and subsequent update parity without changing the Trainer contract.
+If the first training batch has no triplets, lazy kernel compilation occurs on
+the first later batch that contains triplets.
 
 Short deterministic and real-data canaries establish workflow execution,
 checkpointing, and numerical sanity. They do not establish full-dataset

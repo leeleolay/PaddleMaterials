@@ -30,12 +30,11 @@ from ppmat.models import build_model
 from ppmat.models import build_model_from_name
 from ppmat.utils import logger
 from ppmat.utils import save_load
+from ppmat.utils.download import is_url
 from ppmat.utils.execution import configure_execution_backend
 from ppmat.utils.execution import ensure_execution_backend
-from ppmat.utils.execution import execution_mode
 from ppmat.utils.execution import prepare_execution
 from ppmat.utils.execution import validate_execution_backend
-from ppmat.utils.download import is_url
 from ppmat.vocab import build_vocab
 
 PathLike = Union[str, os.PathLike]
@@ -195,7 +194,6 @@ class BasePredictor:
             self.predict_config.get("execution_backend", None),
             owner="Predict",
         )
-        self._execution_prepared_modes = set()
         validate_execution_backend(
             self.model,
             self.execution_backend,
@@ -302,23 +300,15 @@ class BasePredictor:
         backend = getattr(self, "execution_backend", "eager")
         ensure_execution_backend(self.model, backend, owner="Predictor")
         if backend != "eager":
-            mode = execution_mode(self.model)
-            prepared_modes = getattr(self, "_execution_prepared_modes", None)
-            if prepared_modes is None:
-                prepared_modes = set()
-                self._execution_prepared_modes = prepared_modes
-            if mode not in prepared_modes:
-                # Prediction is always an evaluation workflow.  Keep the
-                # warmup out of autograd even when a model's hook performs the
-                # first compiled forward internally.
-                with paddle.no_grad():
-                    prepare_execution(
-                        self.model,
-                        backend,
-                        data,
-                        owner="Predictor",
-                    )
-                prepared_modes.add(mode)
+            # Prediction is always an evaluation workflow. The model owns
+            # warmup idempotency together with runtime invalidation.
+            with paddle.no_grad():
+                prepare_execution(
+                    self.model,
+                    backend,
+                    data,
+                    owner="Predictor",
+                )
         if self.eval_with_no_grad:
             with paddle.no_grad():
                 output = self.model.predict(data)

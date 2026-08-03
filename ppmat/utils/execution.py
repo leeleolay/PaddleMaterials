@@ -31,7 +31,6 @@ from __future__ import annotations
 from typing import Any
 from typing import Optional
 
-
 DEFAULT_EXECUTION_BACKEND = "eager"
 
 
@@ -63,9 +62,7 @@ def configure_execution_backend(
                 f"{owner}.execution_backend={configured_backend!r} was requested, "
                 "but the model does not implement set_execution_backend()."
             )
-        current_backend = getattr(
-            model, "execution_backend", DEFAULT_EXECUTION_BACKEND
-        )
+        current_backend = getattr(model, "execution_backend", DEFAULT_EXECUTION_BACKEND)
         if current_backend != DEFAULT_EXECUTION_BACKEND:
             raise ValueError(
                 f"{owner}.execution_backend='eager' was requested, but the model "
@@ -141,7 +138,8 @@ def prepare_execution(
 
     The sample is passed through unchanged.  This matters for models whose
     public input is a dict, tensor tuple, image batch, or graph object rather
-    than MEGNet's ``{"graph": ...}`` representation.
+    than MEGNet's ``{"graph": ...}`` representation.  The model owns runtime
+    invalidation and must make this hook idempotent for an already warmed mode.
     """
 
     if backend == DEFAULT_EXECUTION_BACKEND:

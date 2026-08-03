@@ -76,6 +76,20 @@ def _make_graphs() -> tuple[pgl.Graph, pgl.Graph]:
     return _make_graph(3), _make_graph(4, offset=0.1)
 
 
+def _make_single_node_graph() -> pgl.Graph:
+    node_feat = np.zeros([1, 92], dtype=np.float32)
+    node_feat[0, 1] = 1.0
+    return pgl.Graph(
+        np.zeros([3, 2], dtype=np.int64),
+        num_nodes=1,
+        node_feat={"node_feat": node_feat},
+        edge_feat={
+            "r": np.eye(3, dtype=np.float32),
+            "nei": np.tile(np.eye(3, dtype=np.float32)[None], [3, 1, 1]),
+        },
+    )
+
+
 def _make_model(execution_backend: str = "eager") -> iComformer:
     with paddle.utils.unique_name.guard():
         paddle.seed(2026)
@@ -115,6 +129,8 @@ def _assert_state_dict_close(actual, expected, atol=2e-6, rtol=2e-6):
 
 def test_graph_to_tensor_batch_packs_single_and_dynamic_batches():
     graph_a, graph_b = _make_graphs()
+    graph_a.node_feat["unused_metadata"] = np.asarray(["ignored"] * 3)
+    graph_b.node_feat["unused_metadata"] = np.asarray(["ignored"] * 4)
     single = graph_to_tensor_batch(graph_a)
     batch = graph_to_tensor_batch([graph_a, graph_b])
 
@@ -126,6 +142,11 @@ def test_graph_to_tensor_batch_packs_single_and_dynamic_batches():
     assert batch.edge_r.shape == [18, 3]
     assert batch.graph_node_count.numpy().tolist() == [3, 4]
     assert batch.node_graph_id.numpy().tolist() == [0, 0, 0, 1, 1, 1, 1]
+
+    tensor_graph = _make_graph(3).tensor(inplace=False)
+    tensor_packed = graph_to_tensor_batch(tensor_graph)
+    assert tensor_packed.node_feat is tensor_graph.node_feat["node_feat"]
+    assert tensor_packed.edge_r is tensor_graph.edge_feat["r"]
 
 
 def test_graph_to_tensor_batch_validates_required_features():
@@ -150,6 +171,43 @@ def test_tensor_core_matches_pgl_eager_for_dynamic_batches():
         expected = model._forward_eager({"graph": graph})
         actual = core(*graph_to_tensor_batch(graph))
         _assert_allclose(actual, expected)
+
+
+def test_tensor_core_matches_single_node_training_batch_norm():
+    reference = _make_model()
+    model = _make_model()
+    model.set_state_dict(reference.state_dict())
+    reference.train()
+    model.train()
+    core = ComformerTensorCore(model)
+    core.training = True
+
+    expected = reference._forward_eager({"graph": _make_single_node_graph()})
+    actual = core(*graph_to_tensor_batch(_make_single_node_graph()))
+
+    _assert_allclose(actual, expected)
+    _assert_allclose(model.att_layers[0].bn._mean, reference.att_layers[0].bn._mean)
+    _assert_allclose(
+        model.att_layers[0].bn._variance,
+        reference.att_layers[0].bn._variance,
+    )
+
+    expected.sum().backward()
+    actual.sum().backward()
+    reference_parameters = dict(reference.named_parameters())
+    actual_parameters = dict(model.named_parameters())
+    assert reference_parameters.keys() == actual_parameters.keys()
+    for name, reference_parameter in reference_parameters.items():
+        actual_parameter = actual_parameters[name]
+        if reference_parameter.grad is None:
+            assert actual_parameter.grad is None, name
+            continue
+        _assert_allclose(
+            actual_parameter.grad,
+            reference_parameter.grad,
+            atol=2e-5,
+            rtol=2e-5,
+        )
 
 
 def test_pir_static_core_supports_dynamic_node_edge_and_batch_sizes():
@@ -275,11 +333,13 @@ def test_gpu_cinn_backward_adam_and_dynamic_batch_parity():
     graph_sequence = (
         pgl.Graph.batch([graph_a, graph_b]),
         _make_graph(5, 0.2),
+        _make_single_node_graph(),
         pgl.Graph.batch([_make_graph(4, 0.3), _make_graph(3, 0.4)]),
     )
     target_sequence = (
         paddle.to_tensor([[0.25], [-0.75]], dtype="float32"),
         paddle.to_tensor([[0.5]], dtype="float32"),
+        paddle.to_tensor([[0.125]], dtype="float32"),
         paddle.to_tensor([[-0.25], [0.75]], dtype="float32"),
     )
 

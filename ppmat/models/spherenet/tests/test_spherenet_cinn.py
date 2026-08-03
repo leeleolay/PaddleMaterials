@@ -129,6 +129,8 @@ def _assert_gradients_close(reference_model, actual_model):
 
 def test_pack_pgl_graph_offsets_sequence_and_preserves_sources():
     graph_a, graph_b, _ = _make_graphs()
+    graph_a.node_feat["unused_metadata"] = np.asarray(["ignored"] * 4)
+    graph_b.node_feat["unused_metadata"] = np.asarray(["ignored"] * 5)
     original_a = np.asarray(graph_a.edge_feat["ti_idx_kj"]).copy()
     original_b = np.asarray(graph_b.edge_feat["ti_idx_kj"]).copy()
 
@@ -151,6 +153,10 @@ def test_pack_pgl_graph_offsets_sequence_and_preserves_sources():
     )
     np.testing.assert_array_equal(graph_a.edge_feat["ti_idx_kj"], original_a)
     np.testing.assert_array_equal(graph_b.edge_feat["ti_idx_kj"], original_b)
+
+    tensor_graph = _collate(_make_graphs()[:2])["graph"].tensor(inplace=False)
+    tensor_packed = graph_to_tensor_batch(tensor_graph)
+    assert tensor_packed.pos is tensor_graph.node_feat["pos"]
 
 
 def test_pack_pgl_graph_masks_empty_triplet_sentinel():
@@ -195,6 +201,55 @@ def test_tensor_core_matches_empty_triplet_eager_forward():
     actual = core(*graph_to_tensor_batch(graph))
 
     _assert_allclose(actual, expected)
+
+
+def test_public_cinn_training_preserves_empty_triplet_adam_semantics(monkeypatch):
+    graph, _, graph_no_triplets = _make_graphs()
+    reference_model = _make_model()
+    cinn_model = _make_model(execution_backend="cinn")
+    cinn_model.set_state_dict(reference_model.state_dict())
+    reference_model.train()
+    cinn_model.train()
+    runtime = SphereNetTensorCore(cinn_model)
+    runtime.train()
+    runtime_calls = []
+
+    def get_runtime():
+        runtime_calls.append(True)
+        return runtime
+
+    monkeypatch.setattr(cinn_model, "_get_cinn_runtime", get_runtime)
+    reference_optimizer = paddle.optimizer.Adam(
+        learning_rate=1e-3, parameters=reference_model.parameters()
+    )
+    cinn_optimizer = paddle.optimizer.Adam(
+        learning_rate=1e-3, parameters=cinn_model.parameters()
+    )
+    graph_sequence = (graph_no_triplets, graph, graph_no_triplets, graph)
+    target_sequence = (0.0, 0.25, -0.5, 0.75)
+
+    for step_graph, target in zip(graph_sequence, target_sequence):
+        data = {
+            "graph": step_graph,
+            "mu": paddle.to_tensor([[target]], dtype="float32"),
+        }
+        reference = reference_model(data)
+        actual = cinn_model(data)
+        reference["loss_dict"]["loss"].backward()
+        actual["loss_dict"]["loss"].backward()
+
+        _assert_allclose(actual["pred_dict"]["mu"], reference["pred_dict"]["mu"])
+        _assert_gradients_close(reference_model, cinn_model)
+        reference_optimizer.step()
+        cinn_optimizer.step()
+        for name, reference_parameter in reference_model.named_parameters():
+            _assert_allclose(
+                dict(cinn_model.named_parameters())[name], reference_parameter
+            )
+        reference_optimizer.clear_grad(set_to_zero=False)
+        cinn_optimizer.clear_grad(set_to_zero=False)
+
+    assert len(runtime_calls) == len(graph_sequence)
 
 
 def test_tensor_core_matches_eager_gradients_and_adam_step():
@@ -317,11 +372,11 @@ def test_public_backend_preserves_dict_and_checkpoint_contract(monkeypatch):
 
 
 def test_public_cinn_backend_fails_fast_on_cpu():
-    graph, _, _ = _make_graphs()
-    model = _make_model(execution_backend="cinn")
-
-    with pytest.raises(RuntimeError, match="requires"):
-        model({"graph": graph}, return_loss=False)
+    graph, _, graph_no_triplets = _make_graphs()
+    for test_graph in (graph, graph_no_triplets):
+        model = _make_model(execution_backend="cinn")
+        with pytest.raises(RuntimeError, match="requires"):
+            model({"graph": test_graph}, return_loss=False)
 
 
 def test_public_cinn_backend_rejects_force_training():
@@ -364,16 +419,12 @@ def test_dynamic_shape_cinn_training_matches_eager_adam_steps():
     if not paddle.base.is_compiled_with_cinn():
         pytest.skip("Paddle was not compiled with CINN.")
     paddle.set_device("gpu:0")
-    graph_a, graph_b, _ = _make_graphs()
+    graph_a, graph_b, graph_no_triplets = _make_graphs()
     reference_model = _make_model()
-    cinn_model = _make_model()
+    cinn_model = _make_model(execution_backend="cinn")
     cinn_model.set_state_dict(reference_model.state_dict())
     reference_model.train()
     cinn_model.train()
-    core = SphereNetTensorCore(cinn_model)
-    core.train()
-    compiled = compile_spherenet_cinn(core, full_graph=True)
-    compiled.train()
     reference_optimizer = paddle.optimizer.Adam(
         learning_rate=1e-3, parameters=reference_model.parameters()
     )
@@ -381,23 +432,26 @@ def test_dynamic_shape_cinn_training_matches_eager_adam_steps():
         learning_rate=1e-3, parameters=cinn_model.parameters()
     )
     graph_sequence = (
+        graph_no_triplets,
         _collate([graph_a, graph_b])["graph"],
         graph_a,
     )
     target_sequence = (
+        paddle.to_tensor([[0.0]], dtype="float32"),
         paddle.to_tensor([[0.25], [-0.75]], dtype="float32"),
         paddle.to_tensor([[0.5]], dtype="float32"),
     )
 
     for graph, target in zip(graph_sequence, target_sequence):
-        reference_output = reference_model._forward_eager({"graph": graph})[0]
-        cinn_output = compiled(*graph_to_tensor_batch(graph))
-        reference_loss = paddle.nn.functional.l1_loss(reference_output, target)
-        cinn_loss = paddle.nn.functional.l1_loss(cinn_output, target)
+        data = {"graph": graph, "mu": target}
+        reference = reference_model(data)
+        actual = cinn_model(data)
+        reference_loss = reference["loss_dict"]["loss"]
+        cinn_loss = actual["loss_dict"]["loss"]
         reference_loss.backward()
         cinn_loss.backward()
 
-        _assert_allclose(cinn_output, reference_output)
+        _assert_allclose(actual["pred_dict"]["mu"], reference["pred_dict"]["mu"])
         _assert_allclose(cinn_loss, reference_loss)
         _assert_gradients_close(reference_model, cinn_model)
         reference_optimizer.step()
@@ -406,5 +460,5 @@ def test_dynamic_shape_cinn_training_matches_eager_adam_steps():
             _assert_allclose(
                 dict(cinn_model.named_parameters())[name], reference_parameter
             )
-        reference_optimizer.clear_grad()
-        cinn_optimizer.clear_grad()
+        reference_optimizer.clear_grad(set_to_zero=False)
+        cinn_optimizer.clear_grad(set_to_zero=False)

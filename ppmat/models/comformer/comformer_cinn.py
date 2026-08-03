@@ -68,7 +68,7 @@ class ComformerGraphTensorBatch(NamedTuple):
 
 def _to_tensor(value, dtype: str) -> paddle.Tensor:
     if isinstance(value, paddle.Tensor):
-        if value.dtype != dtype:
+        if value.dtype != getattr(paddle, dtype):
             return paddle.cast(value, dtype)
         return value
     return paddle.to_tensor(np.asarray(value), dtype=dtype)
@@ -86,25 +86,24 @@ def graph_to_tensor_batch(
     if not isinstance(graph, pgl.Graph):
         raise TypeError(f"graph must be a pgl.Graph, got {type(graph)!r}.")
 
-    tensor_graph = graph.tensor(inplace=False)
-    edges = tensor_graph.edges
+    edges = _to_tensor(graph.edges, "int64")
     if len(edges.shape) != 2 or edges.shape[1] != 2:
         raise ValueError(f"graph.edges must have shape [E, 2], got {edges.shape}.")
     if edges.shape[0] == 0:
         raise ValueError("iComformer requires at least one edge in the graph batch.")
-    if "node_feat" not in tensor_graph.node_feat:
+    if "node_feat" not in graph.node_feat:
         raise ValueError("graph.node_feat['node_feat'] is required.")
-    if "r" not in tensor_graph.edge_feat:
+    if "r" not in graph.edge_feat:
         raise ValueError("graph.edge_feat['r'] is required.")
-    if "nei" not in tensor_graph.edge_feat:
+    if "nei" not in graph.edge_feat:
         raise ValueError("graph.edge_feat['nei'] is required.")
 
-    node_feat = _to_tensor(tensor_graph.node_feat["node_feat"], "float32")
-    edge_r = _to_tensor(tensor_graph.edge_feat["r"], "float32")
-    edge_nei = _to_tensor(tensor_graph.edge_feat["nei"], "float32")
+    node_feat = _to_tensor(graph.node_feat["node_feat"], "float32")
+    edge_r = _to_tensor(graph.edge_feat["r"], "float32")
+    edge_nei = _to_tensor(graph.edge_feat["nei"], "float32")
     edge_src = _to_tensor(edges[:, 0], "int64")
     edge_dst = _to_tensor(edges[:, 1], "int64")
-    node_graph_id = _to_tensor(tensor_graph.graph_node_id, "int64")
+    node_graph_id = _to_tensor(graph.graph_node_id, "int64")
 
     if len(node_feat.shape) != 2:
         raise ValueError(
@@ -183,15 +182,20 @@ def _batch_norm_1d(
         centered = values - mean
         variance = paddle.mean(centered * centered, axis=0)
         sample_count = paddle.cast(paddle.shape(values)[0], values.dtype)
+        has_multiple_samples = sample_count > 1.0
         correction = sample_count / paddle.clip(sample_count - 1.0, min=1.0)
         unbiased_variance = variance * correction
         momentum = layer._momentum
+        updated_mean = layer._mean * momentum + mean.detach() * (1.0 - momentum)
+        updated_variance = layer._variance * momentum + unbiased_variance.detach() * (
+            1.0 - momentum
+        )
         paddle.assign(
-            layer._mean * momentum + mean.detach() * (1.0 - momentum),
+            paddle.where(has_multiple_samples, updated_mean, layer._mean),
             output=layer._mean,
         )
         paddle.assign(
-            layer._variance * momentum + unbiased_variance.detach() * (1.0 - momentum),
+            paddle.where(has_multiple_samples, updated_variance, layer._variance),
             output=layer._variance,
         )
     else:
@@ -203,6 +207,8 @@ def _batch_norm_1d(
         output = output * layer.weight
     if layer.bias is not None:
         output = output + layer.bias
+    if layer.training:
+        output = paddle.where(has_multiple_samples, output, values)
     return output
 
 
@@ -215,7 +221,13 @@ def _linear_before_batch_norm(
 
     if batch_norm.training and linear.bias is not None:
         output = paddle.nn.functional.linear(values, linear.weight, bias=None)
-        return output + linear.bias.detach()
+        detached_bias = output + linear.bias.detach()
+        trainable_bias = output + linear.bias
+        return paddle.where(
+            paddle.shape(values)[0] > 1,
+            detached_bias,
+            trainable_bias,
+        )
     return linear(values)
 
 

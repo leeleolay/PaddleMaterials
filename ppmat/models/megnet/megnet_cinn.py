@@ -83,7 +83,7 @@ class GraphTensorBatch(NamedTuple):
 
 def _to_tensor(value, dtype: str) -> paddle.Tensor:
     if isinstance(value, paddle.Tensor):
-        if value.dtype != dtype:
+        if value.dtype != getattr(paddle, dtype):
             return paddle.cast(value, dtype)
         return value
     return paddle.to_tensor(np.asarray(value), dtype=dtype)
@@ -130,31 +130,30 @@ def graph_to_tensor_batch(
     if not isinstance(state_dim, int) or state_dim <= 0:
         raise ValueError(f"state_dim must be a positive integer, got {state_dim!r}.")
 
-    # Do not mutate the caller's graph.  This is also the point where NumPy PGL
-    # graphs are converted to tensors, outside the compiled model boundary.
-    tensor_graph = graph.tensor(inplace=False)
-    edges = tensor_graph.edges
+    # Tensorize only the fields consumed by the compiled core. PGL graphs may
+    # carry additional cached features that should remain on the host.
+    edges = _to_tensor(graph.edges, "int64")
     if len(edges.shape) != 2 or edges.shape[1] != 2:
         raise ValueError(f"graph.edges must have shape [E, 2], got {edges.shape}.")
     if edges.shape[0] == 0:
         raise ValueError("MEGNet requires at least one edge in the graph batch.")
-    if "atom_types" not in tensor_graph.node_feat:
+    if "atom_types" not in graph.node_feat:
         raise ValueError("graph.node_feat['atom_types'] is required.")
-    if "bond_dist" not in tensor_graph.edge_feat:
+    if "bond_dist" not in graph.edge_feat:
         raise ValueError("graph.edge_feat['bond_dist'] is required.")
 
-    atom_types = _to_tensor(tensor_graph.node_feat["atom_types"], "int64")
-    bond_dist = _to_tensor(tensor_graph.edge_feat["bond_dist"], "float32")
+    atom_types = _to_tensor(graph.node_feat["atom_types"], "int64")
+    bond_dist = _to_tensor(graph.edge_feat["bond_dist"], "float32")
     edge_src = _to_tensor(edges[:, 0], "int64")
     edge_dst = _to_tensor(edges[:, 1], "int64")
-    node_graph_id = _to_tensor(tensor_graph.graph_node_id, "int64")
-    edge_graph_id = _to_tensor(tensor_graph.graph_edge_id, "int64")
+    node_graph_id = _to_tensor(graph.graph_node_id, "int64")
+    edge_graph_id = _to_tensor(graph.graph_edge_id, "int64")
 
-    _, sorted_dst, sorted_eid = tensor_graph.sorted_edges(sort_by="dst")
+    _, sorted_dst, sorted_eid = graph.sorted_edges(sort_by="dst")
     node_sorted_dst = _to_tensor(sorted_dst, "int64")
     node_sorted_eid = _to_tensor(sorted_eid, "int64")
 
-    num_graphs = _scalar_int(tensor_graph.num_graph)
+    num_graphs = _scalar_int(graph.num_graph)
     if state_attr is None:
         state_attr = paddle.zeros([num_graphs, state_dim], dtype="float32")
     else:

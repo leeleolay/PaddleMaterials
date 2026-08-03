@@ -23,6 +23,7 @@ import pytest
 
 from ppmat.models.dimenetpp.dimenetpp import DimeNetPlusPlus
 from ppmat.models.dimenetpp.dimenetpp_cinn import DimeNetPPTensorCore
+from ppmat.models.dimenetpp.dimenetpp_cinn import _triplet_indices
 from ppmat.models.dimenetpp.dimenetpp_cinn import graph_to_tensor_batch
 from ppmat.models.dimenetpp.dimenetpp_cinn import pack_pgl_graph
 
@@ -111,6 +112,7 @@ def _assert_allclose(actual, expected, atol=1e-6, rtol=1e-6):
 def test_graph_to_tensor_batch_preserves_graph_and_triplet_contract():
     graph_a, graph_b = _make_graphs()
     graph = pgl.Graph.batch([graph_a, graph_b])
+    graph.node_feat["unused_metadata"] = np.asarray(["ignored"] * 7)
     packed = graph_to_tensor_batch(graph)
 
     assert not graph.is_tensor()
@@ -119,12 +121,30 @@ def test_graph_to_tensor_batch_preserves_graph_and_triplet_contract():
     np.testing.assert_array_equal(packed.node_graph_id.numpy(), [0, 0, 0, 1, 1, 1, 1])
     np.testing.assert_array_equal(packed.edge_graph_id.numpy(), [0] * 6 + [1] * 12)
 
+    del graph.node_feat["unused_metadata"]
     tensor_graph = graph.tensor(inplace=False)
+    tensor_packed = graph_to_tensor_batch(tensor_graph)
+    assert tensor_packed.atom_types is tensor_graph.node_feat["atom_types"]
+    assert tensor_packed.frac_coords is tensor_graph.node_feat["frac_coords"]
     eager_triplets = _make_model().triplets(
         tensor_graph.edges.T, num_nodes=tensor_graph.graph_node_id.shape[0]
     )
     np.testing.assert_array_equal(packed.idx_kj.numpy(), eager_triplets[-2].numpy())
     np.testing.assert_array_equal(packed.idx_ji.numpy(), eager_triplets[-1].numpy())
+
+
+def test_triplet_indices_preserve_eager_edge_order():
+    edges = np.asarray(
+        [[0, 1], [2, 0], [3, 0], [1, 2], [0, 2], [2, 1]],
+        dtype=np.int64,
+    )
+
+    idx_kj, idx_ji = _triplet_indices(edges)
+
+    np.testing.assert_array_equal(idx_kj, [1, 2, 3, 0, 2, 4])
+    np.testing.assert_array_equal(idx_ji, [0, 0, 1, 3, 4, 5])
+    empty_kj, empty_ji = _triplet_indices(np.empty([0, 2], dtype=np.int64))
+    assert empty_kj.shape == empty_ji.shape == (0,)
 
 
 @pytest.mark.parametrize("batch_size", [1, 2])
@@ -248,15 +268,16 @@ def test_public_backend_preserves_forward_predict_and_checkpoint_contract(monkey
     assert all(not key.startswith("model.") for key in model.state_dict())
 
 
-def test_set_state_dict_invalidates_cached_runtime():
+def test_set_state_dict_reuses_cached_runtime():
     model = _make_model()
-    object.__setattr__(model, "_cinn_runtimes", {"train": object()})
+    runtime = object()
+    object.__setattr__(model, "_cinn_runtimes", {"train": runtime})
     object.__setattr__(model, "_cinn_warmed_modes", {"train"})
 
     model.set_state_dict(model.state_dict())
 
-    assert model._cinn_runtimes == {}
-    assert model._cinn_warmed_modes == set()
+    assert model._cinn_runtimes == {"train": runtime}
+    assert model._cinn_warmed_modes == {"train"}
 
 
 def test_public_cinn_backend_fails_fast_on_cpu():

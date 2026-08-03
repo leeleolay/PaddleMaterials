@@ -101,6 +101,7 @@ def _assert_allclose(actual, expected, atol=1e-6, rtol=1e-6):
 def test_graph_to_tensor_batch_preserves_pgl_batch_contract():
     graph_a, graph_b = _make_graphs()
     graph = pgl.Graph.batch([graph_a, graph_b])
+    graph.node_feat["unused_metadata"] = np.asarray(["ignored"] * 5)
 
     packed = graph_to_tensor_batch(graph)
 
@@ -114,6 +115,11 @@ def test_graph_to_tensor_batch_preserves_pgl_batch_contract():
     np.testing.assert_array_equal(packed.edge_dst.numpy(), [1, 0, 2, 1, 2, 0, 4, 3])
     assert packed.state_attr.shape == [2, 2]
     np.testing.assert_array_equal(packed.state_attr.numpy(), np.zeros([2, 2]))
+
+    tensor_graph = pgl.Graph.batch(_make_graphs()).tensor(inplace=False)
+    tensor_packed = graph_to_tensor_batch(tensor_graph)
+    assert tensor_packed.atom_types is tensor_graph.node_feat["atom_types"]
+    assert tensor_packed.bond_dist is tensor_graph.edge_feat["bond_dist"]
 
 
 @pytest.mark.parametrize("batch_size", [1, 2])
@@ -318,11 +324,22 @@ def test_dynamic_shape_cinn_inference_matches_tensor_eager():
     compiled.eval()
 
     graph_a, graph_b = _make_graphs()
+    baseline = None
     for graph in (graph_a, pgl.Graph.batch([graph_a, graph_b])):
         packed = graph_to_tensor_batch(graph)
         expected = core(*packed)
         actual = compiled(*packed)
         _assert_allclose(actual, expected)
+        baseline = actual
+
+    state_dict = model.state_dict()
+    output_bias = "fc_out.layers.4.bias"
+    state_dict[output_bias] = state_dict[output_bias] + 1.0
+    model.set_state_dict(state_dict)
+    expected = core(*packed)
+    actual = compiled(*packed)
+    _assert_allclose(actual, expected)
+    assert not np.allclose(actual.numpy(), baseline.numpy())
 
 
 @pytest.mark.skipif(

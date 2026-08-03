@@ -59,7 +59,11 @@ class DimeNetPPTensorBatch(NamedTuple):
 
 def _to_tensor(value, dtype: str) -> paddle.Tensor:
     if isinstance(value, paddle.Tensor):
-        return value if value.dtype == dtype else paddle.cast(value, dtype)
+        return (
+            value
+            if value.dtype == getattr(paddle, dtype)
+            else paddle.cast(value, dtype)
+        )
     return paddle.to_tensor(np.asarray(value), dtype=dtype)
 
 
@@ -72,21 +76,28 @@ def _to_numpy(value) -> np.ndarray:
 def _triplet_indices(edges: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Match :meth:`DimeNetPlusPlus.triplets` without an E-by-E tensor."""
 
-    incoming_edges: dict[int, list[int]] = {}
-    for edge_id, (_, dst) in enumerate(edges):
-        incoming_edges.setdefault(int(dst), []).append(edge_id)
+    num_edges = edges.shape[0]
+    if num_edges == 0:
+        empty = np.empty([0], dtype=np.int64)
+        return empty, empty
+    num_nodes = int(edges.max()) + 1
+    incoming_order = np.argsort(edges[:, 1], kind="stable")
+    incoming_count = np.bincount(edges[:, 1], minlength=num_nodes)
+    incoming_start = np.cumsum(incoming_count) - incoming_count
 
-    idx_kj = []
-    idx_ji = []
-    for ji, (src, dst) in enumerate(edges):
-        for kj in incoming_edges.get(int(src), ()):
-            if int(edges[kj, 0]) != int(dst):
-                idx_kj.append(kj)
-                idx_ji.append(ji)
-    return (
-        np.asarray(idx_kj, dtype=np.int64),
-        np.asarray(idx_ji, dtype=np.int64),
+    candidate_count = incoming_count[edges[:, 0]]
+    idx_ji = np.repeat(np.arange(num_edges, dtype=np.int64), candidate_count)
+    candidate_start = np.cumsum(candidate_count) - candidate_count
+    candidate_offset = np.arange(idx_ji.shape[0], dtype=np.int64) - np.repeat(
+        candidate_start, candidate_count
     )
+    candidate_position = (
+        np.repeat(incoming_start[edges[:, 0]], candidate_count) + candidate_offset
+    )
+    idx_kj = incoming_order[candidate_position]
+
+    mask = edges[idx_kj, 0] != edges[idx_ji, 1]
+    return idx_kj[mask], idx_ji[mask]
 
 
 def graph_to_tensor_batch(
@@ -101,8 +112,8 @@ def graph_to_tensor_batch(
     if not isinstance(graph, pgl.Graph):
         raise TypeError(f"graph must be a pgl.Graph, got {type(graph)!r}.")
 
-    tensor_graph = graph.tensor(inplace=False)
-    edges = tensor_graph.edges
+    edges_numpy = _to_numpy(graph.edges).astype(np.int64, copy=False)
+    edges = _to_tensor(graph.edges, "int64")
     if len(edges.shape) != 2 or edges.shape[1] != 2:
         raise ValueError(f"graph.edges must have shape [E, 2], got {edges.shape}.")
     if edges.shape[0] == 0:
@@ -114,22 +125,21 @@ def graph_to_tensor_batch(
         "lattice",
     )
     for name in required_node_features:
-        if name not in tensor_graph.node_feat:
+        if name not in graph.node_feat:
             raise ValueError(f"graph.node_feat[{name!r}] is required.")
-    if "pbc_offset" not in tensor_graph.edge_feat:
+    if "pbc_offset" not in graph.edge_feat:
         raise ValueError("graph.edge_feat['pbc_offset'] is required.")
 
-    edges_numpy = _to_numpy(edges).astype(np.int64, copy=False)
     idx_kj, idx_ji = _triplet_indices(edges_numpy)
     return DimeNetPPTensorBatch(
-        atom_types=_to_tensor(tensor_graph.node_feat["atom_types"], "int64"),
-        frac_coords=_to_tensor(tensor_graph.node_feat["frac_coords"], "float32"),
-        lattice=_to_tensor(tensor_graph.node_feat["lattice"], "float32"),
+        atom_types=_to_tensor(graph.node_feat["atom_types"], "int64"),
+        frac_coords=_to_tensor(graph.node_feat["frac_coords"], "float32"),
+        lattice=_to_tensor(graph.node_feat["lattice"], "float32"),
         edge_src=_to_tensor(edges[:, 0], "int64"),
         edge_dst=_to_tensor(edges[:, 1], "int64"),
-        pbc_offset=_to_tensor(tensor_graph.edge_feat["pbc_offset"], "float32"),
-        node_graph_id=_to_tensor(tensor_graph.graph_node_id, "int64"),
-        edge_graph_id=_to_tensor(tensor_graph.graph_edge_id, "int64"),
+        pbc_offset=_to_tensor(graph.edge_feat["pbc_offset"], "float32"),
+        node_graph_id=_to_tensor(graph.graph_node_id, "int64"),
+        edge_graph_id=_to_tensor(graph.graph_edge_id, "int64"),
         idx_kj=_to_tensor(idx_kj, "int64"),
         idx_ji=_to_tensor(idx_ji, "int64"),
     )

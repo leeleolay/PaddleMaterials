@@ -484,7 +484,17 @@ class SphereNet(CINNExecutionMixin, paddle.nn.Layer):
             use_extra_node_feature=self.use_extra_node_feature,
             extra_node_feature_dim=self.extra_node_feature_dim,
         )
-        return self._get_cinn_runtime()(*packed), packed.pos
+        runtime = self._get_cinn_runtime()
+        triplet_indices = getattr(graph, "edge_feat", {}).get("ti_idx_kj")
+        if (
+            self.training
+            and triplet_indices is not None
+            and triplet_indices.shape[0] == 0
+        ):
+            # A masked static sentinel gives the angle/torsion projections zero
+            # gradients for parameters that eager leaves unused, changing Adam state.
+            return self._forward_eager(data)
+        return runtime(*packed), packed.pos
 
     def prepare_cinn(self, sample_batch=None):
         """Backward-compatible alias for :meth:`prepare_execution`."""

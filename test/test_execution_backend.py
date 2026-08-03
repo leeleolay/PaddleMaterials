@@ -41,12 +41,15 @@ class _HookedModel(paddle.nn.Layer):
         super().__init__()
         self.linear = paddle.nn.Linear(1, 1)
         self.execution_backend = "eager"
+        self.prepared_modes = set()
         self.prepare_calls = []
         self.predict_calls = []
 
     def set_execution_backend(self, backend):
         if backend not in {"eager", "cinn"}:
             raise ValueError(backend)
+        if backend != self.execution_backend:
+            self.prepared_modes.clear()
         self.execution_backend = backend
 
     def validate_execution_backend(self):
@@ -54,7 +57,11 @@ class _HookedModel(paddle.nn.Layer):
             raise AssertionError("validation should only be used for CINN")
 
     def prepare_execution(self, sample):
+        mode = "train" if self.training else "eval"
+        if mode in self.prepared_modes:
+            return
         self.prepare_calls.append((sample, paddle.is_grad_enabled(), self.training))
+        self.prepared_modes.add(mode)
 
     def forward(self, batch, return_loss=True, return_prediction=True):
         prediction = self.linear(batch["x"])
@@ -115,13 +122,13 @@ def test_execution_backend_protocol_is_generic_for_trainer_and_predictor(tmp_pat
         (True, True),
         (False, False),
     ]
-    assert trainer._execution_prepared_modes == {"train", "eval"}
+    assert model.prepared_modes == {"train", "eval"}
 
     predictor = BasePredictor()
-    predictor.model = model
+    predictor.model = _HookedModel()
+    predictor.model.set_execution_backend("cinn")
     predictor.model.eval()
     predictor.execution_backend = "cinn"
-    predictor._execution_prepared_modes = set()
     predictor.eval_with_no_grad = True
     predictor.post_transforms = None
     sample = {"x": paddle.to_tensor([[3.0]])}
@@ -129,10 +136,16 @@ def test_execution_backend_protocol_is_generic_for_trainer_and_predictor(tmp_pat
     predictor._run_model(sample)
 
     # The predictor receives the exact public input and warms only once.
-    assert len(model.prepare_calls) == 3
-    assert model.prepare_calls[-1][0] is sample
-    assert model.prepare_calls[-1][1:] == (False, False)
-    assert model.predict_calls == [sample, sample]
+    assert len(predictor.model.prepare_calls) == 1
+    assert predictor.model.prepare_calls[0][0] is sample
+    assert predictor.model.prepare_calls[0][1:] == (False, False)
+    assert predictor.model.predict_calls == [sample, sample]
+
+    # Runtime invalidation belongs to the model. The workflow must delegate
+    # again instead of retaining an independent prepared-mode cache.
+    predictor.model.prepared_modes.clear()
+    predictor._run_model(sample)
+    assert len(predictor.model.prepare_calls) == 2
 
 
 def test_zero_frequencies_do_not_use_modulo_or_run_evaluation(tmp_path, monkeypatch):
@@ -241,3 +254,54 @@ def test_cinn_warmup_preserves_non_trainable_model_state():
     for name in before:
         np.testing.assert_allclose(before[name].numpy(), after[name].numpy())
     assert model._cinn_warmed_modes == {"train"}
+
+
+def test_cinn_runtime_is_validated_and_compiled_once_per_mode():
+    class RuntimeModel(CINNExecutionMixin, paddle.nn.Layer):
+        def __init__(self):
+            super().__init__()
+            self.linear = paddle.nn.Linear(1, 1)
+            self.validation_count = 0
+            self.compile_modes = []
+            self._init_cinn_execution("cinn")
+
+        def _validate_cinn_environment(self):
+            self.validation_count += 1
+
+        def _compile_cinn_runtime(self):
+            self.compile_modes.append("train" if self.training else "eval")
+            model = self
+
+            class Runtime:
+                training = True
+
+                def __call__(self, value):
+                    return model.linear(value)
+
+            return Runtime()
+
+    model = RuntimeModel()
+    model.train()
+    train_runtime = model._get_cinn_runtime()
+    assert model._get_cinn_runtime() is train_runtime
+
+    model.eval()
+    eval_runtime = model._get_cinn_runtime()
+    assert model._get_cinn_runtime() is eval_runtime
+
+    model.train()
+    assert model._get_cinn_runtime() is train_runtime
+    assert train_runtime is not eval_runtime
+    assert model.validation_count == 2
+    assert model.compile_modes == ["train", "eval"]
+
+    object.__setattr__(model, "_cinn_warmed_modes", {"train", "eval"})
+    state_dict = model.state_dict()
+    state_dict["linear.weight"] = paddle.full_like(state_dict["linear.weight"], 2.0)
+    state_dict["linear.bias"] = paddle.full_like(state_dict["linear.bias"], 1.0)
+    model.set_state_dict(state_dict)
+
+    assert model._get_cinn_runtime() is train_runtime
+    assert model._cinn_warmed_modes == {"train", "eval"}
+    actual = train_runtime(paddle.to_tensor([[3.0]], dtype="float32"))
+    np.testing.assert_allclose(actual.numpy(), [[7.0]])

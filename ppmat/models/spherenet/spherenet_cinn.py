@@ -78,7 +78,11 @@ class SphereNetTensorBatch(NamedTuple):
 
 def _to_tensor(value, dtype: str) -> paddle.Tensor:
     if isinstance(value, paddle.Tensor):
-        return value if value.dtype == dtype else paddle.cast(value, dtype)
+        return (
+            value
+            if value.dtype == getattr(paddle, dtype)
+            else paddle.cast(value, dtype)
+        )
     return paddle.to_tensor(np.asarray(value), dtype=dtype)
 
 
@@ -207,23 +211,20 @@ def graph_to_tensor_batch(
             f"got {extra_node_feature_dim!r}."
         )
 
-    tensor_graph = graph.tensor(inplace=False)
-    edges = tensor_graph.edges
+    edges = _to_tensor(graph.edges, "int64")
     if len(edges.shape) != 2 or edges.shape[1] != 2:
         raise ValueError(f"graph.edges must have shape [E, 2], got {edges.shape}.")
     if edges.shape[0] == 0:
         raise ValueError("SphereNet requires at least one edge in the graph batch.")
     for key in ("atomic_number", "pos"):
-        if key not in tensor_graph.node_feat:
+        if key not in graph.node_feat:
             raise ValueError(f"graph.node_feat[{key!r}] is required.")
     for key in ("ti_idx_kj", "ti_idx_ji"):
-        if key not in tensor_graph.edge_feat:
+        if key not in graph.edge_feat:
             raise ValueError(f"graph.edge_feat[{key!r}] is required.")
 
-    atomic_number = _to_tensor(
-        tensor_graph.node_feat["atomic_number"], "int64"
-    ).reshape([-1])
-    pos = _to_tensor(tensor_graph.node_feat["pos"], "float32")
+    atomic_number = _to_tensor(graph.node_feat["atomic_number"], "int64").reshape([-1])
+    pos = _to_tensor(graph.node_feat["pos"], "float32")
     if len(pos.shape) != 2 or pos.shape[1] != 3:
         raise ValueError(
             f"graph.node_feat['pos'] must have shape [N, 3], got {pos.shape}."
@@ -233,9 +234,9 @@ def graph_to_tensor_batch(
 
     edge_src = _to_tensor(edges[:, 0], "int64")
     edge_dst = _to_tensor(edges[:, 1], "int64")
-    node_graph_id = _to_tensor(tensor_graph.graph_node_id, "int64")
-    idx_kj = _to_tensor(tensor_graph.edge_feat["ti_idx_kj"], "int64").reshape([-1])
-    idx_ji = _to_tensor(tensor_graph.edge_feat["ti_idx_ji"], "int64").reshape([-1])
+    node_graph_id = _to_tensor(graph.graph_node_id, "int64")
+    idx_kj = _to_tensor(graph.edge_feat["ti_idx_kj"], "int64").reshape([-1])
+    idx_ji = _to_tensor(graph.edge_feat["ti_idx_ji"], "int64").reshape([-1])
     if idx_kj.shape[0] != idx_ji.shape[0]:
         raise ValueError("ti_idx_kj and ti_idx_ji must have equal length.")
 
@@ -253,12 +254,12 @@ def graph_to_tensor_batch(
         triplet_mask = paddle.ones([idx_kj.shape[0], 1], dtype="float32")
 
     if use_extra_node_feature:
-        if "node_feature" not in tensor_graph.node_feat:
+        if "node_feature" not in graph.node_feat:
             raise ValueError(
                 "SphereNet use_extra_node_feature=True requires "
                 "graph.node_feat['node_feature']."
             )
-        node_feature = _to_tensor(tensor_graph.node_feat["node_feature"], "float32")
+        node_feature = _to_tensor(graph.node_feat["node_feature"], "float32")
         expected_shape = [pos.shape[0], extra_node_feature_dim]
         if list(node_feature.shape) != expected_shape:
             raise ValueError(
@@ -270,9 +271,7 @@ def graph_to_tensor_batch(
             [pos.shape[0], extra_node_feature_dim], dtype="float32"
         )
 
-    graph_template = paddle.zeros(
-        [_scalar_int(tensor_graph.num_graph), 1], dtype="float32"
-    )
+    graph_template = paddle.zeros([_scalar_int(graph.num_graph), 1], dtype="float32")
     return SphereNetTensorBatch(
         atomic_number=atomic_number,
         pos=pos,

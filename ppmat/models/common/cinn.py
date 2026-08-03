@@ -105,10 +105,10 @@ class CINNExecutionMixin:
         raise NotImplementedError
 
     def _get_cinn_runtime(self):
-        self._validate_cinn_environment()
         mode = "train" if self.training else "eval"
         runtime = self._cinn_runtimes.get(mode)
         if runtime is None:
+            self._validate_cinn_environment()
             runtime = self._compile_cinn_runtime()
             runtime.training = self.training
             self._cinn_runtimes[mode] = runtime
@@ -178,14 +178,6 @@ class CINNExecutionMixin:
             if cuda_rng_state is not None:
                 paddle.set_cuda_rng_state(cuda_rng_state)
         self._cinn_warmed_modes.add(mode)
-
-    def set_state_dict(self, state_dict, use_structured_name=True):
-        result = super().set_state_dict(
-            state_dict,
-            use_structured_name=use_structured_name,
-        )
-        self.invalidate_cinn_runtime()
-        return result
 
 
 __all__ = ["CINNExecutionMixin"]
