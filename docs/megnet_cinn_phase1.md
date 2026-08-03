@@ -5,7 +5,8 @@
 Phase 1 establishes an inference-oriented, Tensor-only CINN path for the
 existing `MEGNetPlus` model. It does not change the public model, dataset,
 collator, trainer, predictor, checkpoint format, or PGL graph-construction
-semantics.
+semantics. A synthetic training canary validates CINN backward and optimizer
+parity without claiming end-to-end Trainer support.
 
 Baseline and validation environment:
 
@@ -105,6 +106,8 @@ The default focused suite checks:
 - dynamic `N`, `E`, and `B` through PIR with `backend=None`;
 - `paddle.jit.save` and `paddle.jit.load` parity.
 
+The GPU-only CINN tests are opt-in because first compilation is expensive.
+
 Run:
 
 ```bash
@@ -115,7 +118,7 @@ Run:
 Result on Paddle 3.3.1:
 
 ```text
-11 passed, 1 skipped
+11 passed, 2 skipped
 ```
 
 The opt-in GPU smoke test compiles one dynamic CINN program and executes both a
@@ -130,7 +133,7 @@ PPMAT_RUN_CINN_TESTS=1 "$PADDLE331/bin/python" -m pytest \
 Result on Paddle 3.3.1:
 
 ```text
-1 passed, 11 deselected, 5 warnings in 94.83s
+1 passed, 12 deselected, 5 warnings in 94.83s
 ```
 
 Both graph shapes match Tensor eager execution within `atol=1e-6` and
@@ -138,12 +141,38 @@ Both graph shapes match Tensor eager execution within `atol=1e-6` and
 lazy compilation. Paddle emitted non-fatal RNN shape-cache and pattern-rewrite
 warnings. No steady-state performance claim is made in phase 1.
 
+## Training Canary
+
+The opt-in training canary compares Tensor eager and CINN from identical
+weights. It executes three batches with graph batch sizes `2 -> 1 -> 2`, using
+MSE loss and the production Adam settings (`beta1=0.9`, `beta2=0.999`, learning
+rate `1e-3`). Every step compares predictions, loss, all parameter gradients,
+and post-update parameters.
+
+```bash
+PPMAT_RUN_CINN_TRAINING_TESTS=1 "$PADDLE331/bin/python" -m pytest \
+  ppmat/models/megnet/tests/test_megnet_cinn.py \
+  -k dynamic_shape_cinn_training -q
+```
+
+Result on Paddle 3.3.1:
+
+```text
+1 passed, 12 deselected, 6 warnings in 180.54s
+```
+
+All three steps pass with `atol=2e-6` and `rtol=2e-6`. A direct first-step
+probe measured forward and loss error `0.0`, maximum parameter-gradient error
+`9.31e-10`, and post-SGD parameter error `0.0`. That direct SGD probe is kept as
+an independent optimizer sanity check; the formal three-step canary uses Adam.
+
 ## Follow-up Phases
 
 Phase 2 should add an opt-in predictor/config integration, cache or export the
 compiled inference program, measure warm and steady-state latency, and validate
 representative MP-2018 graph-size distributions.
 
-Phase 3 should validate CINN backward/optimizer parity before enabling compiled
-training. Eager backward parity alone is not evidence that CINN training is
-supported.
+Phase 3 should integrate the Tensor core with the public Trainer contract and
+validate real-dataset loading, checkpoint/resume, a longer fixed-seed curve,
+and final metrics. AMP, distributed training, schedulers, and production-sized
+MEGNet configurations remain untested.

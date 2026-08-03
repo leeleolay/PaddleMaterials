@@ -325,6 +325,106 @@ def test_dynamic_shape_cinn_inference_matches_tensor_eager():
         _assert_allclose(actual, expected)
 
 
+@pytest.mark.skipif(
+    os.environ.get("PPMAT_RUN_CINN_TRAINING_TESTS") != "1",
+    reason=(
+        "Set PPMAT_RUN_CINN_TRAINING_TESTS=1 to run the GPU CINN training "
+        "canary."
+    ),
+)
+def test_dynamic_shape_cinn_training_matches_tensor_eager():
+    if not paddle.is_compiled_with_cuda():
+        pytest.skip("Paddle was not compiled with CUDA.")
+    if not paddle.base.is_compiled_with_cinn():
+        pytest.skip("Paddle was not compiled with CINN.")
+
+    paddle.set_device("gpu:0")
+    reference_model = _make_model()
+    cinn_model = _make_model()
+    cinn_model.set_state_dict(reference_model.state_dict())
+    reference_core = MEGNetTensorCore(reference_model)
+    cinn_core = MEGNetTensorCore(cinn_model)
+    reference_core.train()
+    cinn_core.train()
+    compiled = compile_megnet_cinn(cinn_core, full_graph=True)
+    compiled.train()
+
+    reference_optimizer = paddle.optimizer.Adam(
+        learning_rate=1e-3,
+        beta1=0.9,
+        beta2=0.999,
+        parameters=reference_model.parameters(),
+    )
+    cinn_optimizer = paddle.optimizer.Adam(
+        learning_rate=1e-3,
+        beta1=0.9,
+        beta2=0.999,
+        parameters=cinn_model.parameters(),
+    )
+    graph_a, graph_b = _make_graphs()
+    graph_sequence = (
+        pgl.Graph.batch([graph_a, graph_b]),
+        graph_a,
+        pgl.Graph.batch(_make_graphs()),
+    )
+    target_sequence = (
+        paddle.to_tensor([[0.25], [-0.75]], dtype="float32"),
+        paddle.to_tensor([[0.5]], dtype="float32"),
+        paddle.to_tensor([[-0.25], [0.75]], dtype="float32"),
+    )
+    reference_losses = []
+    cinn_losses = []
+
+    for graph, target in zip(graph_sequence, target_sequence):
+        reference_batch = graph_to_tensor_batch(graph)
+        cinn_batch = graph_to_tensor_batch(graph)
+        reference_output = reference_core(*reference_batch)
+        cinn_output = compiled(*cinn_batch)
+        reference_loss = paddle.nn.functional.mse_loss(reference_output, target)
+        cinn_loss = paddle.nn.functional.mse_loss(cinn_output, target)
+        reference_loss.backward()
+        cinn_loss.backward()
+
+        _assert_allclose(cinn_output, reference_output, atol=2e-6, rtol=2e-6)
+        _assert_allclose(cinn_loss, reference_loss, atol=2e-6, rtol=2e-6)
+        reference_losses.append(float(reference_loss))
+        cinn_losses.append(float(cinn_loss))
+
+        reference_parameters = dict(reference_model.named_parameters())
+        cinn_parameters = dict(cinn_model.named_parameters())
+        assert reference_parameters.keys() == cinn_parameters.keys()
+        for name, reference_parameter in reference_parameters.items():
+            cinn_parameter = cinn_parameters[name]
+            if reference_parameter.grad is None:
+                assert cinn_parameter.grad is None
+                continue
+            _assert_allclose(
+                cinn_parameter.grad,
+                reference_parameter.grad,
+                atol=2e-6,
+                rtol=2e-6,
+            )
+
+        reference_optimizer.step()
+        cinn_optimizer.step()
+        for name, reference_parameter in reference_parameters.items():
+            _assert_allclose(
+                cinn_parameters[name],
+                reference_parameter,
+                atol=2e-6,
+                rtol=2e-6,
+            )
+        reference_optimizer.clear_grad()
+        cinn_optimizer.clear_grad()
+
+    np.testing.assert_allclose(
+        cinn_losses,
+        reference_losses,
+        atol=2e-6,
+        rtol=2e-6,
+    )
+
+
 def test_graph_to_tensor_batch_validates_required_features():
     graph = pgl.Graph(
         np.asarray([[0, 1], [1, 0]], dtype=np.int64),
