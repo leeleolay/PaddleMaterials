@@ -30,6 +30,11 @@ from ppmat.models import build_model
 from ppmat.models import build_model_from_name
 from ppmat.utils import logger
 from ppmat.utils import save_load
+from ppmat.utils.execution import configure_execution_backend
+from ppmat.utils.execution import ensure_execution_backend
+from ppmat.utils.execution import execution_mode
+from ppmat.utils.execution import prepare_execution
+from ppmat.utils.execution import validate_execution_backend
 from ppmat.utils.download import is_url
 from ppmat.vocab import build_vocab
 
@@ -135,7 +140,10 @@ class BasePredictor:
             else:
                 logger.info("No interface, use the model directly")
             vocab = build_vocab(config.get("Vocabulary"))
-            model = build_model(model_config, vocab=vocab)
+            if vocab is None:
+                model = build_model(model_config)
+            else:
+                model = build_model(model_config, vocab=vocab)
             save_load.load_pretrain(model, checkpoint_path)
         else:
             if self.config_path is not None or self.checkpoint_path is not None:
@@ -181,9 +189,23 @@ class BasePredictor:
         self.config = config
         self.vocab = build_vocab(config.get("Vocabulary"))
 
+        self.predict_config = config.get("Predict") or {}
+        self.execution_backend = configure_execution_backend(
+            self.model,
+            self.predict_config.get("execution_backend", None),
+            owner="Predict",
+        )
+        self._execution_prepared_modes = set()
+        validate_execution_backend(
+            self.model,
+            self.execution_backend,
+            world_size=paddle.distributed.get_world_size(),
+            owner="Predictor",
+        )
+        # Backend selection may create or replace runtime layers.  Apply eval
+        # mode after that hook so every adapter sees the predictor's contract.
         self.model.eval()
 
-        self.predict_config = config.get("Predict") or {}
         self.eval_with_no_grad = self.predict_config.get("eval_with_no_grad", True)
 
         self.graph_converter_fn = None
@@ -277,6 +299,26 @@ class BasePredictor:
         return self.post_transforms(data)
 
     def _run_model(self, data):
+        backend = getattr(self, "execution_backend", "eager")
+        ensure_execution_backend(self.model, backend, owner="Predictor")
+        if backend != "eager":
+            mode = execution_mode(self.model)
+            prepared_modes = getattr(self, "_execution_prepared_modes", None)
+            if prepared_modes is None:
+                prepared_modes = set()
+                self._execution_prepared_modes = prepared_modes
+            if mode not in prepared_modes:
+                # Prediction is always an evaluation workflow.  Keep the
+                # warmup out of autograd even when a model's hook performs the
+                # first compiled forward internally.
+                with paddle.no_grad():
+                    prepare_execution(
+                        self.model,
+                        backend,
+                        data,
+                        owner="Predictor",
+                    )
+                prepared_modes.add(mode)
         if self.eval_with_no_grad:
             with paddle.no_grad():
                 output = self.model.predict(data)

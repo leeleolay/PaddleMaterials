@@ -1,12 +1,29 @@
-# MEGNet CINN Phase 1
+# MEGNet CINN Adapter
 
 ## Scope
 
-Phase 1 establishes an inference-oriented, Tensor-only CINN path for the
-existing `MEGNetPlus` model. It does not change the public model, dataset,
-collator, trainer, predictor, checkpoint format, or PGL graph-construction
-semantics. A synthetic training canary validates CINN backward and optimizer
-parity without claiming end-to-end Trainer support.
+The shared end-to-end contract is documented in
+[`docs/cinn_end_to_end.md`](cinn_end_to_end.md). This document records the
+MEGNet adapter that implements that contract; it is deliberately lower priority
+than the public Trainer/Predictor runtime. `MEGNetPlus` remains the public model
+and the sole checkpoint/optimizer owner; its `forward(batch_dict)` and
+`predict(graphs)` contracts select either the existing eager path or the
+validated CINN Tensor core through `execution_backend`. PGL graph construction,
+batching, metrics, logging, and checkpoint management remain in the dynamic
+Python boundary.
+
+The Tensor-only APIs are retained as low-level diagnostics and are not the
+primary Trainer or Predictor interface. The public workflow has priority:
+
+```text
+DataLoader/Predictor -> PGL graph or dict batch -> MEGNetPlus public API
+                     -> dynamic PGL-to-Tensor packing -> CINN numerical core
+                     -> loss/prediction dict -> Trainer/Predictor/checkpoint
+```
+
+`execution_backend="cinn"` is supported on PaddlePaddle 3.3.1 CUDA builds
+with world size 1 and AMP disabled. AMP, distributed CINN, and persistent
+compiled-program export are intentionally not claimed yet.
 
 Baseline and validation environment:
 
@@ -50,10 +67,31 @@ node_sorted_dst[E]  int64
 state_attr[B, D]    float32 (D=2 by default)
 ```
 
-`MEGNetTensorCore` wraps the original `MEGNetPlus` layer, so a checkpoint can be
-loaded into `MEGNetPlus` before wrapping without parameter conversion. It
-replaces graph-object methods with Tensor gather/scatter operations and returns
-the same normalized prediction shape `[B, 1]`.
+`MEGNetTensorCore` is an internal numerical layer. A `MEGNetPlus` instance owns
+the core's parameters and keeps compiled runtimes in non-registered runtime
+storage, so its state keys remain compatible with ordinary eager checkpoints
+(there is no `model.` prefix). The public model packs PGL graphs immediately
+before calling the core and adapts its normalized output into the standard
+`loss_dict`/`pred_dict` contract.
+
+Training and inference use the same backend selection:
+
+```yaml
+Trainer:
+  execution_backend: cinn
+Predict:
+  execution_backend: cinn
+```
+
+The workflow-level setting is preferred. A model-level default remains
+available for direct `MEGNetPlus` calls, but is not required by Trainer or
+Predictor.
+
+`BaseTrainer` warms the first real collated batch after pretrained/resume
+weights are loaded, and `BasePredictor` warms the first converted graph. The
+compiled object is deliberately not serialized; loading a checkpoint creates a
+fresh runtime for the restored parameters. Train/eval runtimes are kept
+separate because dropout and static graph mode are mode-dependent.
 
 Paddle 3.3.1 still cannot infer CINN symbolic shapes for these graph reduction
 operators:
@@ -73,6 +111,27 @@ This preserves the original per-segment maximum shift without lowering to the
 unsupported `segment_pool(MAX)` operation.
 
 ## Usage
+
+The normal public workflow is unchanged apart from the optional backend flag:
+
+```bash
+PYTHONPATH=/path/to/PaddleMaterials \
+python property_prediction/train.py \
+  -c property_prediction/configs/megnet/megnet_mp2018_train_60k_e_form.yaml \
+  Trainer.execution_backend=cinn
+
+PYTHONPATH=/path/to/PaddleMaterials \
+python property_prediction/predict.py \
+  --config_path /path/to/resolved.yaml \
+  --checkpoint_path /path/to/checkpoints/best.pdparams \
+  --device gpu:0 \
+  --cif_file_path property_prediction/example_data/cifs/mp-18767-LiMnO2.cif \
+  Predict.execution_backend=cinn
+```
+
+When developing from an additional git worktree, set `PYTHONPATH` (or install
+that worktree editable) so the script does not import a different checkout.
+The low-level Tensor API remains useful for compiler diagnostics:
 
 ```python
 from ppmat.models.megnet.megnet_cinn import compile_megnet_cinn
@@ -211,14 +270,80 @@ resolved CLI configurations are preserved beside each run as YAML, while a
 fresh checkout must regenerate the two subsets using the selection rule and
 source/archive hashes above before repeating the smoke.
 
-## Follow-up Phases
+## End-to-End Workflow Verification
 
-Phase 2 should add an opt-in predictor/config integration, cache or export the
-compiled inference program, measure warm and steady-state latency, and validate
-representative MP-2018 graph-size distributions.
+The focused public-contract suite covers backend selection, eager/CINN output
+adaptation, CPU fail-fast behavior, non-default state dimensions, checkpoint
+key compatibility, Trainer mode switching and Adam resume, plus single- and
+batch-Predictor calls. The generic hook protocol is covered separately by
+`test/test_execution_backend.py`:
 
-Phase 3 should integrate the Tensor core with the public Trainer contract and
-validate a longer fixed-seed curve and final metrics. The MP2018 smoke above
-validates the existing eager Trainer and a separate Tensor-only CINN training
-harness; it is not end-to-end CINN Trainer support. AMP, distributed training,
-and production schedules remain untested.
+```bash
+PADDLE331=/tmp/ppmat-paddle331
+"$PADDLE331/bin/python" -m pytest \
+  test/test_execution_backend.py \
+  ppmat/models/megnet/tests/test_megnet_cinn.py \
+  ppmat/models/megnet/tests/test_megnet_cinn_workflows.py \
+  test/test_predictor.py -q
+```
+
+Result on Paddle 3.3.1: `35 passed, 3 skipped`.
+
+The opt-in GPU workflow test exercises BaseTrainer, `epoch_1/latest/best`
+checkpoint creation, a restored Predictor, and CIF graph conversion in one
+process:
+
+```bash
+PPMAT_RUN_CINN_WORKFLOW_TESTS=1 \
+  "$PADDLE331/bin/python" -m pytest \
+  ppmat/models/megnet/tests/test_megnet_cinn_workflows.py \
+  -k gpu_cinn_trainer_checkpoint_and_property_predictor -q
+```
+
+It passed on PaddlePaddle 3.3.1/CUDA 12.6. The small production-shaped model
+took about 175 seconds including first compilation; steady-state train/eval
+steps were below one second.
+
+The real MP2018 entry point was also run from this worktree with the official
+downloaded/cache-backed smoke subset (8 train and 4 validation structures):
+
+```bash
+PYTHONPATH=/path/to/PaddleMaterials \
+python property_prediction/train.py \
+  -c output/reproduction/megnet/mp2018/trainer_eager_t_20260803_024600_s_42/megnet_mp2018_train_60k_e_form.yaml \
+  Trainer.execution_backend=cinn Model.__init_params__.execution_backend=cinn \
+  Trainer.max_iter=2 Trainer.output_dir=output/reproduction/megnet/mp2018/trainer_cinn_entry \
+  Dataset.train.num_workers=0 Dataset.val.num_workers=0
+```
+
+The run completed two CINN optimizer steps (`1.529762`, `3.021938`), produced
+`epoch_1/latest/best`, and reached validation MAE `0.841166 eV/atom`. Resuming
+`latest` in a fresh process completed the third global step and validation
+(`global_step 2 -> 3`); the restored `.pdopt` contains Adam moments and beta
+powers. A subsequent `property_prediction/predict.py` invocation loaded the
+same `best.pdparams` and predicted `-1.7361407` for
+`mp-18767-LiMnO2.cif`, identical to the eager prediction to float32 precision.
+
+The first production configuration compile was roughly three minutes and is
+startup cost, not steady-state throughput. CINN emitted non-fatal RNN dynamic
+shape and pattern-rewrite warnings during compilation.
+
+After extracting the shared execution-backend contract, a fresh one-step
+MP2018 revalidation completed with training loss `2.024862`, validation MAE
+`0.830173 eV/atom`, and `epoch_1/latest/best` checkpoints. A fresh public
+Predictor process loaded `best.pdparams` and produced `-1.7477959` for the same
+LiMnO2 CIF. These values are smoke evidence for the runtime workflow, not a
+full-schedule accuracy claim.
+
+## Adapter Follow-up
+
+The public Trainer and Predictor integration is covered by the shared runtime
+contract. Remaining adapter work is deliberately separate:
+
+1. Validate AMP and distributed execution in the shared runtime instead of
+   enabling them implicitly.
+2. Add an explicit compiled-runtime cache/export format if startup latency
+   justifies the persistence and invalidation complexity.
+3. Measure representative graph-size distributions and throughput after
+   numerical parity is maintained.
+4. Run longer fixed-seed curves and full production schedules.

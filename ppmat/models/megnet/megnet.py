@@ -14,8 +14,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import math
 from collections.abc import Sequence
+from typing import Any
 from typing import Callable
 from typing import Literal
 from typing import Optional
@@ -679,6 +681,11 @@ class MEGNetPlus(paddle.nn.Layer):
         data_mean (float, optional): Mean of the training data. Defaults to 0.0.
         data_std (float, optional): Standard deviation of the training data. Defaults
             to 1.0.
+        execution_backend (str, optional): Numerical execution backend. Use
+            ``"eager"`` for the PGL path or ``"cinn"`` for the compiled Tensor
+            core. Defaults to ``"eager"``.
+        cinn_full_graph (bool, optional): Whether CINN compilation requires the
+            complete Tensor core to convert to a single static graph. Defaults to True.
     """
 
     def __init__(
@@ -699,10 +706,28 @@ class MEGNetPlus(paddle.nn.Layer):
         property_name: Optional[str] = "formation_energy_per_atom",
         data_mean: float = 0.0,
         data_std: float = 1.0,
+        execution_backend: str = "eager",
+        cinn_full_graph: bool = True,
         # loss_cfg:dict = {},
     ):
         # loss = build_loss(loss_cfg)
         super().__init__()
+        if execution_backend is None:
+            execution_backend = "eager"
+        if execution_backend not in {"eager", "cinn"}:
+            raise ValueError(
+                "execution_backend must be either 'eager' or 'cinn', "
+                f"got {execution_backend!r}."
+            )
+        if not isinstance(cinn_full_graph, bool):
+            raise TypeError("cinn_full_graph must be a bool.")
+        self.execution_backend = execution_backend
+        self.cinn_full_graph = cinn_full_graph
+        # The compiled layers must not be registered children.  Registering a
+        # wrapper around this model would change all checkpoint keys by adding
+        # a prefix (for example, ``model.embedding...``).
+        object.__setattr__(self, "_cinn_runtimes", {})
+        object.__setattr__(self, "_cinn_warmed_modes", set())
         self.max_element_types = max_element_types
         if bond_expansion_cfg is None:
             bond_expansion_cfg = {
@@ -779,12 +804,34 @@ class MEGNetPlus(paddle.nn.Layer):
         elif isinstance(m, nn.LSTM):
             initializer.lstm_init_(m)
 
-    def _forward(self, data):
+    def _forward_eager(self, data):
         #  The data in data['graph'] is numpy.ndarray, convert it to paddle.Tensor
         g = data["graph"].tensor()
         # print(data["id"])
         batch_size = g.num_graph
-        state_attr = paddle.zeros([batch_size, 2])
+        if isinstance(batch_size, paddle.Tensor):
+            batch_size = int(batch_size)
+        state_attr = data.get("state_attr")
+        if state_attr is None:
+            state_attr = paddle.zeros(
+                [batch_size, self.embedding.dim_state_embedding], dtype="float32"
+            )
+        else:
+            # Dataset collators commonly leave optional graph-level features as
+            # NumPy arrays.  Normalize them at the eager boundary just as the
+            # CINN packing path does, and fail with a useful shape error before
+            # the first linear layer is reached.
+            if not isinstance(state_attr, paddle.Tensor):
+                state_attr = paddle.to_tensor(state_attr, dtype="float32")
+            elif state_attr.dtype != paddle.float32:
+                state_attr = paddle.cast(state_attr, "float32")
+            expected_shape = [batch_size, self.embedding.dim_state_embedding]
+            if list(state_attr.shape) != expected_shape:
+                raise ValueError(
+                    "state_attr must have shape "
+                    f"[num_graphs, {self.embedding.dim_state_embedding}], "
+                    f"got {list(state_attr.shape)}."
+                )
         node_attr = g.node_feat["atom_types"]
         edge_attr = self.bond_expansion(g.edge_feat["bond_dist"])
         node_feat, edge_feat, state_feat = self.embedding(
@@ -805,6 +852,172 @@ class MEGNetPlus(paddle.nn.Layer):
 
         result = self.fc_out(vec)
 
+        return result
+
+    def _forward(self, data):
+        """Run the configured numerical backend on a public model batch."""
+
+        if self.execution_backend == "eager":
+            return self._forward_eager(data)
+        return self._forward_cinn(data)
+
+    def _validate_cinn_environment(self) -> None:
+        """Fail early when the CINN backend cannot run in this process."""
+
+        if not self.include_state_embedding:
+            raise ValueError(
+                "MEGNet CINN execution requires include_state=True because the "
+                "Tensor core uses graph-level state features."
+            )
+        if not paddle.is_compiled_with_cuda():
+            raise RuntimeError(
+                "MEGNet execution_backend='cinn' requires a CUDA-enabled Paddle "
+                "installation; use execution_backend='eager' on CPU."
+            )
+        if not paddle.base.is_compiled_with_cinn():
+            raise RuntimeError(
+                "MEGNet execution_backend='cinn' requires a Paddle build with "
+                "CINN support."
+            )
+        device = paddle.get_device()
+        if not device.startswith("gpu"):
+            raise RuntimeError(
+                "MEGNet execution_backend='cinn' requires a GPU device, "
+                f"but the current device is {device!r}."
+            )
+
+    def validate_execution_backend(self) -> None:
+        """Public validation hook used by Trainer and Predictor runtimes."""
+
+        if self.execution_backend == "cinn":
+            self._validate_cinn_environment()
+
+    def set_execution_backend(self, backend: str) -> None:
+        """Select eager or CINN execution without changing model parameters."""
+
+        if backend is None:
+            backend = "eager"
+        if backend not in {"eager", "cinn"}:
+            raise ValueError(
+                "execution_backend must be either 'eager' or 'cinn', "
+                f"got {backend!r}."
+            )
+        if backend != self.execution_backend:
+            self.execution_backend = backend
+            self.invalidate_cinn_runtime()
+
+    def invalidate_cinn_runtime(self) -> None:
+        """Drop compiled callables while retaining the model/checkpoint owner."""
+
+        runtimes = getattr(self, "_cinn_runtimes", None)
+        if runtimes is not None:
+            runtimes.clear()
+        warmed_modes = getattr(self, "_cinn_warmed_modes", None)
+        if warmed_modes is not None:
+            warmed_modes.clear()
+
+    def _get_cinn_runtime(self):
+        """Lazily compile the Tensor core for the current train/eval mode."""
+
+        self._validate_cinn_environment()
+        mode = "train" if self.training else "eval"
+        runtimes = self._cinn_runtimes
+        runtime = runtimes.get(mode)
+        if runtime is not None:
+            return runtime
+
+        # Import lazily to keep the eager model import independent of CINN/PGL
+        # compiler availability and to avoid a circular module import.
+        from ppmat.models.megnet.megnet_cinn import MEGNetTensorCore
+        from ppmat.models.megnet.megnet_cinn import compile_megnet_cinn
+
+        core = MEGNetTensorCore(self)
+        # ``core.model`` points at this model.  Calling core.train()/eval()
+        # recursively would therefore cycle through this model's runtime cache;
+        # setting the flag directly is sufficient because all child modules are
+        # already in the requested mode.
+        core.training = self.training
+        runtime = compile_megnet_cinn(core, full_graph=self.cinn_full_graph)
+        runtime.training = self.training
+        runtimes[mode] = runtime
+        return runtime
+
+    def _forward_cinn(self, data):
+        """Pack a public PGL batch and execute the compiled Tensor core."""
+
+        from ppmat.models.megnet.megnet_cinn import graph_to_tensor_batch
+
+        graph = data.get("graph") if isinstance(data, dict) else None
+        if graph is None:
+            raise KeyError("MEGNet CINN forward expects data['graph'].")
+        packed = graph_to_tensor_batch(
+            graph,
+            state_attr=data.get("state_attr"),
+            state_dim=self.embedding.dim_state_embedding,
+        )
+        return self._get_cinn_runtime()(*packed)
+
+    def prepare_execution(self, sample_batch: Optional[Any] = None) -> None:
+        """Prepare the selected backend before a training or prediction loop.
+
+        The compilation is intentionally lazy and uses a real collated batch so
+        that dynamic graph sizes are represented by the same contract used at
+        runtime.  Eager models treat this as a no-op.
+        """
+
+        if self.execution_backend != "cinn":
+            return
+        mode = "train" if self.training else "eval"
+        if mode in self._cinn_warmed_modes:
+            return
+        if sample_batch is None:
+            raise ValueError(
+                "prepare_execution requires one collated sample batch; pass a batch "
+                "from the target DataLoader or predictor graph converter."
+            )
+        if isinstance(sample_batch, dict):
+            execution_batch = sample_batch
+        else:
+            # Predictor inputs are commonly a PGL graph or a list of graphs,
+            # while Trainer inputs are collated dictionaries.
+            execution_batch = {"graph": sample_batch}
+        self._get_cinn_runtime()
+        # Execute once to trigger PIR/CINN compilation.  Do not wrap this in
+        # no_grad: the training runtime must retain its backward graph.
+        rng_state = paddle.get_rng_state()
+        device = paddle.get_device()
+        cuda_rng_state = (
+            paddle.get_cuda_rng_state()
+            if paddle.is_compiled_with_cuda() and device.startswith("gpu")
+            else None
+        )
+        try:
+            context = (
+                contextlib.nullcontext()
+                if self.training
+                else paddle.no_grad()
+            )
+            with context:
+                self(execution_batch, return_loss=False, return_prediction=True)
+        finally:
+            # Warmup must not alter dropout or data-pipeline reproducibility.
+            paddle.set_rng_state(rng_state)
+            if cuda_rng_state is not None:
+                paddle.set_cuda_rng_state(cuda_rng_state)
+        self._cinn_warmed_modes.add(mode)
+
+    def prepare_cinn(self, sample_batch: Optional[dict[str, Any]] = None) -> None:
+        """Backward-compatible alias for :meth:`prepare_execution`."""
+
+        self.prepare_execution(sample_batch)
+
+    def set_state_dict(self, state_dict, use_structured_name=True):
+        """Keep a compiled runtime from outliving a replaced parameter set."""
+
+        result = super().set_state_dict(
+            state_dict, use_structured_name=use_structured_name
+        )
+        self.invalidate_cinn_runtime()
         return result
 
     def normalize(self, tensor):
@@ -837,24 +1050,31 @@ class MEGNetPlus(paddle.nn.Layer):
 
     @paddle.no_grad()
     def predict(self, graphs):
-        if isinstance(graphs, list):
-            results = []
-            for graph in graphs:
-                result = self._forward(
-                    {
-                        "graph": graph,
-                    }
-                )
-                result = self.unnormalize(result).numpy()[0, 0]
-                result = {self.property_name: result}
-                results.append(result)
-            return results
-
+        if isinstance(graphs, (list, tuple)):
+            if not graphs:
+                return []
+            graph_batch = pgl.Graph.batch(graphs)
+        elif isinstance(graphs, pgl.Graph):
+            graph_batch = graphs
         else:
-            data = {
-                "graph": graphs,
-            }
-            result = self._forward(data)
-            result = self.unnormalize(result).numpy()[0, 0]
-            result = {self.property_name: result}
-            return result
+            raise TypeError(
+                "MEGNetPlus.predict expects a pgl.Graph or a sequence of graphs, "
+                f"got {type(graphs)!r}."
+            )
+
+        predictions = self.unnormalize(
+            self._forward({"graph": graph_batch})
+        ).numpy()
+        num_graphs = graph_batch.num_graph
+        if isinstance(num_graphs, paddle.Tensor):
+            num_graphs = int(num_graphs.numpy().reshape(-1)[0])
+        else:
+            num_graphs = int(num_graphs)
+        if num_graphs > 1:
+            return [
+                {self.property_name: prediction[0]}
+                for prediction in predictions
+            ]
+        # Preserve the historical NumPy scalar return type for callers that
+        # serialize or post-process property predictions directly.
+        return {self.property_name: predictions[0, 0]}

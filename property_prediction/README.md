@@ -34,13 +34,13 @@ Property Prediction (PP) targets rapid, first-principles-level estimation of key
 | Mixed precision (AMP)                        |                    —                     |                       —                       |                       —                        |                       —                        |
 | Fine-tuning                                  |                    ✅                    |                       ✅                      |                       ✅                       |                       🚧                       |
 | Uncertainty / Active Learning                |                    —                     |                       —                       |                       —                        |                       —                        |
-| Dynamic→Static graphs                        |                    —                     |                       —                       |                       —                        |                       —                        |
-| Compiler (CINN) opt.                         |                    —                     |                       —                       |                       —                        |                       —                        |
+| Dynamic→Static graphs                        |                    ✅                    |                       —                       |                       —                        |                       —                        |
+| Compiler (CINN) opt.                         |                    ✅                    |                       —                       |                       —                        |                       —                        |
 | **ML Capabilities · Predict**                |                                          |                                               |                                                |                                                |
 | Distillation / Pruning                       |                    —                     |                       —                       |                       —                        |                       —                        |
 | Standard inference                           |                    ✅                    |                       ✅                      |                       ✅                       |                       ✅                       |
 | Distributed inference                        |                    —                     |                       —                       |                       —                        |                       —                        |
-| Compiler-level inference                     |                    —                     |                       —                       |                       —                        |                       —                        |
+| Compiler-level inference                     |                    ✅                    |                       —                       |                       —                        |                       —                        |
 | **Datasets**                                 |                                          |                                               |                                                |                                                |
 | **Materials Project**                        |                                          |                                               |                                                |                                                |
 | MP2024                                       |                    ✅                    |                       ✅                      |                       —                        |                       —                        |
@@ -55,3 +55,10 @@ Property Prediction (PP) targets rapid, first-principles-level estimation of key
 | **QM9**                                      |                    —                    |                       —                       |                       ✅                       |                       ✅                       |
 
 **Legend:** ✅ Verified · 🧪 Implemented, pending validation · 🚧 In development · `-` Not supported · 🌟 Original Work
+
+The shared CINN Trainer/Predictor contract is documented in
+[`docs/cinn_end_to_end.md`](../docs/cinn_end_to_end.md). MEGNet is the first
+adapter and provides an opt-in single-GPU FP32 path on PaddlePaddle 3.3.1;
+AMP and distributed CINN execution remain explicitly unsupported. See
+[`docs/megnet_cinn_phase1.md`](../docs/megnet_cinn_phase1.md) for its numerical
+adapter and workflow evidence.

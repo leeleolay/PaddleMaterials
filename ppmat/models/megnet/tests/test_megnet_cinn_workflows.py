@@ -1,0 +1,320 @@
+# Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+import numpy as np
+import paddle
+import pgl
+import pytest
+from omegaconf import OmegaConf
+from pymatgen.core import Structure
+
+from ppmat.datasets.collate_fn import DefaultCollator
+from ppmat.models.megnet.megnet import MEGNetPlus
+from ppmat.models.megnet.megnet_cinn import MEGNetTensorCore
+from ppmat.predictor import PropertyPredictor
+from ppmat.trainer.base_trainer import BaseTrainer
+
+
+@pytest.fixture(autouse=True)
+def _cpu_device():
+    original_device = paddle.get_device()
+    paddle.set_device("cpu")
+    yield
+    paddle.set_device(original_device)
+
+
+@pytest.fixture
+def tensor_runtime_proxy(monkeypatch):
+    """Exercise public workflow adapters without invoking expensive GPU CINN."""
+
+    cores = {}
+
+    def get_runtime(model):
+        core = cores.get(id(model))
+        if core is None:
+            core = MEGNetTensorCore(model)
+            cores[id(model)] = core
+        return core
+
+    monkeypatch.setattr(MEGNetPlus, "validate_execution_backend", lambda self: None)
+    monkeypatch.setattr(MEGNetPlus, "_validate_cinn_environment", lambda self: None)
+    monkeypatch.setattr(MEGNetPlus, "_get_cinn_runtime", get_runtime)
+    return cores
+
+
+def _make_graph(atom_types):
+    return pgl.Graph(
+        np.asarray([[0, 1], [1, 0]], dtype=np.int64),
+        num_nodes=2,
+        node_feat={"atom_types": np.asarray(atom_types, dtype=np.int64)},
+        edge_feat={"bond_dist": np.asarray([1.0, 1.0], dtype=np.float32)},
+    )
+
+
+def _make_samples():
+    return [
+        {
+            "graph": _make_graph([1, 8]),
+            "formation_energy_per_atom": np.asarray([0.25], dtype=np.float32),
+        },
+        {
+            "graph": _make_graph([6, 7]),
+            "formation_energy_per_atom": np.asarray([-0.75], dtype=np.float32),
+        },
+    ]
+
+
+def _make_loader():
+    return paddle.io.DataLoader(
+        _make_samples(),
+        batch_size=2,
+        shuffle=False,
+        collate_fn=DefaultCollator(),
+        return_list=True,
+    )
+
+
+def _make_model(execution_backend="cinn"):
+    with paddle.utils.unique_name.guard():
+        paddle.seed(2026)
+        return MEGNetPlus(
+            dim_node_embedding=4,
+            dim_edge_embedding=6,
+            nblocks=1,
+            hidden_layer_sizes_input=(8, 4),
+            hidden_layer_sizes_conv=(8, 8, 4),
+            hidden_layer_sizes_output=(8, 4),
+            nlayers_set2set=1,
+            niters_set2set=2,
+            bond_expansion_cfg={
+                "rbf_type": "Gaussian",
+                "initial": 0.0,
+                "final": 5.0,
+                "num_centers": 6,
+                "width": 0.5,
+            },
+            execution_backend=execution_backend,
+        )
+
+
+def _trainer_config(output_dir, max_epochs, resume_from_checkpoint=None):
+    return {
+        "max_epochs": max_epochs,
+        "output_dir": str(output_dir),
+        "save_freq": 1,
+        "log_freq": 100,
+        "start_eval_epoch": 1,
+        "eval_freq": 1,
+        "seed": 2026,
+        "pretrained_model_path": None,
+        "resume_from_checkpoint": resume_from_checkpoint,
+        "compute_metric_during_train": False,
+        "use_amp": False,
+        "eval_with_no_grad": True,
+        "gradient_accumulation_steps": 1,
+        "best_metric_indicator": "eval_loss",
+        "name_for_best_metric": "loss",
+        "greater_is_better": False,
+        "execution_backend": "cinn",
+    }
+
+
+def _build_trainer(model, output_dir, max_epochs, resume_from_checkpoint=None):
+    optimizer = paddle.optimizer.Adam(
+        learning_rate=1e-3,
+        beta1=0.9,
+        beta2=0.999,
+        parameters=model.parameters(),
+    )
+    trainer = BaseTrainer(
+        _trainer_config(output_dir, max_epochs, resume_from_checkpoint),
+        model,
+        train_dataloader=_make_loader(),
+        val_dataloader=_make_loader(),
+        optimizer=optimizer,
+    )
+    return trainer, optimizer
+
+
+def _assert_state_dict_close(actual, expected, atol=1e-6):
+    assert actual.keys() == expected.keys()
+    for key in actual:
+        np.testing.assert_allclose(
+            actual[key].numpy(), expected[key].numpy(), atol=atol, rtol=atol
+        )
+
+
+def test_cinn_trainer_checkpoint_resume_matches_uninterrupted_training(
+    tmp_path, tensor_runtime_proxy
+):
+    initial_model = _make_model()
+    initial_state = initial_model.state_dict()
+
+    first_model = _make_model()
+    first_model.set_state_dict(initial_state)
+    first_trainer, _ = _build_trainer(first_model, tmp_path / "first", 1)
+    with paddle.utils.unique_name.guard():
+        first_trainer.train()
+
+    checkpoint_dir = tmp_path / "first" / "checkpoints"
+    for prefix in ("epoch_1", "latest", "best"):
+        for suffix in ("pdparams", "pdopt", "pdstates"):
+            assert (checkpoint_dir / f"{prefix}.{suffix}").is_file()
+    checkpoint_state = paddle.load(str(checkpoint_dir / "latest.pdparams"))
+    assert checkpoint_state.keys() == first_model.state_dict().keys()
+    assert all(not key.startswith("model.") for key in checkpoint_state)
+
+    resumed_model = _make_model()
+    resumed_trainer, resumed_optimizer = _build_trainer(
+        resumed_model,
+        tmp_path / "resumed",
+        2,
+    )
+    with paddle.utils.unique_name.guard():
+        resumed_trainer.train(resume_from_checkpoint=str(checkpoint_dir / "latest"))
+
+    uninterrupted_model = _make_model()
+    uninterrupted_model.set_state_dict(initial_state)
+    uninterrupted_trainer, uninterrupted_optimizer = _build_trainer(
+        uninterrupted_model, tmp_path / "uninterrupted", 2
+    )
+    with paddle.utils.unique_name.guard():
+        uninterrupted_trainer.train()
+
+    assert first_trainer.state.global_step == 1
+    assert resumed_trainer.state.global_step == 2
+    assert resumed_trainer.state.epoch == 2
+    assert resumed_optimizer.get_lr() == uninterrupted_optimizer.get_lr()
+    _assert_state_dict_close(
+        resumed_model.state_dict(), uninterrupted_model.state_dict(), atol=2e-6
+    )
+    _assert_state_dict_close(
+        resumed_optimizer.state_dict(),
+        uninterrupted_optimizer.state_dict(),
+        atol=2e-6,
+    )
+    assert resumed_model._cinn_warmed_modes == {"train", "eval"}
+
+
+def _predictor_config(checkpoint_path):
+    return {
+        "Model": {
+            "__class_name__": "MEGNetPlus",
+            "__init_params__": {
+                "dim_node_embedding": 4,
+                "dim_edge_embedding": 6,
+                "nblocks": 1,
+                "hidden_layer_sizes_input": [8, 4],
+                "hidden_layer_sizes_conv": [8, 8, 4],
+                "hidden_layer_sizes_output": [8, 4],
+                "nlayers_set2set": 1,
+                "niters_set2set": 2,
+                "bond_expansion_cfg": {
+                    "rbf_type": "Gaussian",
+                    "initial": 0.0,
+                    "final": 5.0,
+                    "num_centers": 6,
+                    "width": 0.5,
+                },
+                "property_name": "formation_energy_per_atom",
+            },
+        },
+        "Predict": {
+            "checkpoint_path": str(checkpoint_path),
+            "execution_backend": "cinn",
+            "eval_with_no_grad": True,
+            "graph_converter": {
+                "__class_name__": "FindPointsInSpheres",
+                "__init_params__": {"cutoff": 4.0, "num_cpus": 1},
+            },
+        },
+    }
+
+
+def test_cinn_property_predictor_loads_checkpoint_and_batches_cifs(
+    tmp_path, tensor_runtime_proxy
+):
+    model = _make_model(execution_backend="eager")
+    checkpoint_path = tmp_path / "best.pdparams"
+    paddle.save(model.state_dict(), str(checkpoint_path))
+    config_path = tmp_path / "megnet.yaml"
+    OmegaConf.save(OmegaConf.create(_predictor_config(checkpoint_path)), config_path)
+
+    predictor = PropertyPredictor(config_path=config_path, device="cpu")
+    cif_path = (
+        Path(__file__).resolve().parents[4]
+        / "property_prediction"
+        / "example_data"
+        / "cifs"
+        / "mp-18767-LiMnO2.cif"
+    )
+    single = predictor.from_cif_file(str(cif_path))
+    structure = Structure.from_file(cif_path)
+    batch = predictor.from_structures([structure, structure])
+
+    assert predictor.execution_backend == "cinn"
+    assert predictor.model._cinn_warmed_modes == {"eval"}
+    assert len(batch) == 2
+    assert single.keys() == {"formation_energy_per_atom"}
+    np.testing.assert_allclose(
+        [item["formation_energy_per_atom"] for item in batch],
+        [single["formation_energy_per_atom"]] * 2,
+        atol=1e-6,
+        rtol=1e-6,
+    )
+    assert predictor.model.state_dict().keys() == model.state_dict().keys()
+    assert all(not key.startswith("model.") for key in predictor.model.state_dict())
+
+
+@pytest.mark.skipif(
+    os.environ.get("PPMAT_RUN_CINN_WORKFLOW_TESTS") != "1",
+    reason=(
+        "Set PPMAT_RUN_CINN_WORKFLOW_TESTS=1 to run the GPU Trainer/Predictor "
+        "workflow smoke."
+    ),
+)
+def test_gpu_cinn_trainer_checkpoint_and_property_predictor(tmp_path):
+    if not paddle.is_compiled_with_cuda():
+        pytest.skip("Paddle was not compiled with CUDA.")
+    if not paddle.base.is_compiled_with_cinn():
+        pytest.skip("Paddle was not compiled with CINN.")
+
+    paddle.set_device("gpu:0")
+    model = _make_model()
+    trainer, _ = _build_trainer(model, tmp_path / "trainer", 1)
+    with paddle.utils.unique_name.guard():
+        trainer.train()
+
+    checkpoint_path = tmp_path / "trainer" / "checkpoints" / "best.pdparams"
+    config_path = tmp_path / "megnet.yaml"
+    OmegaConf.save(OmegaConf.create(_predictor_config(checkpoint_path)), config_path)
+    predictor = PropertyPredictor(config_path=config_path, device="gpu:0")
+    cif_path = (
+        Path(__file__).resolve().parents[4]
+        / "property_prediction"
+        / "example_data"
+        / "cifs"
+        / "mp-18767-LiMnO2.cif"
+    )
+    result = predictor.from_cif_file(str(cif_path))
+
+    assert trainer.state.global_step == 1
+    assert result.keys() == {"formation_energy_per_atom"}
+    assert predictor.model._cinn_warmed_modes == {"eval"}
+    assert predictor.model.state_dict().keys() == model.state_dict().keys()

@@ -436,3 +436,86 @@ def test_graph_to_tensor_batch_validates_required_features():
         ValueError, match=r"graph\.edge_feat\['bond_dist'\] is required"
     ):
         graph_to_tensor_batch(graph)
+
+
+def test_public_megnet_backend_preserves_trainer_and_predictor_contract(monkeypatch):
+    reference_model = _make_model()
+    model = _make_model()
+    model.set_state_dict(reference_model.state_dict())
+    reference_model.eval()
+    model.eval()
+
+    reference_graphs = _make_graphs()
+    runtime_graphs = _make_graphs()
+    reference_batch = {
+        "graph": pgl.Graph.batch(reference_graphs),
+        "formation_energy_per_atom": paddle.to_tensor(
+            [[0.25], [-0.75]], dtype="float32"
+        ),
+    }
+    runtime_batch = {
+        "graph": pgl.Graph.batch(runtime_graphs),
+        "formation_energy_per_atom": paddle.to_tensor(
+            [[0.25], [-0.75]], dtype="float32"
+        ),
+    }
+    expected_keys = list(model.state_dict())
+    core = MEGNetTensorCore(model)
+    monkeypatch.setattr(model, "_validate_cinn_environment", lambda: None)
+    monkeypatch.setattr(model, "_get_cinn_runtime", lambda: core)
+    model.set_execution_backend("cinn")
+
+    expected = reference_model(reference_batch)
+    actual = model(runtime_batch)
+    _assert_allclose(actual["loss_dict"]["loss"], expected["loss_dict"]["loss"])
+    _assert_allclose(
+        actual["pred_dict"]["formation_energy_per_atom"],
+        expected["pred_dict"]["formation_energy_per_atom"],
+    )
+
+    expected_prediction = reference_model.predict(reference_graphs[0])
+    actual_prediction = model.predict(runtime_graphs[0])
+    np.testing.assert_allclose(
+        actual_prediction["formation_energy_per_atom"],
+        expected_prediction["formation_energy_per_atom"],
+        atol=1e-6,
+        rtol=1e-6,
+    )
+    assert list(model.state_dict()) == expected_keys
+    assert all(not key.startswith("model.") for key in model.state_dict())
+
+
+def test_public_cinn_backend_fails_fast_on_cpu():
+    graph, _ = _make_graphs()
+    model = _make_model()
+    model.set_execution_backend("cinn")
+
+    with pytest.raises(RuntimeError, match="requires"):
+        model({"graph": graph}, return_loss=False)
+
+
+def test_eager_backend_supports_non_default_state_dimension():
+    graph, _ = _make_graphs()
+    model = _make_model(dim_state_embedding=4)
+    model.eval()
+
+    result = model({"graph": graph}, return_loss=False)
+
+    assert model.execution_backend == "eager"
+    assert result["pred_dict"]["formation_energy_per_atom"].shape == [1, 1]
+
+
+def test_eager_backend_converts_numpy_state_attr():
+    graph, _ = _make_graphs()
+    model = _make_model()
+    model.eval()
+
+    result = model(
+        {
+            "graph": graph,
+            "state_attr": np.zeros((1, 2), dtype=np.float64),
+        },
+        return_loss=False,
+    )
+
+    assert result["pred_dict"]["formation_energy_per_atom"].shape == [1, 1]

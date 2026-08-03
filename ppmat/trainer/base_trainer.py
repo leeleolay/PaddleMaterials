@@ -42,6 +42,11 @@ from ppmat.utils import AverageMeter
 from ppmat.utils import logger
 from ppmat.utils import misc
 from ppmat.utils import save_load
+from ppmat.utils.execution import configure_execution_backend
+from ppmat.utils.execution import ensure_execution_backend
+from ppmat.utils.execution import execution_mode
+from ppmat.utils.execution import prepare_execution
+from ppmat.utils.execution import validate_execution_backend
 
 
 class BaseTrainer:
@@ -88,6 +93,16 @@ class BaseTrainer:
         self.compute_metric_func_dict = compute_metric_func_dict
 
         self.config = config
+
+        # Keep the model as the sole checkpoint/optimizer owner.  A runtime
+        # backend may be selected from Trainer config, but it must be exposed
+        # by the model itself so train and prediction share the same contract.
+        self.execution_backend = configure_execution_backend(
+            self.model,
+            config.get("execution_backend", None),
+            owner="Trainer",
+        )
+        self._execution_prepared_modes = set()
 
         if optimizer is None:
             self.use_amp = False
@@ -139,6 +154,8 @@ class BaseTrainer:
                 "'iters_per_epoch' according to the 'world_size' both linearly if you "
                 "are training model."
             )
+
+        self._validate_execution_backend()
 
         # 4. load pretrained model, usually used for transfer learning
         if self.pretrained_model_path is not None:
@@ -239,6 +256,39 @@ class BaseTrainer:
         self.out_dict_cfg = self.config.get(
             "out_dict", log_cfg.get("out_dict", None)
         )  # None → print all
+
+    def _validate_execution_backend(self):
+        """Validate backend/runtime combinations before model mutation."""
+        validate_execution_backend(
+            self.model,
+            self.execution_backend,
+            use_amp=self.use_amp,
+            world_size=self.world_size,
+            owner="Trainer",
+        )
+
+    def _prepare_model_execution(self, sample_batch):
+        """Warm up a dynamic compiled backend using a real collated batch."""
+
+        ensure_execution_backend(
+            self.model,
+            self.execution_backend,
+            owner="Trainer",
+        )
+        if self.execution_backend == "eager":
+            return
+        mode = execution_mode(self.model)
+        if mode in self._execution_prepared_modes:
+            return
+        context = paddle.no_grad() if mode == "eval" else contextlib.nullcontext()
+        with context:
+            prepare_execution(
+                self.model,
+                self.execution_backend,
+                sample_batch,
+                owner="Trainer",
+            )
+        self._execution_prepared_modes.add(mode)
 
     def get_num_trainable_parameters(self):
         """
@@ -352,7 +402,12 @@ class BaseTrainer:
         batch_tic = time.perf_counter()
 
         # start to evaluate
-        for _, batch_data in enumerate(dataloader):
+        for iter_id, batch_data in enumerate(dataloader):
+            if iter_id == 0:
+                self._prepare_model_execution(batch_data)
+                # Compilation is startup work, not data reader/model latency.
+                reader_tic = time.perf_counter()
+                batch_tic = reader_tic
             reader_cost = time.perf_counter() - reader_tic
             time_info["reader_cost"].update(reader_cost)
 
@@ -539,6 +594,11 @@ class BaseTrainer:
                 and self.state.global_step >= self.max_train_steps
             ):
                 break
+            if iter_id == 0:
+                self._prepare_model_execution(batch_data)
+                # Compilation is startup work, not data reader/model latency.
+                reader_tic = time.perf_counter()
+                batch_tic = reader_tic
             reader_cost = time.perf_counter() - reader_tic
             time_info["reader_cost"].update(reader_cost)
             # auto compute batch size
@@ -682,6 +742,10 @@ class BaseTrainer:
             self.model.before_train(self)
 
         self.state = TrainerState()
+        # A new train invocation may load a different checkpoint.  The model
+        # invalidates its compiled runtime when weights are replaced; mirror
+        # that lifecycle at the workflow boundary as well.
+        self._execution_prepared_modes.clear()
         # load model checkpoint, usually used for resume training
         resume_from_checkpoint = (
             resume_from_checkpoint
@@ -695,7 +759,7 @@ class BaseTrainer:
                     " be overridden by weights loaded from given 'checkpoint_path'."
                 )
             loaded_state = save_load.load_checkpoint(
-                self.resume_from_checkpoint,
+                resume_from_checkpoint,
                 self.model,
                 self.optimizer,
                 self.scaler,
