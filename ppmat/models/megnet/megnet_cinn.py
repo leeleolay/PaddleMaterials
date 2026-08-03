@@ -479,9 +479,7 @@ class MEGNetTensorCore(paddle.nn.Layer):
     ) -> paddle.Tensor:
         """Return unnormalized predictions as a tensor of shape ``[B, 1]``."""
 
-        return self.model.unnormalize(
-            self.forward_tensor(batch, state_attr=state_attr)
-        )
+        return self.model.unnormalize(self.forward_tensor(batch, state_attr=state_attr))
 
 
 def make_megnet_input_spec(
@@ -525,9 +523,7 @@ def compile_megnet(
         else MEGNetTensorCore(model_or_core)
     )
     if input_spec is None:
-        input_spec = make_megnet_input_spec(
-            core.model.embedding.dim_state_embedding
-        )
+        input_spec = make_megnet_input_spec(core.model.embedding.dim_state_embedding)
     return paddle.jit.to_static(
         core,
         input_spec=input_spec,

@@ -14,9 +14,11 @@
 
 from __future__ import annotations
 
+import numpy as np
 import paddle
 import pytest
 
+from ppmat.models.common.cinn import CINNExecutionMixin
 from ppmat.predictor import BasePredictor
 from ppmat.trainer.base_trainer import BaseTrainer
 from ppmat.utils.execution import configure_execution_backend
@@ -133,6 +135,30 @@ def test_execution_backend_protocol_is_generic_for_trainer_and_predictor(tmp_pat
     assert model.predict_calls == [sample, sample]
 
 
+def test_zero_frequencies_do_not_use_modulo_or_run_evaluation(tmp_path, monkeypatch):
+    model = _HookedModel()
+    optimizer = paddle.optimizer.Adam(learning_rate=1e-3, parameters=model.parameters())
+    config = _trainer_config(tmp_path / "trainer")
+    config.update({"execution_backend": "eager", "eval_freq": 0, "save_freq": 0})
+    trainer = BaseTrainer(
+        config,
+        model,
+        train_dataloader=_loader(),
+        val_dataloader=_loader(),
+        optimizer=optimizer,
+    )
+    monkeypatch.setattr(
+        trainer,
+        "eval_epoch",
+        lambda dataloader: pytest.fail("eval_freq=0 must disable evaluation"),
+    )
+
+    trainer.train()
+
+    assert trainer.state.global_step == 1
+    assert (tmp_path / "trainer" / "checkpoints" / "latest.pdparams").is_file()
+
+
 def test_eager_override_is_compatible_with_legacy_models():
     class LegacyModel:
         pass
@@ -145,9 +171,7 @@ def test_eager_override_is_compatible_with_legacy_models():
         execution_backend = "cinn"
 
     with pytest.raises(ValueError, match="cannot switch"):
-        configure_execution_backend(
-            FixedCompiledModel(), "eager", owner="Trainer"
-        )
+        configure_execution_backend(FixedCompiledModel(), "eager", owner="Trainer")
 
 
 def test_backend_setter_must_honor_requested_backend():
@@ -177,3 +201,43 @@ def test_compiled_backend_requires_model_hooks():
 
     with pytest.raises(ValueError, match="validated execution runtime"):
         validate_execution_backend(object(), "cinn", owner="Predictor")
+
+
+def test_cinn_warmup_preserves_non_trainable_model_state():
+    class StatefulModel(CINNExecutionMixin, paddle.nn.Layer):
+        def __init__(self):
+            super().__init__()
+            self.batch_norm = paddle.nn.BatchNorm1D(2)
+            self._init_cinn_execution("cinn")
+
+        def _validate_cinn_environment(self):
+            pass
+
+        def _compile_cinn_runtime(self):
+            class Runtime:
+                training = True
+
+            return Runtime()
+
+        def forward(self, data, return_loss=True, return_prediction=True):
+            del return_loss, return_prediction
+            prediction = self.batch_norm(data["x"])
+            return {"loss_dict": {}, "pred_dict": {"value": prediction}}
+
+    model = StatefulModel()
+    model.train()
+    before = {
+        name: value.clone()
+        for name, value in model.named_parameters()
+        if value.stop_gradient
+    }
+
+    model.prepare_execution({"x": paddle.ones([4, 2])})
+
+    after = {
+        name: value for name, value in model.named_parameters() if value.stop_gradient
+    }
+    assert before.keys() == after.keys()
+    for name in before:
+        np.testing.assert_allclose(before[name].numpy(), after[name].numpy())
+    assert model._cinn_warmed_modes == {"train"}

@@ -22,7 +22,9 @@ from typing import Union
 import numpy as np
 import paddle
 import paddle.nn as nn
+import pgl
 
+from ppmat.models.common.cinn import CINNExecutionMixin
 from ppmat.models.common.message_passing.message_passing import MessagePassing
 from ppmat.utils.scatter import scatter
 
@@ -312,7 +314,7 @@ def bond_cosine(r1, r2):
     return bond_cosine
 
 
-class iComformer(nn.Layer):
+class iComformer(CINNExecutionMixin, nn.Layer):
     """Complete and Efficient Graph Transformers for Crystal Material Property
     Prediction,  https://arxiv.org/pdf/2403.11857
 
@@ -339,6 +341,11 @@ class iComformer(nn.Layer):
             Defaults to 1.0.
         loss_type (str, optional): Loss type, can be 'mse_loss' or 'l1_loss'. Defaults
             to "mse_loss".
+        execution_backend (str, optional): Numerical execution backend. Use
+            ``"eager"`` for the PGL path or ``"cinn"`` for the compiled Tensor
+            core. Defaults to ``"eager"``.
+        cinn_full_graph (bool, optional): Whether CINN requires the complete Tensor
+            core to convert to one static graph. Defaults to True.
     """
 
     def __init__(
@@ -357,8 +364,11 @@ class iComformer(nn.Layer):
         data_mean: float = 0.0,
         data_std: float = 1.0,
         loss_type: str = "mse_loss",
+        execution_backend: str = "eager",
+        cinn_full_graph: bool = True,
     ):
         super().__init__()
+        self._init_cinn_execution(execution_backend, cinn_full_graph)
         self.conv_layers = conv_layers
         self.edge_layers = edge_layers
         self.atom_input_features = atom_input_features
@@ -429,23 +439,21 @@ class iComformer(nn.Layer):
     def unnormalize(self, tensor):
         return tensor * self.data_std + self.data_mean
 
-    def _forward(self, data) -> paddle.Tensor:
+    def _forward_eager(self, data) -> paddle.Tensor:
         #  The data in data['graph'] is numpy.ndarray, convert it to paddle.Tensor
-        data["graph"] = data["graph"].tensor()
+        graph = data["graph"].tensor()
 
-        batch_idx = data["graph"].graph_node_id
-        edges = data["graph"].edges.T.contiguous()
+        batch_idx = graph.graph_node_id
+        edges = graph.edges.T.contiguous()
 
         node_features = self.atom_embedding(
-            data["graph"].node_feat["node_feat"].cast("float32")
+            graph.node_feat["node_feat"].cast("float32")
         )
-        edge_feat = -0.75 / paddle.linalg.norm(x=data["graph"].edge_feat["r"], axis=1)
-        edge_nei_len = -0.75 / paddle.linalg.norm(
-            x=data["graph"].edge_feat["nei"], axis=-1
-        )
+        edge_feat = -0.75 / paddle.linalg.norm(x=graph.edge_feat["r"], axis=1)
+        edge_nei_len = -0.75 / paddle.linalg.norm(x=graph.edge_feat["nei"], axis=-1)
         edge_nei_angle = bond_cosine(
-            data["graph"].edge_feat["nei"],
-            data["graph"].edge_feat["r"].unsqueeze(1).tile(repeat_times=[1, 3, 1]),
+            graph.edge_feat["nei"],
+            graph.edge_feat["r"].unsqueeze(1).tile(repeat_times=[1, 3, 1]),
         )
         num_edge = tuple(edge_feat.shape)[0]
         edge_features = self.rbf(edge_feat)
@@ -465,6 +473,28 @@ class iComformer(nn.Layer):
         features = self.fc(features)
         result = self.fc_out(features)
         return result
+
+    def _forward(self, data) -> paddle.Tensor:
+        if self.execution_backend == "eager":
+            return self._forward_eager(data)
+        return self._forward_cinn(data)
+
+    def _compile_cinn_runtime(self):
+        from ppmat.models.comformer.comformer_cinn import ComformerTensorCore
+        from ppmat.models.comformer.comformer_cinn import compile_comformer_cinn
+
+        core = ComformerTensorCore(self)
+        core.training = self.training
+        return compile_comformer_cinn(core, full_graph=self.cinn_full_graph)
+
+    def _forward_cinn(self, data) -> paddle.Tensor:
+        from ppmat.models.comformer.comformer_cinn import graph_to_tensor_batch
+
+        graph = data.get("graph") if isinstance(data, dict) else None
+        if graph is None:
+            raise KeyError("iComformer CINN forward expects data['graph'].")
+        packed = graph_to_tensor_batch(graph)
+        return self._get_cinn_runtime()(*packed)
 
     def forward(self, data, return_loss=True, return_prediction=True):
         assert (
@@ -490,24 +520,25 @@ class iComformer(nn.Layer):
 
     @paddle.no_grad()
     def predict(self, graphs):
-        if isinstance(graphs, list):
-            results = []
-            for graph in graphs:
-                result = self._forward(
-                    {
-                        "graph": graph,
-                    }
-                )
-                result = self.unnormalize(result).numpy()[0, 0]
-                result = {self.property_name: result}
-                results.append(result)
-            return results
-
+        is_sequence = isinstance(graphs, (list, tuple))
+        if is_sequence:
+            if not graphs:
+                return []
+            graph_batch = pgl.Graph.batch(list(graphs))
+        elif isinstance(graphs, pgl.Graph):
+            graph_batch = graphs
         else:
-            data = {
-                "graph": graphs,
-            }
-            result = self._forward(data)
-            result = self.unnormalize(result).numpy()[0, 0]
-            result = {self.property_name: result}
-            return result
+            raise TypeError(
+                "iComformer.predict expects a pgl.Graph or a sequence of graphs, "
+                f"got {type(graphs)!r}."
+            )
+
+        predictions = self.unnormalize(self._forward({"graph": graph_batch})).numpy()
+        num_graphs = graph_batch.num_graph
+        if isinstance(num_graphs, paddle.Tensor):
+            num_graphs = int(num_graphs.numpy().reshape(-1)[0])
+        else:
+            num_graphs = int(num_graphs)
+        if is_sequence or num_graphs > 1:
+            return [{self.property_name: prediction[0]} for prediction in predictions]
+        return {self.property_name: predictions[0, 0]}

@@ -8,6 +8,7 @@ from paddle.nn.functional import swish
 
 from ppmat.models.common.basis_utils import bessel_basis
 from ppmat.models.common.basis_utils import real_sph_harm
+from ppmat.models.common.cinn import CINNExecutionMixin
 from ppmat.utils.crystal import get_pbc_distances
 from ppmat.utils.scatter import scatter
 
@@ -269,7 +270,7 @@ class OutputPPBlock(paddle.nn.Layer):
         return self.lin(x)
 
 
-class DimeNetPlusPlus(paddle.nn.Layer):
+class DimeNetPlusPlus(CINNExecutionMixin, paddle.nn.Layer):
     """
     Fast and Uncertainty-Aware Directional Message Passing for
     Non-Equilibrium Molecules, https://arxiv.org/abs/2011.14115
@@ -317,6 +318,11 @@ class DimeNetPlusPlus(paddle.nn.Layer):
         loss_type (str, optional): Loss type, can be 'mse_loss' or 'l1_loss'.
             Defaults to "l1_loss".
         act (str, optional): The activation function. Defaults to swish.
+        execution_backend (str, optional): Numerical execution backend. Use
+            ``"eager"`` for the PGL path or ``"cinn"`` for the compiled Tensor
+            core. Defaults to ``"eager"``.
+        cinn_full_graph (bool, optional): Whether CINN compilation requires the
+            complete Tensor core to convert to one static graph. Defaults to True.
     """
 
     def __init__(
@@ -343,8 +349,11 @@ class DimeNetPlusPlus(paddle.nn.Layer):
         data_std: float = 1.0,
         loss_type: str = "l1_loss",
         act: str = "swish",
+        execution_backend: str = "eager",
+        cinn_full_graph: bool = True,
     ):
         super().__init__()
+        self._init_cinn_execution(execution_backend, cinn_full_graph)
         # store hyperparams
         self.out_channels = out_channels
         self.cutoff = cutoff
@@ -356,12 +365,8 @@ class DimeNetPlusPlus(paddle.nn.Layer):
         else:
             assert isinstance(property_names, str)
             self.property_names = property_names
-        self.register_buffer(
-            tensor=paddle.to_tensor(data_mean), name="data_mean"
-        )
-        self.register_buffer(
-            tensor=paddle.to_tensor(data_std), name="data_std"
-        )
+        self.register_buffer(tensor=paddle.to_tensor(data_mean), name="data_mean")
+        self.register_buffer(tensor=paddle.to_tensor(data_std), name="data_std")
 
         # basis layers
         self.rbf = BesselBasisLayer(num_radial, cutoff, envelope_exponent)
@@ -450,7 +455,7 @@ class DimeNetPlusPlus(paddle.nn.Layer):
     def unnormalize(self, tensor):
         return tensor * self.data_std + self.data_mean
 
-    def _forward(self, data):
+    def _forward_eager(self, data):
         #  The data in data['graph'] is numpy.ndarray, convert it to paddle.Tensor
         data["graph"] = data["graph"].tensor()
 
@@ -504,6 +509,39 @@ class DimeNetPlusPlus(paddle.nn.Layer):
         # readout
         energy = scatter(P, batch, dim=0, reduce=self.readout)
         return energy
+
+    def _forward(self, data):
+        """Run the selected numerical backend on a public model batch."""
+
+        if self.execution_backend == "eager":
+            return self._forward_eager(data)
+        return self._forward_cinn(data)
+
+    def _compile_cinn_runtime(self):
+        """Build the DimeNet++ Tensor core used by the shared lifecycle."""
+
+        from ppmat.models.dimenetpp.dimenetpp_cinn import DimeNetPPTensorCore
+        from ppmat.models.dimenetpp.dimenetpp_cinn import compile_dimenetpp_cinn
+
+        core = DimeNetPPTensorCore(self)
+        core.training = self.training
+        return compile_dimenetpp_cinn(core, full_graph=self.cinn_full_graph)
+
+    def _forward_cinn(self, data):
+        """Pack a public PGL batch and execute the compiled Tensor core."""
+
+        from ppmat.models.dimenetpp.dimenetpp_cinn import graph_to_tensor_batch
+
+        graph = data.get("graph") if isinstance(data, dict) else None
+        if graph is None:
+            raise KeyError("DimeNet++ CINN forward expects data['graph'].")
+        packed = graph_to_tensor_batch(graph)
+        return self._get_cinn_runtime()(*packed)
+
+    def prepare_cinn(self, sample_batch=None) -> None:
+        """Backward-compatible alias for :meth:`prepare_execution`."""
+
+        self.prepare_execution(sample_batch)
 
     def forward(self, data, return_loss=True, return_prediction=True):
         assert (

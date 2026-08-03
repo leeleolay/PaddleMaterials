@@ -18,6 +18,7 @@ from paddle.nn import Embedding
 from paddle.nn import Linear
 
 from ppmat.models.common import initializer
+from ppmat.models.common.cinn import CINNExecutionMixin
 from ppmat.models.common.spherical_fourier_bessel import DistEmbedding
 from ppmat.models.common.spherical_fourier_bessel import SphericalFourierBesselEmbedding
 from ppmat.models.spherenet.geometry import compute_geometry
@@ -284,7 +285,7 @@ class NodeUpdate(paddle.nn.Layer):
         return v
 
 
-class SphereNet(paddle.nn.Layer):
+class SphereNet(CINNExecutionMixin, paddle.nn.Layer):
     """Spherical Message Passing for 3D molecular graph tasks.
 
     This class follows the PaddleMaterials model protocol directly: ``forward``
@@ -320,8 +321,13 @@ class SphereNet(paddle.nn.Layer):
         data_mean=0.0,
         data_std=1.0,
         force_loss_weight=1.0,
+        execution_backend="eager",
+        cinn_full_graph=True,
     ):
         super().__init__()
+        self._init_cinn_execution(execution_backend, cinn_full_graph)
+        if not isinstance(extra_node_feature_dim, int) or extra_node_feature_dim <= 0:
+            raise ValueError("extra_node_feature_dim must be a positive integer.")
 
         act_fn = _swish if act in ("swish", "silu") else act
         if not callable(act_fn):
@@ -329,6 +335,7 @@ class SphereNet(paddle.nn.Layer):
 
         self.energy_and_force = energy_and_force
         self.use_extra_node_feature = use_extra_node_feature
+        self.extra_node_feature_dim = extra_node_feature_dim
         self.property_name = property_name
         self.force_key = force_key
         self.force_loss_weight = float(force_loss_weight)
@@ -404,7 +411,7 @@ class SphereNet(paddle.nn.Layer):
         for layer in layers:
             layer.reset_parameters()
 
-    def _forward(self, data):
+    def _forward_eager(self, data):
         graph = data["graph"].tensor()
         z = graph.node_feat["atomic_number"].astype("int64").reshape([-1])
         pos = graph.node_feat["pos"].astype(paddle.get_default_dtype())
@@ -443,6 +450,46 @@ class SphereNet(paddle.nn.Layer):
             u = u + _aggregate(v, node_batch, None, require_second_order)
 
         return u, pos
+
+    def _forward(self, data):
+        """Run the configured eager or CINN numerical backend."""
+
+        if self.execution_backend == "eager":
+            return self._forward_eager(data)
+        return self._forward_cinn(data)
+
+    def _validate_cinn_model(self):
+        if self.energy_and_force:
+            raise ValueError(
+                "SphereNet execution_backend='cinn' supports property prediction "
+                "only; energy_and_force=True requires eager second-order autograd."
+            )
+
+    def _compile_cinn_runtime(self):
+        from ppmat.models.spherenet.spherenet_cinn import SphereNetTensorCore
+        from ppmat.models.spherenet.spherenet_cinn import compile_spherenet_cinn
+
+        core = SphereNetTensorCore(self)
+        core.training = self.training
+        return compile_spherenet_cinn(core, full_graph=self.cinn_full_graph)
+
+    def _forward_cinn(self, data):
+        from ppmat.models.spherenet.spherenet_cinn import graph_to_tensor_batch
+
+        graph = data.get("graph") if isinstance(data, dict) else None
+        if graph is None:
+            raise KeyError("SphereNet CINN forward expects data['graph'].")
+        packed = graph_to_tensor_batch(
+            graph,
+            use_extra_node_feature=self.use_extra_node_feature,
+            extra_node_feature_dim=self.extra_node_feature_dim,
+        )
+        return self._get_cinn_runtime()(*packed), packed.pos
+
+    def prepare_cinn(self, sample_batch=None):
+        """Backward-compatible alias for :meth:`prepare_execution`."""
+
+        self.prepare_execution(sample_batch)
 
     def normalize(self, tensor):
         return (tensor - self.data_mean) / self.data_std

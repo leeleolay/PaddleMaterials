@@ -328,8 +328,7 @@ def test_dynamic_shape_cinn_inference_matches_tensor_eager():
 @pytest.mark.skipif(
     os.environ.get("PPMAT_RUN_CINN_TRAINING_TESTS") != "1",
     reason=(
-        "Set PPMAT_RUN_CINN_TRAINING_TESTS=1 to run the GPU CINN training "
-        "canary."
+        "Set PPMAT_RUN_CINN_TRAINING_TESTS=1 to run the GPU CINN training " "canary."
     ),
 )
 def test_dynamic_shape_cinn_training_matches_tensor_eager():

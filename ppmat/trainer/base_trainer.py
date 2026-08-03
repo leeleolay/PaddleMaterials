@@ -67,10 +67,10 @@ class BaseTrainer:
             Scheduler. Defaults to None.
         compute_metric_func_dict (Optional[Dict], optional): Compute metric function
             dictionary. Defaults to None.
-    
+
     Notice:
         support 2 types metric integration method. recommend metric module first. if
-        metirc calc is complicated using multipul inputs and outputs of models, could 
+        metirc calc is complicated using multipul inputs and outputs of models, could
         use stream metric.
     """
 
@@ -204,7 +204,8 @@ class BaseTrainer:
                 logger.info(
                     "VisualDL is enabled for logging, you can view it by running:\n"
                     f"visualdl --logdir {self.visualdl_writer._logdir} --port 8080"
-                    "\n For more information about how to use VisualDL, please refer to:"
+                    "\n For more information about how to use VisualDL, please "
+                    "refer to:"
                     "https://www.paddlepaddle.org.cn/paddle/visualdl"
                 )
 
@@ -508,7 +509,6 @@ class BaseTrainer:
             # concatenate gathered tensors and compute
             for key, compute_metric_func in self.compute_metric_func_dict.items():
 
-
                 pred = paddle.concat(all_pred_dict[key])[:num_eval_samples]
                 label = paddle.concat(all_label_dict[key])[:num_eval_samples]
                 metric = compute_metric_func(pred, label)
@@ -652,7 +652,10 @@ class BaseTrainer:
                     loss_info[key] = AverageMeter(key)
                 loss_info[key].update(float(loss_dict[key]), batch_size)
 
-            if self.compute_metric_during_train and self.compute_metric_func_dict is not None:
+            if (
+                self.compute_metric_during_train
+                and self.compute_metric_func_dict is not None
+            ):
                 pred_dict = result.get("pred_dict", {})
                 for key, compute_metric_func in self.compute_metric_func_dict.items():
                     if key not in pred_dict:
@@ -825,7 +828,7 @@ class BaseTrainer:
 
             # save checkpoint when epoch is divisible by save_freq
             if (
-                self.state.epoch % self.config["save_freq"] == 0
+                (self.save_freq > 0 and self.state.epoch % self.save_freq == 0)
                 or self.state.epoch == self.config["max_epochs"]
                 or self.state.epoch == 1
             ):
@@ -851,10 +854,14 @@ class BaseTrainer:
 
             # evaluate model when epoch is divisible by eval_freq
             if (
-                self.state.epoch % self.config["eval_freq"] == 0
-                or self.state.epoch == self.config["max_epochs"]
-                or self.state.epoch == 1
-            ) and val_dataloader is not None:
+                val_dataloader is not None
+                and self.eval_freq > 0
+                and (
+                    self.state.epoch % self.eval_freq == 0
+                    or self.state.epoch == self.config["max_epochs"]
+                    or self.state.epoch == 1
+                )
+            ):
 
                 eval_time_info, eval_loss_info, eval_metric_info = self.eval_epoch(
                     val_dataloader
