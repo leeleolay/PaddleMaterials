@@ -22,7 +22,6 @@ from typing import Union
 import numpy as np
 import paddle
 import paddle.nn as nn
-import pgl
 
 from ppmat.models.common.cinn import CINNExecutionMixin
 from ppmat.models.common.message_passing.message_passing import MessagePassing
@@ -520,25 +519,14 @@ class iComformer(CINNExecutionMixin, nn.Layer):
 
     @paddle.no_grad()
     def predict(self, graphs):
-        is_sequence = isinstance(graphs, (list, tuple))
-        if is_sequence:
-            if not graphs:
-                return []
-            graph_batch = pgl.Graph.batch(list(graphs))
-        elif isinstance(graphs, pgl.Graph):
-            graph_batch = graphs
-        else:
-            raise TypeError(
-                "iComformer.predict expects a pgl.Graph or a sequence of graphs, "
-                f"got {type(graphs)!r}."
-            )
+        if isinstance(graphs, list):
+            results = []
+            for graph in graphs:
+                result = self._forward({"graph": graph})
+                result = self.unnormalize(result).numpy()[0, 0]
+                results.append({self.property_name: result})
+            return results
 
-        predictions = self.unnormalize(self._forward({"graph": graph_batch})).numpy()
-        num_graphs = graph_batch.num_graph
-        if isinstance(num_graphs, paddle.Tensor):
-            num_graphs = int(num_graphs.numpy().reshape(-1)[0])
-        else:
-            num_graphs = int(num_graphs)
-        if is_sequence or num_graphs > 1:
-            return [{self.property_name: prediction[0]} for prediction in predictions]
-        return {self.property_name: predictions[0, 0]}
+        result = self._forward({"graph": graphs})
+        result = self.unnormalize(result).numpy()[0, 0]
+        return {self.property_name: result}

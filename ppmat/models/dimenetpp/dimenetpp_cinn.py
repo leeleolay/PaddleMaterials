@@ -47,6 +47,7 @@ class DimeNetPPTensorBatch(NamedTuple):
 
     atom_types: paddle.Tensor
     frac_coords: paddle.Tensor
+    cart_coords: paddle.Tensor
     lattice: paddle.Tensor
     edge_src: paddle.Tensor
     edge_dst: paddle.Tensor
@@ -122,6 +123,7 @@ def graph_to_tensor_batch(
     required_node_features = (
         "atom_types",
         "frac_coords",
+        "cart_coords",
         "lattice",
     )
     for name in required_node_features:
@@ -134,6 +136,7 @@ def graph_to_tensor_batch(
     return DimeNetPPTensorBatch(
         atom_types=_to_tensor(graph.node_feat["atom_types"], "int64"),
         frac_coords=_to_tensor(graph.node_feat["frac_coords"], "float32"),
+        cart_coords=_to_tensor(graph.node_feat["cart_coords"], "float32"),
         lattice=_to_tensor(graph.node_feat["lattice"], "float32"),
         edge_src=_to_tensor(edges[:, 0], "int64"),
         edge_dst=_to_tensor(edges[:, 1], "int64"),
@@ -199,11 +202,7 @@ class DimeNetPPTensorCore(paddle.nn.Layer):
         super().__init__()
         if not isinstance(model, DimeNetPlusPlus):
             raise TypeError(f"model must be DimeNetPlusPlus, got {type(model)!r}.")
-        if model.readout not in {"sum", "add", "mean"}:
-            raise ValueError(
-                "DimeNet++ CINN supports readout='sum' or 'mean', "
-                f"got {model.readout!r}."
-            )
+        model._validate_cinn_model()
         self.model = model
 
     @staticmethod
@@ -237,6 +236,7 @@ class DimeNetPPTensorCore(paddle.nn.Layer):
         self,
         atom_types: paddle.Tensor,
         frac_coords: paddle.Tensor,
+        cart_coords: paddle.Tensor,
         lattice: paddle.Tensor,
         edge_src: paddle.Tensor,
         edge_dst: paddle.Tensor,
@@ -252,12 +252,12 @@ class DimeNetPPTensorCore(paddle.nn.Layer):
         num_graphs = paddle.shape(lattice)[0]
 
         node_lattice = paddle.gather(lattice, node_graph_id, axis=0)
-        pos = paddle.bmm(frac_coords.unsqueeze(1), node_lattice).squeeze(1)
+        distance_pos = paddle.bmm(frac_coords.unsqueeze(1), node_lattice).squeeze(1)
         edge_lattice = paddle.gather(lattice, edge_graph_id, axis=0)
         offsets = paddle.bmm(pbc_offset.unsqueeze(1), edge_lattice).squeeze(1)
         distance_vectors = (
-            paddle.gather(pos, edge_src, axis=0)
-            - paddle.gather(pos, edge_dst, axis=0)
+            paddle.gather(distance_pos, edge_src, axis=0)
+            - paddle.gather(distance_pos, edge_dst, axis=0)
             + offsets
         )
         dist = paddle.linalg.norm(distance_vectors, axis=-1)
@@ -266,13 +266,13 @@ class DimeNetPPTensorCore(paddle.nn.Layer):
         idx_j = paddle.gather(edge_src, idx_ji, axis=0)
         idx_k = paddle.gather(edge_src, idx_kj, axis=0)
         pos_ji = (
-            paddle.gather(pos, idx_j, axis=0)
-            - paddle.gather(pos, idx_i, axis=0)
+            paddle.gather(cart_coords, idx_j, axis=0)
+            - paddle.gather(cart_coords, idx_i, axis=0)
             + paddle.gather(offsets, idx_ji, axis=0)
         )
         pos_kj = (
-            paddle.gather(pos, idx_k, axis=0)
-            - paddle.gather(pos, idx_j, axis=0)
+            paddle.gather(cart_coords, idx_k, axis=0)
+            - paddle.gather(cart_coords, idx_j, axis=0)
             + paddle.gather(offsets, idx_kj, axis=0)
         )
         angle = paddle.atan2(
@@ -312,6 +312,7 @@ def make_dimenetpp_input_spec() -> list[paddle.static.InputSpec]:
     return [
         paddle.static.InputSpec([None], dtype="int64", name="atom_types"),
         paddle.static.InputSpec([None, 3], dtype="float32", name="frac_coords"),
+        paddle.static.InputSpec([None, 3], dtype="float32", name="cart_coords"),
         paddle.static.InputSpec([None, 3, 3], dtype="float32", name="lattice"),
         paddle.static.InputSpec([None], dtype="int64", name="edge_src"),
         paddle.static.InputSpec([None], dtype="int64", name="edge_dst"),

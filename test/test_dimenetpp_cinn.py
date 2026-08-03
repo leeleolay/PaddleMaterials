@@ -78,7 +78,9 @@ def _make_graphs() -> tuple[pgl.Graph, pgl.Graph]:
     return _make_graph(3), _make_graph(4, coordinate_shift=0.125)
 
 
-def _make_model(execution_backend: str = "eager") -> DimeNetPlusPlus:
+def _make_model(
+    execution_backend: str = "eager", readout: str = "mean"
+) -> DimeNetPlusPlus:
     with paddle.utils.unique_name.guard():
         paddle.seed(2026)
         model = DimeNetPlusPlus(
@@ -95,7 +97,7 @@ def _make_model(execution_backend: str = "eager") -> DimeNetPlusPlus:
             num_before_skip=1,
             num_after_skip=1,
             num_output_layers=1,
-            readout="mean",
+            readout=readout,
             loss_type="mse_loss",
             execution_backend=execution_backend,
         )
@@ -126,6 +128,7 @@ def test_graph_to_tensor_batch_preserves_graph_and_triplet_contract():
     tensor_packed = graph_to_tensor_batch(tensor_graph)
     assert tensor_packed.atom_types is tensor_graph.node_feat["atom_types"]
     assert tensor_packed.frac_coords is tensor_graph.node_feat["frac_coords"]
+    assert tensor_packed.cart_coords is tensor_graph.node_feat["cart_coords"]
     eager_triplets = _make_model().triplets(
         tensor_graph.edges.T, num_nodes=tensor_graph.graph_node_id.shape[0]
     )
@@ -170,6 +173,19 @@ def test_tensor_core_matches_eager_without_triplets():
     assert packed.idx_ji.shape == [0]
     expected = model._forward_eager({"graph": graph})
     actual = DimeNetPPTensorCore(model)(*packed)
+
+    _assert_allclose(actual, expected)
+
+
+def test_tensor_core_uses_eager_cartesian_coordinates_for_angles():
+    reference_graph = _make_graph(4)
+    tensor_graph = _make_graph(4)
+    reference_graph.node_feat["cart_coords"][1, 0] += 0.35
+    tensor_graph.node_feat["cart_coords"][1, 0] += 0.35
+    model = _make_model()
+
+    expected = model._forward_eager({"graph": reference_graph})
+    actual = DimeNetPPTensorCore(model)(*graph_to_tensor_batch(tensor_graph))
 
     _assert_allclose(actual, expected)
 
@@ -286,6 +302,13 @@ def test_public_cinn_backend_fails_fast_on_cpu():
         model.validate_execution_backend()
 
 
+def test_public_cinn_backend_rejects_unsupported_readout_before_compilation():
+    model = _make_model(execution_backend="cinn", readout="max")
+
+    with pytest.raises(ValueError, match="supports readout='sum' or 'mean'"):
+        model.validate_execution_backend()
+
+
 def test_graph_to_tensor_batch_validates_required_features():
     graph = pgl.Graph(
         edges=np.asarray([[0, 1], [1, 0]], dtype=np.int64),
@@ -293,6 +316,11 @@ def test_graph_to_tensor_batch_validates_required_features():
         node_feat={"atom_types": np.asarray([1, 8], dtype=np.int64)},
     )
     with pytest.raises(ValueError, match=r"node_feat\['frac_coords'\]"):
+        graph_to_tensor_batch(graph)
+
+    graph = _make_graph(3)
+    del graph.node_feat["cart_coords"]
+    with pytest.raises(ValueError, match=r"node_feat\['cart_coords'\]"):
         graph_to_tensor_batch(graph)
 
 

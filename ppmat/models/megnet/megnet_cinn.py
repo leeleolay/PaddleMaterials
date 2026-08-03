@@ -97,7 +97,6 @@ def _scalar_int(value) -> int:
 
 def graph_to_tensor_batch(
     graph: pgl.Graph | Sequence[pgl.Graph],
-    state_attr: Optional[paddle.Tensor] = None,
     state_dim: int = 2,
 ) -> GraphTensorBatch:
     """Extract the tensor inputs required by :class:`MEGNetTensorCore`.
@@ -105,11 +104,8 @@ def graph_to_tensor_batch(
     Args:
         graph: A PGL graph or a sequence of graphs.  A sequence is batched in
             Python before conversion.
-        state_attr: Optional graph-level state with shape ``[B, state_dim]``.
-            When omitted, the MEGNet default zero state is created.
-        state_dim: Graph-level state feature dimension used when
-            ``state_attr`` is omitted.  The default matches MEGNet's standard
-            two-feature state.
+        state_dim: Graph-level zero-state feature dimension. The default matches
+            MEGNet's standard two-feature state.
 
     Returns:
         A ``GraphTensorBatch`` whose first dimensions may vary between calls,
@@ -154,20 +150,7 @@ def graph_to_tensor_batch(
     node_sorted_eid = _to_tensor(sorted_eid, "int64")
 
     num_graphs = _scalar_int(graph.num_graph)
-    if state_attr is None:
-        state_attr = paddle.zeros([num_graphs, state_dim], dtype="float32")
-    else:
-        state_attr = _to_tensor(state_attr, "float32")
-        if len(state_attr.shape) != 2 or state_attr.shape[0] != num_graphs:
-            raise ValueError(
-                f"state_attr must have shape [num_graphs, {state_dim}], "
-                f"got {state_attr.shape} for {num_graphs} graphs."
-            )
-        if state_attr.shape[1] != state_dim:
-            raise ValueError(
-                f"MEGNet state_attr must have feature dimension {state_dim}, "
-                f"got {state_attr.shape}."
-            )
+    state_attr = paddle.zeros([num_graphs, state_dim], dtype="float32")
 
     return GraphTensorBatch(
         atom_types=atom_types,
@@ -184,14 +167,12 @@ def graph_to_tensor_batch(
 
 def pack_pgl_graph(
     graph: pgl.Graph | Sequence[pgl.Graph],
-    state_attr: Optional[paddle.Tensor] = None,
     state_dim: int = 2,
 ) -> GraphTensorBatch:
     """Alias with an explicit packing name for the PGL-to-tensor boundary."""
 
     return graph_to_tensor_batch(
         graph,
-        state_attr=state_attr,
         state_dim=state_dim,
     )
 
@@ -422,13 +403,11 @@ class MEGNetTensorCore(paddle.nn.Layer):
     def forward_graph(
         self,
         graph: pgl.Graph | Sequence[pgl.Graph],
-        state_attr: Optional[paddle.Tensor] = None,
     ) -> paddle.Tensor:
         """Convenience eager call for a PGL graph."""
 
         packed = graph_to_tensor_batch(
             graph,
-            state_attr=state_attr,
             state_dim=self.model.embedding.dim_state_embedding,
         )
         return self.forward_tensor(packed)
@@ -436,7 +415,6 @@ class MEGNetTensorCore(paddle.nn.Layer):
     def forward_tensor(
         self,
         batch: GraphTensorBatch,
-        state_attr: Optional[paddle.Tensor] = None,
     ) -> paddle.Tensor:
         """Run a packed graph and return normalized predictions of shape ``[B, 1]``."""
 
@@ -450,35 +428,16 @@ class MEGNetTensorCore(paddle.nn.Layer):
                 "batch.state_attr has feature dimension "
                 f"{batch.state_attr.shape[1]}, expected {expected_state_dim}."
             )
-        if state_attr is not None:
-            state_attr = _to_tensor(state_attr, "float32")
-            if len(state_attr.shape) != 2:
-                raise ValueError(
-                    f"state_attr must have shape [B, D], got {state_attr.shape}."
-                )
-            if state_attr.shape[0] != batch.state_attr.shape[0]:
-                raise ValueError(
-                    "state_attr batch dimension "
-                    f"{state_attr.shape[0]} does not match "
-                    f"{batch.state_attr.shape[0]}."
-                )
-            if state_attr.shape[1] != expected_state_dim:
-                raise ValueError(
-                    "state_attr has feature dimension "
-                    f"{state_attr.shape[1]}, expected {expected_state_dim}."
-                )
-            batch = batch._replace(state_attr=state_attr)
         return self(*batch)
 
     @paddle.no_grad()
     def predict_tensor(
         self,
         batch: GraphTensorBatch,
-        state_attr: Optional[paddle.Tensor] = None,
     ) -> paddle.Tensor:
         """Return unnormalized predictions as a tensor of shape ``[B, 1]``."""
 
-        return self.model.unnormalize(self.forward_tensor(batch, state_attr=state_attr))
+        return self.model.unnormalize(self.forward_tensor(batch))
 
 
 def make_megnet_input_spec(

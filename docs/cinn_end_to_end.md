@@ -42,7 +42,7 @@ schedule or reproduced a paper metric.
 | `MEGNetPlus` | 36 / 36 | Single-GPU FP32 | Single-GPU FP32 | PGL batching, graph-state packing |
 | `iComformer` | 8 / 8 | Single-GPU FP32 | Single-GPU FP32 | PGL batching and feature packing |
 | `DimeNetPlusPlus` | 4 / 4 | Single-GPU FP32 | Single-GPU FP32 | PGL batching and discrete triplet construction |
-| `SphereNet` | 12 / 12 | Single-GPU FP32 | Single-GPU FP32 | PGL batching and discrete torsion index selection |
+| `SphereNet` | 12 / 12 | Single-GPU FP32, triplets required | Single-GPU FP32 | PGL batching and discrete torsion index selection |
 
 All 12 SphereNet property-prediction YAML files set
 `Model.__init_params__.energy_and_force=false`. That scalar-property path is
@@ -163,6 +163,14 @@ and readout run in the CINN numerical core. Loss construction, backward
 invocation, and optimizer updates remain in the standard Paddle Trainer flow;
 gradients propagate through the compiled core.
 
+DimeNet++ packs both fractional and Cartesian coordinates because its existing
+eager path derives periodic distances from `frac_coords` and `lattice`, but
+derives triplet angles from `cart_coords`. Keeping those sources distinct also
+preserves graphs whose Cartesian coordinates are not reconstructed from the
+stored fractional values. SphereNet's eager path tensorizes only the graph
+fields it consumes, so unrelated string metadata remains outside Paddle and
+the source PGL graph is not mutated.
+
 Checkpoint files contain the ordinary model and optimizer state only. Resume
 and Predictor loading therefore remain compatible with eager checkpoints. A
 new process compiles train/eval callables from its first real input, while an
@@ -176,10 +184,10 @@ alone is not end-to-end evidence.
 | Level | Evidence |
 |---|---|
 | Shared workflow contract | Backend selection, fail-fast checks, real-batch warmup, train/eval mode separation, state/RNG preservation, and checkpoint-key stability |
-| Adapter parity | PGL-to-Tensor packing, single and batched forward, dynamic shapes, loss, parameter gradients, and an Adam update against the eager model |
+| Adapter parity | PGL-to-Tensor packing, single and batched forward, dynamic shapes, loss, parameter gradients, and an Adam update against the original eager model, subject to the documented iComformer bias boundary |
 | GPU CINN canary | Actual Paddle 3.3.1 CINN forward, backward, and optimizer step on one GPU |
-| Trainer workflow | Training step, evaluation, `latest`/`best` checkpoint creation, load/resume, and optimizer-state restoration |
-| Predictor workflow | Checkpoint load, graph conversion, first-input eval warmup, single/batched prediction, and output serialization |
+| Trainer workflow | Independent eager/CINN training from identical state, evaluation, `latest`/`best` checkpoint creation, load/resume, and optimizer-state restoration |
+| Predictor workflow | The same checkpoint loaded by eager/CINN Predictors, graph conversion, first-input eval warmup, single/batched prediction, and output serialization |
 | Full reproduction | Full dataset schedule, final metric, and paper/checkpoint comparison; not claimed by this adapter work |
 
 The PaddlePaddle 3.3.1 GPU validation run included these end-to-end canaries:
@@ -196,18 +204,27 @@ counts to keep compiler validation bounded. Their registered Predictor checks
 use the released, full-size model configurations and checkpoints. These values
 are execution/parity evidence, not task-quality measurements.
 
+The opt-in workflow tests additionally construct independent eager and CINN
+Trainers from identical weights and compare their one-step model and Adam
+states. Both backends then resume the same CINN `latest` checkpoint, execute a
+second update, and compare the restored model and optimizer state. Eager and
+CINN Predictors finally load the same resumed checkpoint and compare the public
+CIF or XYZ prediction. This prevents a compiled Tensor core from serving as its
+own reference. The documented iComformer bias exception is checked explicitly
+in both optimizer steps.
+
 A focused non-GPU/PIR regression run is:
 
 ```bash
 python -m pytest \
   test/test_execution_backend.py \
-  ppmat/models/megnet/tests/test_megnet_cinn.py \
-  ppmat/models/megnet/tests/test_megnet_cinn_workflows.py \
-  ppmat/models/comformer/tests/test_comformer_cinn.py \
-  ppmat/models/dimenetpp/tests/test_dimenetpp_cinn.py \
-  ppmat/models/dimenetpp/tests/test_dimenetpp_cinn_workflows.py \
-  ppmat/models/spherenet/tests/test_spherenet_cinn.py \
-  ppmat/models/spherenet/tests/test_spherenet_cinn_workflows.py \
+  test/test_megnet_cinn.py \
+  test/test_megnet_cinn_workflows.py \
+  test/test_comformer_cinn.py \
+  test/test_dimenetpp_cinn.py \
+  test/test_dimenetpp_cinn_workflows.py \
+  test/test_spherenet_cinn.py \
+  test/test_spherenet_cinn_workflows.py \
   test/test_predictor.py -q
 ```
 
@@ -218,6 +235,20 @@ a Tensor core or compiler boundary.
 
 ## Known Numerical Boundary
 
+In iComformer, each `lin_concate.bias` is immediately followed by training
+BatchNorm and is algebraically canceled when the normalization batch contains
+more than one value. Paddle's eager GPU kernel and the explicit PIR/CINN
+reduction can nevertheless leave different roundoff gradients up to `1.2e-5`
+in the two-layer canary; Adam can map such a nonzero sign to a bias update near
+`1e-3`. A one-step two-layer probe measured a post-update eval-output difference
+of `2.12e-3`, which the optimizer canary bounds at `3e-3`. The original eager
+implementation is intentionally unchanged. Tests bound these gradients,
+compare every other parameter and BatchNorm buffer after Adam, and exercise the
+single-value BatchNorm Tensor-core forward/backward path separately. Predictor
+parity uses the same checkpoint for both backends. Consequently, complete
+iComformer optimizer-state equality for those canceled bias entries is not
+claimed.
+
 A two-node DimeNet++ graph has directed edges but no valid non-backtracking
 triplet. On PaddlePaddle 3.3.1, eager backward through this zero-triplet path
 has a framework limitation and is not a reliable eager-versus-CINN backward
@@ -227,12 +258,11 @@ zero-triplet training as unsupported on this validated version rather than
 inferring support from the forward test.
 
 SphereNet keeps its masked empty-triplet sentinel for CINN evaluation and
-prediction. During training, an entirely empty-triplet batch uses SphereNet's
-existing eager path because the static sentinel produces zero gradients for
-angle/torsion projection parameters that eager leaves unused. This preserves
-Adam state and subsequent update parity without changing the Trainer contract.
-If the first training batch has no triplets, lazy kernel compilation occurs on
-the first later batch that contains triplets.
+prediction. CINN training requires every collated batch to contain at least one
+triplet: the static sentinel produces zero gradients for angle/torsion
+projection parameters that eager leaves unused, which changes Adam state.
+The model raises a clear error for an entirely empty-triplet training batch
+instead of silently switching the Trainer to eager execution.
 
 Short deterministic and real-data canaries establish workflow execution,
 checkpointing, and numerical sanity. They do not establish full-dataset

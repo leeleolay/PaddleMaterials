@@ -170,6 +170,14 @@ def test_pack_pgl_graph_masks_empty_triplet_sentinel():
     np.testing.assert_array_equal(packed.triplet_mask.numpy(), [[0.0]])
 
 
+def test_extra_node_feature_dimension_is_validated_only_when_consumed():
+    model = _make_model(extra_node_feature_dim=0)
+    assert model.extra_node_feature_dim == 1
+
+    with pytest.raises(ValueError, match="positive integer"):
+        _make_model(use_extra_node_feature=True, extra_node_feature_dim=0)
+
+
 @pytest.mark.parametrize("batch_size", [1, 2])
 def test_tensor_core_matches_eager_forward(batch_size):
     graph_a, graph_b, _ = _make_graphs()
@@ -203,53 +211,31 @@ def test_tensor_core_matches_empty_triplet_eager_forward():
     _assert_allclose(actual, expected)
 
 
-def test_public_cinn_training_preserves_empty_triplet_adam_semantics(monkeypatch):
-    graph, _, graph_no_triplets = _make_graphs()
-    reference_model = _make_model()
+def test_public_cinn_training_rejects_empty_triplet_batch(monkeypatch):
+    _, _, graph_no_triplets = _make_graphs()
+    unused_metadata = np.asarray(["ignored"] * graph_no_triplets.num_nodes)
+    graph_no_triplets.node_feat["unused_metadata"] = unused_metadata
     cinn_model = _make_model(execution_backend="cinn")
-    cinn_model.set_state_dict(reference_model.state_dict())
-    reference_model.train()
     cinn_model.train()
-    runtime = SphereNetTensorCore(cinn_model)
-    runtime.train()
-    runtime_calls = []
-
-    def get_runtime():
-        runtime_calls.append(True)
-        return runtime
-
-    monkeypatch.setattr(cinn_model, "_get_cinn_runtime", get_runtime)
-    reference_optimizer = paddle.optimizer.Adam(
-        learning_rate=1e-3, parameters=reference_model.parameters()
+    monkeypatch.setattr(cinn_model, "_validate_cinn_environment", lambda: None)
+    monkeypatch.setattr(
+        cinn_model,
+        "_get_cinn_runtime",
+        lambda: pytest.fail("empty-triplet training must fail before runtime lookup"),
     )
-    cinn_optimizer = paddle.optimizer.Adam(
-        learning_rate=1e-3, parameters=cinn_model.parameters()
+
+    with pytest.raises(ValueError, match="requires at least one triplet"):
+        cinn_model(
+            {
+                "graph": graph_no_triplets,
+                "mu": paddle.to_tensor([[0.0]], dtype="float32"),
+            }
+        )
+
+    assert not graph_no_triplets.is_tensor()
+    np.testing.assert_array_equal(
+        graph_no_triplets.node_feat["unused_metadata"], unused_metadata
     )
-    graph_sequence = (graph_no_triplets, graph, graph_no_triplets, graph)
-    target_sequence = (0.0, 0.25, -0.5, 0.75)
-
-    for step_graph, target in zip(graph_sequence, target_sequence):
-        data = {
-            "graph": step_graph,
-            "mu": paddle.to_tensor([[target]], dtype="float32"),
-        }
-        reference = reference_model(data)
-        actual = cinn_model(data)
-        reference["loss_dict"]["loss"].backward()
-        actual["loss_dict"]["loss"].backward()
-
-        _assert_allclose(actual["pred_dict"]["mu"], reference["pred_dict"]["mu"])
-        _assert_gradients_close(reference_model, cinn_model)
-        reference_optimizer.step()
-        cinn_optimizer.step()
-        for name, reference_parameter in reference_model.named_parameters():
-            _assert_allclose(
-                dict(cinn_model.named_parameters())[name], reference_parameter
-            )
-        reference_optimizer.clear_grad(set_to_zero=False)
-        cinn_optimizer.clear_grad(set_to_zero=False)
-
-    assert len(runtime_calls) == len(graph_sequence)
 
 
 def test_tensor_core_matches_eager_gradients_and_adam_step():
@@ -375,6 +361,7 @@ def test_public_cinn_backend_fails_fast_on_cpu():
     graph, _, graph_no_triplets = _make_graphs()
     for test_graph in (graph, graph_no_triplets):
         model = _make_model(execution_backend="cinn")
+        model.eval()
         with pytest.raises(RuntimeError, match="requires"):
             model({"graph": test_graph}, return_loss=False)
 
@@ -387,8 +374,8 @@ def test_public_cinn_backend_rejects_force_training():
 
 
 @pytest.mark.skipif(
-    os.environ.get("PPMAT_RUN_SPHERENET_CINN_TESTS") != "1",
-    reason="Set PPMAT_RUN_SPHERENET_CINN_TESTS=1 for GPU CINN inference.",
+    os.environ.get("PPMAT_RUN_CINN_TESTS") != "1",
+    reason="Set PPMAT_RUN_CINN_TESTS=1 for GPU CINN inference.",
 )
 def test_dynamic_shape_cinn_inference_matches_eager():
     if not paddle.is_compiled_with_cuda():
@@ -396,22 +383,30 @@ def test_dynamic_shape_cinn_inference_matches_eager():
     if not paddle.base.is_compiled_with_cinn():
         pytest.skip("Paddle was not compiled with CINN.")
     paddle.set_device("gpu:0")
-    graph_a, graph_b, _ = _make_graphs()
-    model = _make_model()
-    model.eval()
-    core = SphereNetTensorCore(model)
+    graph_a, graph_b, graph_no_triplets = _make_graphs()
+    reference_model = _make_model()
+    cinn_model = _make_model()
+    cinn_model.set_state_dict(reference_model.state_dict())
+    reference_model.eval()
+    cinn_model.eval()
+    core = SphereNetTensorCore(cinn_model)
     core.eval()
     compiled = compile_spherenet_cinn(core, full_graph=True)
     compiled.eval()
 
-    for graph in (graph_a, _collate([graph_a, graph_b])["graph"]):
+    for graph in (
+        graph_a,
+        _collate([graph_a, graph_b])["graph"],
+        graph_no_triplets,
+    ):
+        expected = reference_model._forward_eager({"graph": graph})[0]
         packed = graph_to_tensor_batch(graph)
-        _assert_allclose(compiled(*packed), core(*packed))
+        _assert_allclose(compiled(*packed), expected)
 
 
 @pytest.mark.skipif(
-    os.environ.get("PPMAT_RUN_SPHERENET_CINN_TRAINING_TESTS") != "1",
-    reason="Set PPMAT_RUN_SPHERENET_CINN_TRAINING_TESTS=1 for GPU training.",
+    os.environ.get("PPMAT_RUN_CINN_TRAINING_TESTS") != "1",
+    reason="Set PPMAT_RUN_CINN_TRAINING_TESTS=1 for GPU training.",
 )
 def test_dynamic_shape_cinn_training_matches_eager_adam_steps():
     if not paddle.is_compiled_with_cuda():
@@ -419,7 +414,7 @@ def test_dynamic_shape_cinn_training_matches_eager_adam_steps():
     if not paddle.base.is_compiled_with_cinn():
         pytest.skip("Paddle was not compiled with CINN.")
     paddle.set_device("gpu:0")
-    graph_a, graph_b, graph_no_triplets = _make_graphs()
+    graph_a, graph_b, _ = _make_graphs()
     reference_model = _make_model()
     cinn_model = _make_model(execution_backend="cinn")
     cinn_model.set_state_dict(reference_model.state_dict())
@@ -432,14 +427,14 @@ def test_dynamic_shape_cinn_training_matches_eager_adam_steps():
         learning_rate=1e-3, parameters=cinn_model.parameters()
     )
     graph_sequence = (
-        graph_no_triplets,
         _collate([graph_a, graph_b])["graph"],
         graph_a,
+        _collate([graph_b, graph_a])["graph"],
     )
     target_sequence = (
-        paddle.to_tensor([[0.0]], dtype="float32"),
         paddle.to_tensor([[0.25], [-0.75]], dtype="float32"),
         paddle.to_tensor([[0.5]], dtype="float32"),
+        paddle.to_tensor([[-0.25], [0.75]], dtype="float32"),
     )
 
     for graph, target in zip(graph_sequence, target_sequence):

@@ -150,20 +150,6 @@ def _sum_by_id(
     )
 
 
-def _mean_by_id(
-    values: paddle.Tensor,
-    segment_ids: paddle.Tensor,
-    out_size: paddle.Tensor,
-) -> paddle.Tensor:
-    sums = _sum_by_id(values, segment_ids, out_size)
-    counts = paddle.scatter_nd_add(
-        paddle.zeros([out_size, 1], dtype=values.dtype),
-        paddle.unsqueeze(segment_ids, axis=1),
-        paddle.ones_like(values[:, :1]),
-    )
-    return sums / paddle.clip(counts, min=1.0)
-
-
 def _batch_norm_1d(
     layer: paddle.nn.BatchNorm1D,
     values: paddle.Tensor,
@@ -393,8 +379,13 @@ class ComformerTensorCore(paddle.nn.Layer):
                 edge_features,
             )
 
-        graph_count = paddle.shape(graph_node_count)[0]
-        features = _mean_by_id(node_features, node_graph_id, graph_count)
+        features = _sum_by_id(
+            node_features,
+            node_graph_id,
+            paddle.shape(graph_node_count)[0],
+        )
+        node_count = paddle.cast(graph_node_count.unsqueeze(1), features.dtype)
+        features = features / paddle.clip(node_count, min=1.0)
         return model.fc_out(model.fc(features))
 
     def forward_graph(self, graph: pgl.Graph | Sequence[pgl.Graph]) -> paddle.Tensor:

@@ -517,6 +517,13 @@ class DimeNetPlusPlus(CINNExecutionMixin, paddle.nn.Layer):
             return self._forward_eager(data)
         return self._forward_cinn(data)
 
+    def _validate_cinn_model(self) -> None:
+        if self.readout not in {"sum", "add", "mean"}:
+            raise ValueError(
+                "DimeNet++ CINN supports readout='sum' or 'mean', "
+                f"got {self.readout!r}."
+            )
+
     def _compile_cinn_runtime(self):
         """Build the DimeNet++ Tensor core used by the shared lifecycle."""
 
@@ -537,11 +544,6 @@ class DimeNetPlusPlus(CINNExecutionMixin, paddle.nn.Layer):
             raise KeyError("DimeNet++ CINN forward expects data['graph'].")
         packed = graph_to_tensor_batch(graph)
         return self._get_cinn_runtime()(*packed)
-
-    def prepare_cinn(self, sample_batch=None) -> None:
-        """Backward-compatible alias for :meth:`prepare_execution`."""
-
-        self.prepare_execution(sample_batch)
 
     def forward(self, data, return_loss=True, return_prediction=True):
         assert (

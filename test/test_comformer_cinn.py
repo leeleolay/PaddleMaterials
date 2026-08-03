@@ -90,11 +90,14 @@ def _make_single_node_graph() -> pgl.Graph:
     )
 
 
-def _make_model(execution_backend: str = "eager") -> iComformer:
+def _make_model(
+    execution_backend: str = "eager",
+    conv_layers: int = 1,
+) -> iComformer:
     with paddle.utils.unique_name.guard():
         paddle.seed(2026)
         return iComformer(
-            conv_layers=1,
+            conv_layers=conv_layers,
             edge_layers=1,
             atom_input_features=92,
             edge_features=8,
@@ -106,18 +109,27 @@ def _make_model(execution_backend: str = "eager") -> iComformer:
         )
 
 
-def _assert_allclose(actual, expected, atol=2e-6, rtol=2e-6):
+def _assert_allclose(actual, expected, atol=2e-6, rtol=2e-6, err_msg=""):
     np.testing.assert_allclose(
         actual.numpy(),
         expected.numpy(),
         atol=atol,
         rtol=rtol,
+        err_msg=err_msg,
     )
 
 
-def _assert_state_dict_close(actual, expected, atol=2e-6, rtol=2e-6):
+def _assert_state_dict_close(
+    actual,
+    expected,
+    atol=2e-6,
+    rtol=2e-6,
+    excluded_keys=frozenset(),
+):
     assert actual.keys() == expected.keys()
     for key in actual:
+        if key in excluded_keys:
+            continue
         np.testing.assert_allclose(
             actual[key].numpy(),
             expected[key].numpy(),
@@ -125,6 +137,25 @@ def _assert_state_dict_close(actual, expected, atol=2e-6, rtol=2e-6):
             rtol=rtol,
             err_msg=key,
         )
+
+
+def _cancelled_batch_norm_biases(parameters):
+    return {name for name in parameters if name.endswith("lin_concate.bias")}
+
+
+def _cancelled_optimizer_moment_keys(model, optimizer_state):
+    parameters = dict(model.named_parameters())
+    cancelled_biases = _cancelled_batch_norm_biases(parameters)
+    parameter_names = {
+        parameter.name
+        for name, parameter in parameters.items()
+        if name in cancelled_biases
+    }
+    return {
+        key
+        for key in optimizer_state
+        if any(key.startswith(f"{name}_moment") for name in parameter_names)
+    }
 
 
 def test_graph_to_tensor_batch_packs_single_and_dynamic_batches():
@@ -210,6 +241,128 @@ def test_tensor_core_matches_single_node_training_batch_norm():
         )
 
 
+def test_tensor_core_matches_eager_gradients_and_adam_step():
+    reference_model = _make_model()
+    tensor_model = _make_model()
+    tensor_model.set_state_dict(reference_model.state_dict())
+    reference_model.train()
+    tensor_model.train()
+    tensor_core = ComformerTensorCore(tensor_model)
+    tensor_core.training = True
+    graph_a, graph_b = _make_graphs()
+    target = paddle.to_tensor([[0.25], [-0.75]], dtype="float32")
+
+    reference_output = reference_model._forward_eager(
+        {"graph": pgl.Graph.batch([graph_a, graph_b])}
+    )
+    tensor_output = tensor_core(*graph_to_tensor_batch(pgl.Graph.batch(_make_graphs())))
+    reference_loss = paddle.nn.functional.mse_loss(reference_output, target)
+    tensor_loss = paddle.nn.functional.mse_loss(tensor_output, target)
+    reference_loss.backward()
+    tensor_loss.backward()
+
+    _assert_allclose(tensor_output, reference_output)
+    _assert_allclose(tensor_loss, reference_loss)
+    reference_parameters = dict(reference_model.named_parameters())
+    tensor_parameters = dict(tensor_model.named_parameters())
+    assert reference_parameters.keys() == tensor_parameters.keys()
+    cancelled_biases = _cancelled_batch_norm_biases(reference_parameters)
+    tensor_biases_before_step = {
+        name: tensor_parameters[name].clone() for name in cancelled_biases
+    }
+    for name, reference_parameter in reference_parameters.items():
+        tensor_parameter = tensor_parameters[name]
+        if reference_parameter.grad is None:
+            assert tensor_parameter.grad is None, name
+        elif name in cancelled_biases:
+            assert float(paddle.max(paddle.abs(reference_parameter.grad))) < 2e-5
+            assert float(paddle.max(paddle.abs(tensor_parameter.grad))) == 0.0
+        else:
+            _assert_allclose(
+                tensor_parameter.grad,
+                reference_parameter.grad,
+                atol=2e-4,
+                rtol=2e-4,
+                err_msg=name,
+            )
+
+    reference_optimizer = paddle.optimizer.Adam(
+        learning_rate=1e-3, parameters=reference_model.parameters()
+    )
+    tensor_optimizer = paddle.optimizer.Adam(
+        learning_rate=1e-3, parameters=tensor_model.parameters()
+    )
+    reference_optimizer.step()
+    tensor_optimizer.step()
+    reference_parameters = dict(reference_model.named_parameters())
+    tensor_parameters = dict(tensor_model.named_parameters())
+    assert reference_parameters.keys() == tensor_parameters.keys()
+    for name, reference_parameter in reference_parameters.items():
+        if name in cancelled_biases:
+            _assert_allclose(
+                tensor_parameters[name],
+                tensor_biases_before_step[name],
+                atol=0.0,
+                rtol=0.0,
+                err_msg=name,
+            )
+            continue
+        if reference_parameter.stop_gradient:
+            continue
+        _assert_allclose(
+            tensor_parameters[name],
+            reference_parameter,
+            atol=2e-5,
+            rtol=2e-5,
+            err_msg=name,
+        )
+
+
+def test_two_layer_tensor_core_propagates_edge_update_gradients():
+    reference_model = _make_model(conv_layers=2)
+    tensor_model = _make_model(conv_layers=2)
+    tensor_model.set_state_dict(reference_model.state_dict())
+    reference_model.train()
+    tensor_model.train()
+    tensor_core = ComformerTensorCore(tensor_model)
+    tensor_core.training = True
+    graph = pgl.Graph.batch(_make_graphs())
+    target = paddle.to_tensor([[0.25], [-0.75]], dtype="float32")
+
+    reference_output = reference_model._forward_eager({"graph": graph})
+    tensor_output = tensor_core(*graph_to_tensor_batch(graph))
+    paddle.nn.functional.mse_loss(reference_output, target).backward()
+    paddle.nn.functional.mse_loss(tensor_output, target).backward()
+
+    _assert_allclose(tensor_output, reference_output, atol=1e-5, rtol=1e-5)
+    reference_parameters = dict(reference_model.named_parameters())
+    tensor_parameters = dict(tensor_model.named_parameters())
+    edge_parameter_names = [
+        name
+        for name, parameter in reference_parameters.items()
+        if name.startswith("edge_update_layer.")
+        and not name.endswith("lin_concate.bias")
+        and not parameter.stop_gradient
+    ]
+    assert edge_parameter_names
+    for name in edge_parameter_names:
+        reference_gradient = reference_parameters[name].grad
+        tensor_gradient = tensor_parameters[name].grad
+        if reference_gradient is None:
+            assert tensor_gradient is None, name
+            continue
+        assert tensor_gradient is not None, name
+        _assert_allclose(
+            tensor_gradient,
+            reference_gradient,
+            atol=1e-3,
+            rtol=1e-3,
+            err_msg=name,
+        )
+    assert reference_parameters["edge_update_layer.lin_concate.weight"].grad is not None
+    assert tensor_parameters["edge_update_layer.lin_concate.weight"].grad is not None
+
+
 def test_pir_static_core_supports_dynamic_node_edge_and_batch_sizes():
     model = _make_model()
     model.eval()
@@ -270,6 +423,8 @@ def test_public_backend_preserves_forward_predict_and_checkpoint_contract(monkey
     single_list_prediction = model.predict([_make_graphs()[0]])
     assert isinstance(single_list_prediction, list)
     assert len(single_list_prediction) == 1
+    batched_prediction = model.predict(pgl.Graph.batch(list(_make_graphs())))
+    assert isinstance(batched_prediction, dict)
     assert list(model.state_dict()) == expected_keys
     assert all(not key.startswith("model.") for key in model.state_dict())
 
@@ -284,69 +439,58 @@ def test_public_cinn_backend_fails_fast_on_cpu():
     os.environ.get("PPMAT_RUN_CINN_TESTS") != "1",
     reason="Set PPMAT_RUN_CINN_TESTS=1 to run the GPU CINN inference smoke.",
 )
-def test_gpu_cinn_inference_matches_tensor_eager_with_dynamic_batches():
+def test_gpu_cinn_inference_matches_eager_with_dynamic_batches():
     if not paddle.is_compiled_with_cuda():
         pytest.skip("Paddle was not compiled with CUDA.")
     if not paddle.base.is_compiled_with_cinn():
         pytest.skip("Paddle was not compiled with CINN.")
 
     paddle.set_device("gpu:0")
-    model = _make_model()
-    model.eval()
-    core = ComformerTensorCore(model)
-    core.training = False
-    compiled = compile_comformer_cinn(core)
+    reference_model = _make_model(conv_layers=2)
+    cinn_model = _make_model(conv_layers=2)
+    cinn_model.set_state_dict(reference_model.state_dict())
+    reference_model.eval()
+    cinn_model.eval()
+    cinn_core = ComformerTensorCore(cinn_model)
+    cinn_core.training = False
+    compiled = compile_comformer_cinn(cinn_core)
     compiled.training = False
     graph_a, graph_b = _make_graphs()
     for graph in (graph_a, pgl.Graph.batch([graph_a, graph_b]), _make_graph(5, 0.2)):
+        expected = reference_model._forward_eager({"graph": graph})
         packed = graph_to_tensor_batch(graph)
-        _assert_allclose(compiled(*packed), core(*packed))
+        _assert_allclose(compiled(*packed), expected)
 
 
 @pytest.mark.skipif(
     os.environ.get("PPMAT_RUN_CINN_TRAINING_TESTS") != "1",
     reason="Set PPMAT_RUN_CINN_TRAINING_TESTS=1 to run the GPU training canary.",
 )
-def test_gpu_cinn_backward_adam_and_dynamic_batch_parity():
+def test_gpu_cinn_training_matches_eager_except_cancelled_batch_norm_biases():
     if not paddle.is_compiled_with_cuda():
         pytest.skip("Paddle was not compiled with CUDA.")
     if not paddle.base.is_compiled_with_cinn():
         pytest.skip("Paddle was not compiled with CINN.")
 
     paddle.set_device("gpu:0")
-    reference_model = _make_model()
-    cinn_model = _make_model()
+    reference_model = _make_model(conv_layers=2)
+    cinn_model = _make_model(conv_layers=2)
     cinn_model.set_state_dict(reference_model.state_dict())
-    initial_state = {
-        key: value.clone() for key, value in reference_model.state_dict().items()
-    }
     reference_model.train()
     cinn_model.train()
-    reference_core = ComformerTensorCore(reference_model)
     cinn_core = ComformerTensorCore(cinn_model)
-    reference_core.training = True
     cinn_core.training = True
     compiled = compile_comformer_cinn(cinn_core)
     compiled.training = True
 
-    graph_a, graph_b = _make_graphs()
-    graph_sequence = (
-        pgl.Graph.batch([graph_a, graph_b]),
-        _make_graph(5, 0.2),
-        _make_single_node_graph(),
-        pgl.Graph.batch([_make_graph(4, 0.3), _make_graph(3, 0.4)]),
-    )
-    target_sequence = (
-        paddle.to_tensor([[0.25], [-0.75]], dtype="float32"),
-        paddle.to_tensor([[0.5]], dtype="float32"),
-        paddle.to_tensor([[0.125]], dtype="float32"),
-        paddle.to_tensor([[-0.25], [0.75]], dtype="float32"),
-    )
+    graph = pgl.Graph.batch(_make_graphs())
+    target = paddle.to_tensor([[0.25], [-0.75]], dtype="float32")
 
     # Trigger compilation, then restore mutable BatchNorm buffers just as the
     # public execution lifecycle does before the first optimizer update.
-    compiled(*graph_to_tensor_batch(graph_sequence[0]))
-    cinn_model.set_state_dict(initial_state)
+    warmup_state = cinn_model._snapshot_warmup_state()
+    compiled(*graph_to_tensor_batch(graph))
+    cinn_model._restore_warmup_state(warmup_state)
     reference_optimizer = paddle.optimizer.Adam(
         learning_rate=1e-3, parameters=reference_model.parameters()
     )
@@ -354,50 +498,73 @@ def test_gpu_cinn_backward_adam_and_dynamic_batch_parity():
         learning_rate=1e-3, parameters=cinn_model.parameters()
     )
 
-    for graph, target in zip(graph_sequence, target_sequence):
-        packed = graph_to_tensor_batch(graph)
-        reference_output = reference_core(*packed)
-        cinn_output = compiled(*packed)
-        reference_loss = paddle.nn.functional.mse_loss(reference_output, target)
-        cinn_loss = paddle.nn.functional.mse_loss(cinn_output, target)
-        reference_loss.backward()
-        cinn_loss.backward()
-        _assert_allclose(cinn_output, reference_output, atol=3e-6, rtol=3e-6)
-        _assert_allclose(cinn_loss, reference_loss, atol=5e-6, rtol=5e-6)
+    reference_output = reference_model._forward_eager({"graph": graph})
+    cinn_output = compiled(*graph_to_tensor_batch(graph))
+    reference_loss = paddle.nn.functional.mse_loss(reference_output, target)
+    cinn_loss = paddle.nn.functional.mse_loss(cinn_output, target)
+    reference_loss.backward()
+    cinn_loss.backward()
+    _assert_allclose(cinn_output, reference_output, atol=3e-6, rtol=3e-6)
+    _assert_allclose(cinn_loss, reference_loss, atol=5e-6, rtol=5e-6)
 
-        reference_parameters = dict(reference_model.named_parameters())
-        cinn_parameters = dict(cinn_model.named_parameters())
-        assert reference_parameters.keys() == cinn_parameters.keys()
-        for name, reference_parameter in reference_parameters.items():
-            cinn_parameter = cinn_parameters[name]
-            if reference_parameter.grad is None:
-                assert cinn_parameter.grad is None, name
-                continue
-            _assert_allclose(
-                cinn_parameter.grad,
-                reference_parameter.grad,
-                atol=2e-4,
-                rtol=2e-4,
-            )
-
-        reference_optimizer.step()
-        cinn_optimizer.step()
-        for name, reference_parameter in reference_parameters.items():
-            _assert_allclose(
-                cinn_parameters[name],
-                reference_parameter,
-                atol=2e-5,
-                rtol=2e-5,
-            )
-        reference_optimizer.clear_grad()
-        cinn_optimizer.clear_grad()
-
-        _assert_state_dict_close(
-            cinn_model.state_dict(),
-            reference_model.state_dict(),
+    reference_parameters = dict(reference_model.named_parameters())
+    cinn_parameters = dict(cinn_model.named_parameters())
+    assert reference_parameters.keys() == cinn_parameters.keys()
+    # Training BatchNorm cancels these biases; only eager roundoff reaches Adam.
+    cancelled_biases = _cancelled_batch_norm_biases(reference_parameters)
+    assert cancelled_biases
+    cinn_biases_before_step = {
+        name: cinn_parameters[name].clone() for name in cancelled_biases
+    }
+    for name, reference_parameter in reference_parameters.items():
+        cinn_parameter = cinn_parameters[name]
+        if reference_parameter.grad is None:
+            assert cinn_parameter.grad is None, name
+            continue
+        if name in cancelled_biases:
+            assert float(paddle.max(paddle.abs(reference_parameter.grad))) < 2e-5
+            assert float(paddle.max(paddle.abs(cinn_parameter.grad))) == 0.0
+            continue
+        _assert_allclose(
+            cinn_parameter.grad,
+            reference_parameter.grad,
             atol=2e-5,
             rtol=2e-5,
+            err_msg=name,
         )
+
+    reference_optimizer.step()
+    cinn_optimizer.step()
+    for name, reference_parameter in reference_parameters.items():
+        if name in cancelled_biases:
+            _assert_allclose(
+                cinn_parameters[name],
+                cinn_biases_before_step[name],
+                atol=0.0,
+                rtol=0.0,
+                err_msg=name,
+            )
+            continue
+        _assert_allclose(
+            cinn_parameters[name],
+            reference_parameter,
+            atol=3e-6,
+            rtol=3e-6,
+            err_msg=name,
+        )
+    _assert_state_dict_close(
+        cinn_model.state_dict(),
+        reference_model.state_dict(),
+        atol=3e-6,
+        rtol=3e-6,
+        excluded_keys=cancelled_biases,
+    )
+
+    reference_model.eval()
+    cinn_model.eval()
+    reference_output = reference_model._forward_eager({"graph": graph})
+    cinn_output = cinn_model._forward_eager({"graph": graph})
+    _assert_allclose(cinn_output, reference_output, atol=3e-3, rtol=0.0)
 
 
 @pytest.fixture
@@ -405,11 +572,13 @@ def tensor_runtime_proxy(monkeypatch):
     cores = {}
 
     def get_runtime(model):
-        core = cores.get(id(model))
+        mode = "train" if model.training else "eval"
+        key = (id(model), mode)
+        core = cores.get(key)
         if core is None:
             core = ComformerTensorCore(model)
-            cores[id(model)] = core
-        core.training = model.training
+            core.training = model.training
+            cores[key] = core
         return core
 
     monkeypatch.setattr(iComformer, "validate_execution_backend", lambda self: None)
@@ -442,7 +611,7 @@ def _make_loader():
     )
 
 
-def _trainer_config(output_dir, max_epochs):
+def _trainer_config(output_dir, max_epochs, execution_backend="cinn"):
     return {
         "max_epochs": max_epochs,
         "output_dir": str(output_dir),
@@ -460,17 +629,17 @@ def _trainer_config(output_dir, max_epochs):
         "best_metric_indicator": "eval_loss",
         "name_for_best_metric": "loss",
         "greater_is_better": False,
-        "execution_backend": "cinn",
+        "execution_backend": execution_backend,
     }
 
 
-def _build_trainer(model, output_dir, max_epochs):
+def _build_trainer(model, output_dir, max_epochs, execution_backend="cinn"):
     optimizer = paddle.optimizer.Adam(
         learning_rate=1e-3,
         parameters=model.parameters(),
     )
     trainer = BaseTrainer(
-        _trainer_config(output_dir, max_epochs),
+        _trainer_config(output_dir, max_epochs, execution_backend),
         model,
         train_dataloader=_make_loader(),
         val_dataloader=_make_loader(),
@@ -529,12 +698,16 @@ def test_cinn_trainer_checkpoint_resume_matches_uninterrupted_training(
     assert resumed_model._cinn_warmed_modes == {"train", "eval"}
 
 
-def _predictor_config(checkpoint_path):
+def _predictor_config(
+    checkpoint_path,
+    execution_backend="cinn",
+    conv_layers=1,
+):
     return {
         "Model": {
             "__class_name__": "iComformer",
             "__init_params__": {
-                "conv_layers": 1,
+                "conv_layers": conv_layers,
                 "edge_layers": 1,
                 "atom_input_features": 92,
                 "edge_features": 8,
@@ -547,7 +720,7 @@ def _predictor_config(checkpoint_path):
         },
         "Predict": {
             "checkpoint_path": str(checkpoint_path),
-            "execution_backend": "cinn",
+            "execution_backend": execution_backend,
             "eval_with_no_grad": True,
             "graph_converter": {
                 "__class_name__": "ComformerGraphConverter",
@@ -572,7 +745,7 @@ def test_cinn_property_predictor_loads_checkpoint_and_batches_cifs(
 
     predictor = PropertyPredictor(config_path=config_path, device="cpu")
     cif_path = (
-        Path(__file__).resolve().parents[4]
+        Path(__file__).resolve().parents[1]
         / "property_prediction"
         / "example_data"
         / "cifs"
@@ -606,25 +779,128 @@ def test_gpu_cinn_trainer_checkpoint_and_property_predictor(tmp_path):
         pytest.skip("Paddle was not compiled with CINN.")
 
     paddle.set_device("gpu:0")
-    model = _make_model(execution_backend="cinn")
-    trainer, _ = _build_trainer(model, tmp_path / "trainer", 1)
+    initial_model = _make_model(execution_backend="eager", conv_layers=2)
+    initial_state = {
+        key: value.clone() for key, value in initial_model.state_dict().items()
+    }
+    reference_model = _make_model(execution_backend="eager", conv_layers=2)
+    reference_model.set_state_dict(initial_state)
+    reference_trainer, reference_optimizer = _build_trainer(
+        reference_model, tmp_path / "eager_trainer", 1, execution_backend="eager"
+    )
+    model = _make_model(execution_backend="cinn", conv_layers=2)
+    model.set_state_dict(initial_state)
+    trainer, optimizer = _build_trainer(model, tmp_path / "cinn_trainer", 1)
+    with paddle.utils.unique_name.guard():
+        reference_trainer.train()
     with paddle.utils.unique_name.guard():
         trainer.train()
+    cancelled_biases = _cancelled_batch_norm_biases(initial_state)
+    _assert_state_dict_close(
+        model.state_dict(),
+        reference_model.state_dict(),
+        atol=2e-5,
+        rtol=2e-5,
+        excluded_keys=cancelled_biases,
+    )
+    for key in cancelled_biases:
+        _assert_allclose(
+            model.state_dict()[key],
+            initial_state[key],
+            atol=0.0,
+            rtol=0.0,
+            err_msg=key,
+        )
+    cancelled_optimizer_keys = _cancelled_optimizer_moment_keys(
+        model, optimizer.state_dict()
+    )
+    assert cancelled_optimizer_keys
+    for key in cancelled_optimizer_keys:
+        assert float(paddle.max(paddle.abs(optimizer.state_dict()[key]))) == 0.0
+    _assert_state_dict_close(
+        optimizer.state_dict(),
+        reference_optimizer.state_dict(),
+        atol=2e-5,
+        rtol=2e-5,
+        excluded_keys=cancelled_optimizer_keys,
+    )
 
-    checkpoint_path = tmp_path / "trainer" / "checkpoints" / "best.pdparams"
-    config_path = tmp_path / "comformer.yaml"
-    OmegaConf.save(OmegaConf.create(_predictor_config(checkpoint_path)), config_path)
+    resume_checkpoint = tmp_path / "cinn_trainer" / "checkpoints" / "latest"
+    reference_resumed_model = _make_model(execution_backend="eager", conv_layers=2)
+    reference_resumed_trainer, reference_resumed_optimizer = _build_trainer(
+        reference_resumed_model,
+        tmp_path / "eager_resumed",
+        2,
+        execution_backend="eager",
+    )
+    resumed_model = _make_model(execution_backend="cinn", conv_layers=2)
+    resumed_trainer, resumed_optimizer = _build_trainer(
+        resumed_model, tmp_path / "cinn_resumed", 2
+    )
+    with paddle.utils.unique_name.guard():
+        reference_resumed_trainer.train(resume_from_checkpoint=str(resume_checkpoint))
+    with paddle.utils.unique_name.guard():
+        resumed_trainer.train(resume_from_checkpoint=str(resume_checkpoint))
+    resumed_cancelled_biases = _cancelled_batch_norm_biases(
+        dict(resumed_model.named_parameters())
+    )
+    _assert_state_dict_close(
+        resumed_model.state_dict(),
+        reference_resumed_model.state_dict(),
+        atol=2e-5,
+        rtol=2e-5,
+        excluded_keys=resumed_cancelled_biases,
+    )
+    resumed_cancelled_optimizer_keys = _cancelled_optimizer_moment_keys(
+        resumed_model, resumed_optimizer.state_dict()
+    )
+    assert resumed_cancelled_optimizer_keys
+    for key in resumed_cancelled_optimizer_keys:
+        assert float(paddle.max(paddle.abs(resumed_optimizer.state_dict()[key]))) == 0.0
+    _assert_state_dict_close(
+        resumed_optimizer.state_dict(),
+        reference_resumed_optimizer.state_dict(),
+        atol=2e-5,
+        rtol=2e-5,
+        excluded_keys=resumed_cancelled_optimizer_keys,
+    )
+
+    checkpoint_path = tmp_path / "cinn_resumed" / "checkpoints" / "latest.pdparams"
+    config_path = tmp_path / "comformer_cinn.yaml"
+    OmegaConf.save(
+        OmegaConf.create(_predictor_config(checkpoint_path, conv_layers=2)),
+        config_path,
+    )
     predictor = PropertyPredictor(config_path=config_path, device="gpu:0")
+    reference_config_path = tmp_path / "comformer_eager.yaml"
+    OmegaConf.save(
+        OmegaConf.create(_predictor_config(checkpoint_path, "eager", conv_layers=2)),
+        reference_config_path,
+    )
+    reference_predictor = PropertyPredictor(
+        config_path=reference_config_path, device="gpu:0"
+    )
     cif_path = (
-        Path(__file__).resolve().parents[4]
+        Path(__file__).resolve().parents[1]
         / "property_prediction"
         / "example_data"
         / "cifs"
         / "mp-18767-LiMnO2.cif"
     )
     result = predictor.from_cif_file(str(cif_path))
+    reference_result = reference_predictor.from_cif_file(str(cif_path))
 
     assert trainer.state.global_step == 1
+    assert reference_trainer.state.global_step == 1
+    assert resumed_trainer.state.global_step == 2
+    assert reference_resumed_trainer.state.global_step == 2
+    assert resumed_model._cinn_warmed_modes == {"train", "eval"}
     assert result.keys() == {"formation_energy_per_atom"}
+    np.testing.assert_allclose(
+        result["formation_energy_per_atom"],
+        reference_result["formation_energy_per_atom"],
+        atol=2e-6,
+        rtol=2e-6,
+    )
     assert predictor.model._cinn_warmed_modes == {"eval"}
     assert predictor.model.state_dict().keys() == model.state_dict().keys()

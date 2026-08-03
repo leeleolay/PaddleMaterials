@@ -132,7 +132,7 @@ def test_tensor_core_matches_eager_forward(batch_size):
     core.eval()
 
     packed = graph_to_tensor_batch(graph)
-    expected = model._forward({"graph": graph})
+    expected = model._forward_eager({"graph": graph})
     actual = core(*packed)
 
     assert actual.shape == [batch_size, 1]
@@ -153,7 +153,7 @@ def test_tensor_core_matches_eager_gradients_and_optimizer_step():
     tensor_core.train()
 
     target = paddle.to_tensor([[0.25], [-0.75]], dtype="float32")
-    reference_output = reference_model._forward({"graph": reference_graph})
+    reference_output = reference_model._forward_eager({"graph": reference_graph})
     tensor_output = tensor_core(*graph_to_tensor_batch(tensor_graph))
     reference_loss = paddle.nn.functional.mse_loss(reference_output, target)
     tensor_loss = paddle.nn.functional.mse_loss(tensor_output, target)
@@ -239,7 +239,7 @@ def test_compile_accepts_original_megnet_model():
     compiled.eval()
 
     packed = graph_to_tensor_batch(graph_a)
-    expected = model._forward({"graph": graph_a})
+    expected = model._forward_eager({"graph": graph_a})
     actual = compiled(*packed)
     _assert_allclose(actual, expected)
 
@@ -259,11 +259,6 @@ def test_non_default_state_dimension_is_explicitly_packed():
 
     with pytest.raises(ValueError, match="expected 4"):
         core.forward_tensor(graph_to_tensor_batch(graph_a))
-    with pytest.raises(ValueError, match="batch dimension"):
-        core.forward_tensor(
-            packed,
-            state_attr=paddle.zeros([2, 4], dtype="float32"),
-        )
 
     static_core = compile_megnet(core, backend=None, full_graph=True)
     static_core.eval()
@@ -309,34 +304,38 @@ def test_static_core_can_be_exported_and_reloaded(tmp_path):
     os.environ.get("PPMAT_RUN_CINN_TESTS") != "1",
     reason="Set PPMAT_RUN_CINN_TESTS=1 to run the GPU CINN smoke test.",
 )
-def test_dynamic_shape_cinn_inference_matches_tensor_eager():
+def test_dynamic_shape_cinn_inference_matches_eager():
     if not paddle.is_compiled_with_cuda():
         pytest.skip("Paddle was not compiled with CUDA.")
     if not paddle.base.is_compiled_with_cinn():
         pytest.skip("Paddle was not compiled with CINN.")
 
     paddle.set_device("gpu:0")
-    model = _make_model()
-    model.eval()
-    core = MEGNetTensorCore(model)
-    core.eval()
-    compiled = compile_megnet_cinn(core, full_graph=True)
+    reference_model = _make_model()
+    cinn_model = _make_model()
+    cinn_model.set_state_dict(reference_model.state_dict())
+    reference_model.eval()
+    cinn_model.eval()
+    cinn_core = MEGNetTensorCore(cinn_model)
+    cinn_core.eval()
+    compiled = compile_megnet_cinn(cinn_core, full_graph=True)
     compiled.eval()
 
     graph_a, graph_b = _make_graphs()
     baseline = None
     for graph in (graph_a, pgl.Graph.batch([graph_a, graph_b])):
+        expected = reference_model._forward_eager({"graph": graph})
         packed = graph_to_tensor_batch(graph)
-        expected = core(*packed)
         actual = compiled(*packed)
         _assert_allclose(actual, expected)
         baseline = actual
 
-    state_dict = model.state_dict()
+    state_dict = cinn_model.state_dict()
     output_bias = "fc_out.layers.4.bias"
     state_dict[output_bias] = state_dict[output_bias] + 1.0
-    model.set_state_dict(state_dict)
-    expected = core(*packed)
+    cinn_model.set_state_dict(state_dict)
+    reference_model.set_state_dict(state_dict)
+    expected = reference_model._forward_eager({"graph": graph})
     actual = compiled(*packed)
     _assert_allclose(actual, expected)
     assert not np.allclose(actual.numpy(), baseline.numpy())
@@ -348,7 +347,7 @@ def test_dynamic_shape_cinn_inference_matches_tensor_eager():
         "Set PPMAT_RUN_CINN_TRAINING_TESTS=1 to run the GPU CINN training " "canary."
     ),
 )
-def test_dynamic_shape_cinn_training_matches_tensor_eager():
+def test_dynamic_shape_cinn_training_matches_eager():
     if not paddle.is_compiled_with_cuda():
         pytest.skip("Paddle was not compiled with CUDA.")
     if not paddle.base.is_compiled_with_cinn():
@@ -358,9 +357,7 @@ def test_dynamic_shape_cinn_training_matches_tensor_eager():
     reference_model = _make_model()
     cinn_model = _make_model()
     cinn_model.set_state_dict(reference_model.state_dict())
-    reference_core = MEGNetTensorCore(reference_model)
     cinn_core = MEGNetTensorCore(cinn_model)
-    reference_core.train()
     cinn_core.train()
     compiled = compile_megnet_cinn(cinn_core, full_graph=True)
     compiled.train()
@@ -392,9 +389,8 @@ def test_dynamic_shape_cinn_training_matches_tensor_eager():
     cinn_losses = []
 
     for graph, target in zip(graph_sequence, target_sequence):
-        reference_batch = graph_to_tensor_batch(graph)
+        reference_output = reference_model._forward_eager({"graph": graph})
         cinn_batch = graph_to_tensor_batch(graph)
-        reference_output = reference_core(*reference_batch)
         cinn_output = compiled(*cinn_batch)
         reference_loss = paddle.nn.functional.mse_loss(reference_output, target)
         cinn_loss = paddle.nn.functional.mse_loss(cinn_output, target)
@@ -465,12 +461,14 @@ def test_public_megnet_backend_preserves_trainer_and_predictor_contract(monkeypa
     runtime_graphs = _make_graphs()
     reference_batch = {
         "graph": pgl.Graph.batch(reference_graphs),
+        "state_attr": np.ones([2, 2], dtype=np.float32),
         "formation_energy_per_atom": paddle.to_tensor(
             [[0.25], [-0.75]], dtype="float32"
         ),
     }
     runtime_batch = {
         "graph": pgl.Graph.batch(runtime_graphs),
+        "state_attr": np.ones([2, 2], dtype=np.float32),
         "formation_energy_per_atom": paddle.to_tensor(
             [[0.25], [-0.75]], dtype="float32"
         ),
@@ -497,6 +495,11 @@ def test_public_megnet_backend_preserves_trainer_and_predictor_contract(monkeypa
         atol=1e-6,
         rtol=1e-6,
     )
+    single_list_prediction = model.predict([_make_graphs()[0]])
+    assert isinstance(single_list_prediction, list)
+    assert len(single_list_prediction) == 1
+    batched_prediction = model.predict(pgl.Graph.batch(list(_make_graphs())))
+    assert isinstance(batched_prediction, dict)
     assert list(model.state_dict()) == expected_keys
     assert all(not key.startswith("model.") for key in model.state_dict())
 
@@ -521,17 +524,21 @@ def test_eager_backend_supports_non_default_state_dimension():
     assert result["pred_dict"]["formation_energy_per_atom"].shape == [1, 1]
 
 
-def test_eager_backend_converts_numpy_state_attr():
+def test_eager_backend_ignores_unconsumed_state_attr():
     graph, _ = _make_graphs()
     model = _make_model()
     model.eval()
 
-    result = model(
+    expected = model({"graph": graph}, return_loss=False)
+    actual = model(
         {
             "graph": graph,
-            "state_attr": np.zeros((1, 2), dtype=np.float64),
+            "state_attr": np.ones((1, 2), dtype=np.float64),
         },
         return_loss=False,
     )
 
-    assert result["pred_dict"]["formation_energy_per_atom"].shape == [1, 1]
+    _assert_allclose(
+        actual["pred_dict"]["formation_energy_per_atom"],
+        expected["pred_dict"]["formation_energy_per_atom"],
+    )

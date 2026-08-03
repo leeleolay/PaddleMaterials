@@ -25,6 +25,12 @@ from ppmat.models.spherenet.geometry import compute_geometry
 from ppmat.utils.scatter import scatter_sum
 
 
+def _to_tensor(value, dtype: str) -> paddle.Tensor:
+    if isinstance(value, paddle.Tensor):
+        return value if value.dtype == getattr(paddle, dtype) else value.astype(dtype)
+    return paddle.to_tensor(value, dtype=dtype)
+
+
 def _swish(x):
     # Match DIG's expression and avoid fused silu's NaN first derivative for
     # large negative float32 inputs.
@@ -326,7 +332,9 @@ class SphereNet(CINNExecutionMixin, paddle.nn.Layer):
     ):
         super().__init__()
         self._init_cinn_execution(execution_backend, cinn_full_graph)
-        if not isinstance(extra_node_feature_dim, int) or extra_node_feature_dim <= 0:
+        if use_extra_node_feature and (
+            not isinstance(extra_node_feature_dim, int) or extra_node_feature_dim <= 0
+        ):
             raise ValueError("extra_node_feature_dim must be a positive integer.")
 
         act_fn = _swish if act in ("swish", "silu") else act
@@ -335,7 +343,9 @@ class SphereNet(CINNExecutionMixin, paddle.nn.Layer):
 
         self.energy_and_force = energy_and_force
         self.use_extra_node_feature = use_extra_node_feature
-        self.extra_node_feature_dim = extra_node_feature_dim
+        self.extra_node_feature_dim = (
+            extra_node_feature_dim if use_extra_node_feature else 1
+        )
         self.property_name = property_name
         self.force_key = force_key
         self.force_loss_weight = float(force_loss_weight)
@@ -412,23 +422,25 @@ class SphereNet(CINNExecutionMixin, paddle.nn.Layer):
             layer.reset_parameters()
 
     def _forward_eager(self, data):
-        graph = data["graph"].tensor()
-        z = graph.node_feat["atomic_number"].astype("int64").reshape([-1])
-        pos = graph.node_feat["pos"].astype(paddle.get_default_dtype())
+        graph = data["graph"]
+        z = _to_tensor(graph.node_feat["atomic_number"], "int64").reshape([-1])
+        pos = _to_tensor(graph.node_feat["pos"], paddle.get_default_dtype())
         if self.energy_and_force:
             pos = pos.detach()
             pos.stop_gradient = False
 
-        node_batch = graph.graph_node_id.astype("int64")
-        edge_index = paddle.transpose(graph.edges.astype("int64"), [1, 0])
+        node_batch = _to_tensor(graph.graph_node_id, "int64")
+        edge_index = paddle.transpose(_to_tensor(graph.edges, "int64"), [1, 0])
         node_feature = graph.node_feat.get("node_feature")
         triplet_indices = {
-            "idx_kj": graph.edge_feat["ti_idx_kj"].astype("int64"),
-            "idx_ji": graph.edge_feat["ti_idx_ji"].astype("int64"),
+            "idx_kj": _to_tensor(graph.edge_feat["ti_idx_kj"], "int64"),
+            "idx_ji": _to_tensor(graph.edge_feat["ti_idx_ji"], "int64"),
         }
 
         if self.use_extra_node_feature and node_feature is not None:
-            extra_node_feature = self.extra_emb(node_feature)
+            extra_node_feature = self.extra_emb(
+                _to_tensor(node_feature, paddle.get_default_dtype())
+            )
         else:
             extra_node_feature = None
 
@@ -458,7 +470,7 @@ class SphereNet(CINNExecutionMixin, paddle.nn.Layer):
             return self._forward_eager(data)
         return self._forward_cinn(data)
 
-    def _validate_cinn_model(self):
+    def _validate_cinn_model(self) -> None:
         if self.energy_and_force:
             raise ValueError(
                 "SphereNet execution_backend='cinn' supports property prediction "
@@ -479,27 +491,22 @@ class SphereNet(CINNExecutionMixin, paddle.nn.Layer):
         graph = data.get("graph") if isinstance(data, dict) else None
         if graph is None:
             raise KeyError("SphereNet CINN forward expects data['graph'].")
-        packed = graph_to_tensor_batch(
-            graph,
-            use_extra_node_feature=self.use_extra_node_feature,
-            extra_node_feature_dim=self.extra_node_feature_dim,
-        )
-        runtime = self._get_cinn_runtime()
         triplet_indices = getattr(graph, "edge_feat", {}).get("ti_idx_kj")
         if (
             self.training
             and triplet_indices is not None
             and triplet_indices.shape[0] == 0
         ):
-            # A masked static sentinel gives the angle/torsion projections zero
-            # gradients for parameters that eager leaves unused, changing Adam state.
-            return self._forward_eager(data)
-        return runtime(*packed), packed.pos
-
-    def prepare_cinn(self, sample_batch=None):
-        """Backward-compatible alias for :meth:`prepare_execution`."""
-
-        self.prepare_execution(sample_batch)
+            raise ValueError(
+                "SphereNet CINN training requires at least one triplet in each "
+                "graph batch."
+            )
+        packed = graph_to_tensor_batch(
+            graph,
+            use_extra_node_feature=self.use_extra_node_feature,
+            extra_node_feature_dim=self.extra_node_feature_dim,
+        )
+        return self._get_cinn_runtime()(*packed), packed.pos
 
     def normalize(self, tensor):
         return (tensor - self.data_mean) / self.data_std

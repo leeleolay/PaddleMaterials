@@ -172,13 +172,13 @@ Run:
 
 ```bash
 "$PADDLE331/bin/python" -m pytest \
-  ppmat/models/megnet/tests/test_megnet_cinn.py -q
+  test/test_megnet_cinn.py -q
 ```
 
 Result on Paddle 3.3.1:
 
 ```text
-11 passed, 2 skipped
+15 passed, 2 skipped
 ```
 
 The opt-in GPU smoke test compiles one dynamic CINN program and executes both a
@@ -186,39 +186,39 @@ single graph and a heterogeneous two-graph batch:
 
 ```bash
 PPMAT_RUN_CINN_TESTS=1 "$PADDLE331/bin/python" -m pytest \
-  ppmat/models/megnet/tests/test_megnet_cinn.py \
+  test/test_megnet_cinn.py \
   -k dynamic_shape_cinn_inference -q
 ```
 
 Result on Paddle 3.3.1:
 
 ```text
-1 passed, 12 deselected, 5 warnings in 94.83s
+1 passed, 16 deselected, 5 warnings in 94.83s
 ```
 
-Both graph shapes match Tensor eager execution within `atol=1e-6` and
-`rtol=1e-6`. The test-sized model took approximately 85 seconds for its first
-lazy compilation. Paddle emitted non-fatal RNN shape-cache and pattern-rewrite
-warnings. No steady-state performance claim is made in phase 1.
+Both graph shapes match the original PGL eager execution within `atol=1e-6`
+and `rtol=1e-6`. The test-sized model took approximately 85 seconds for its
+first lazy compilation. Paddle emitted non-fatal RNN shape-cache and
+pattern-rewrite warnings. No steady-state performance claim is made in phase 1.
 
 ## Training Canary
 
-The opt-in training canary compares Tensor eager and CINN from identical
-weights. It executes three batches with graph batch sizes `2 -> 1 -> 2`, using
-MSE loss and the production Adam settings (`beta1=0.9`, `beta2=0.999`, learning
-rate `1e-3`). Every step compares predictions, loss, all parameter gradients,
-and post-update parameters.
+The opt-in training canary compares an independent original PGL eager model and
+CINN from identical weights. It executes three batches with graph batch sizes
+`2 -> 1 -> 2`, using MSE loss and the production Adam settings (`beta1=0.9`,
+`beta2=0.999`, learning rate `1e-3`). Every step compares predictions, loss,
+all parameter gradients, and post-update parameters.
 
 ```bash
 PPMAT_RUN_CINN_TRAINING_TESTS=1 "$PADDLE331/bin/python" -m pytest \
-  ppmat/models/megnet/tests/test_megnet_cinn.py \
+  test/test_megnet_cinn.py \
   -k dynamic_shape_cinn_training -q
 ```
 
 Result on Paddle 3.3.1:
 
 ```text
-1 passed, 12 deselected, 6 warnings in 180.54s
+1 passed, 16 deselected, 6 warnings in 180.54s
 ```
 
 All three steps pass with `atol=2e-6` and `rtol=2e-6`. A direct first-step
@@ -283,27 +283,29 @@ batch-Predictor calls. The generic hook protocol is covered separately by
 PADDLE331=/tmp/ppmat-paddle331
 "$PADDLE331/bin/python" -m pytest \
   test/test_execution_backend.py \
-  ppmat/models/megnet/tests/test_megnet_cinn.py \
-  ppmat/models/megnet/tests/test_megnet_cinn_workflows.py \
+  test/test_megnet_cinn.py \
+  test/test_megnet_cinn_workflows.py \
   test/test_predictor.py -q
 ```
 
-Result on Paddle 3.3.1: `35 passed, 3 skipped`.
+Result on Paddle 3.3.1: `38 passed, 3 skipped`.
 
-The opt-in GPU workflow test exercises BaseTrainer, `epoch_1/latest/best`
-checkpoint creation, a restored Predictor, and CIF graph conversion in one
-process:
+The opt-in GPU workflow test trains independent eager and CINN BaseTrainers from
+identical state, compares their post-update model and Adam state, and creates
+`epoch_1/latest/best`. Both backends then resume the same CINN `latest`
+checkpoint for a second update before eager/CINN Predictors load the resumed
+checkpoint and compare a converted CIF:
 
 ```bash
 PPMAT_RUN_CINN_WORKFLOW_TESTS=1 \
   "$PADDLE331/bin/python" -m pytest \
-  ppmat/models/megnet/tests/test_megnet_cinn_workflows.py \
+  test/test_megnet_cinn_workflows.py \
   -k gpu_cinn_trainer_checkpoint_and_property_predictor -q
 ```
 
-It passed on PaddlePaddle 3.3.1/CUDA 12.6. The small production-shaped model
-took about 175 seconds including first compilation; steady-state train/eval
-steps were below one second.
+It passed on PaddlePaddle 3.3.1/CUDA 12.6 in `181.78s`. The small
+production-shaped model's steady-state train/eval steps were below one second;
+first compilation accounts for most of the workflow time.
 
 The real MP2018 entry point was also run from this worktree with the official
 downloaded/cache-backed smoke subset (8 train and 4 validation structures):

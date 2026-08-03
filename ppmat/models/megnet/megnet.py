@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
-from typing import Any
 from typing import Callable
 from typing import Literal
 from typing import Optional
@@ -796,27 +795,9 @@ class MEGNetPlus(CINNExecutionMixin, paddle.nn.Layer):
         batch_size = g.num_graph
         if isinstance(batch_size, paddle.Tensor):
             batch_size = int(batch_size)
-        state_attr = data.get("state_attr")
-        if state_attr is None:
-            state_attr = paddle.zeros(
-                [batch_size, self.embedding.dim_state_embedding], dtype="float32"
-            )
-        else:
-            # Dataset collators commonly leave optional graph-level features as
-            # NumPy arrays.  Normalize them at the eager boundary just as the
-            # CINN packing path does, and fail with a useful shape error before
-            # the first linear layer is reached.
-            if not isinstance(state_attr, paddle.Tensor):
-                state_attr = paddle.to_tensor(state_attr, dtype="float32")
-            elif state_attr.dtype != paddle.float32:
-                state_attr = paddle.cast(state_attr, "float32")
-            expected_shape = [batch_size, self.embedding.dim_state_embedding]
-            if list(state_attr.shape) != expected_shape:
-                raise ValueError(
-                    "state_attr must have shape "
-                    f"[num_graphs, {self.embedding.dim_state_embedding}], "
-                    f"got {list(state_attr.shape)}."
-                )
+        state_attr = paddle.zeros(
+            [batch_size, self.embedding.dim_state_embedding], dtype="float32"
+        )
         node_attr = g.node_feat["atom_types"]
         edge_attr = self.bond_expansion(g.edge_feat["bond_dist"])
         node_feat, edge_feat, state_feat = self.embedding(
@@ -878,15 +859,9 @@ class MEGNetPlus(CINNExecutionMixin, paddle.nn.Layer):
             raise KeyError("MEGNet CINN forward expects data['graph'].")
         packed = graph_to_tensor_batch(
             graph,
-            state_attr=data.get("state_attr"),
             state_dim=self.embedding.dim_state_embedding,
         )
         return self._get_cinn_runtime()(*packed)
-
-    def prepare_cinn(self, sample_batch: Optional[dict[str, Any]] = None) -> None:
-        """Backward-compatible alias for :meth:`prepare_execution`."""
-
-        self.prepare_execution(sample_batch)
 
     def normalize(self, tensor):
         return (tensor - self.data_mean) / self.data_std
@@ -918,26 +893,14 @@ class MEGNetPlus(CINNExecutionMixin, paddle.nn.Layer):
 
     @paddle.no_grad()
     def predict(self, graphs):
-        if isinstance(graphs, (list, tuple)):
-            if not graphs:
-                return []
-            graph_batch = pgl.Graph.batch(graphs)
-        elif isinstance(graphs, pgl.Graph):
-            graph_batch = graphs
-        else:
-            raise TypeError(
-                "MEGNetPlus.predict expects a pgl.Graph or a sequence of graphs, "
-                f"got {type(graphs)!r}."
-            )
+        if isinstance(graphs, list):
+            results = []
+            for graph in graphs:
+                result = self._forward({"graph": graph})
+                result = self.unnormalize(result).numpy()[0, 0]
+                results.append({self.property_name: result})
+            return results
 
-        predictions = self.unnormalize(self._forward({"graph": graph_batch})).numpy()
-        num_graphs = graph_batch.num_graph
-        if isinstance(num_graphs, paddle.Tensor):
-            num_graphs = int(num_graphs.numpy().reshape(-1)[0])
-        else:
-            num_graphs = int(num_graphs)
-        if num_graphs > 1:
-            return [{self.property_name: prediction[0]} for prediction in predictions]
-        # Preserve the historical NumPy scalar return type for callers that
-        # serialize or post-process property predictions directly.
-        return {self.property_name: predictions[0, 0]}
+        result = self._forward({"graph": graphs})
+        result = self.unnormalize(result).numpy()[0, 0]
+        return {self.property_name: result}
