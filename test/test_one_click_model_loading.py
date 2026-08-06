@@ -26,24 +26,21 @@ INFGCN_MODEL_NAMES = [
 QM9_ATOM_NAME2IDX = {"H": 0, "C": 1, "N": 2, "O": 3, "F": 4}
 
 
-def _build_field_cfg(format, value_unit, coordinate_unit, name="density"):
+def _build_field_cfg(format, value_unit, name="density"):
     return {
         "format": format,
         "name": name,
         "value_unit": value_unit,
-        "coordinate_unit": coordinate_unit,
         "num_cpus": 1,
     }
 
 
-def _build_graph_cfg(cutoff, coordinate_unit):
+def _build_graph_cfg(cutoff):
     return {
         "__class_name__": "RadiusGraphConverter",
         "__init_params__": {
             "cutoff": cutoff,
-            "coordinate_unit": coordinate_unit,
             "inclusive_cutoff": True,
-            "atom_vocab": {},
             "include_distance": False,
         },
     }
@@ -337,11 +334,10 @@ def test_infgcn_predict_config_uses_standard_field_builders():
     assert "def from_mol_file" in field_source
     assert cfg["Predict"] == {
         "grid_batch_size": 20000,
-        "build_graph_cfg": _build_graph_cfg(3.0, "angstrom"),
+        "build_graph_cfg": _build_graph_cfg(3.0),
         "build_field_cfg": _build_field_cfg(
-            "array",
+            "chgcar",
             "electron/angstrom^3",
-            "angstrom",
         ),
     }
 
@@ -577,17 +573,6 @@ def test_field_predictor_from_data_uses_standard_batch_contract():
                 "density_unit": "electron/angstrom^3",
             },
         )
-    with pytest.raises(ValueError, match="model expects angstrom"):
-        predictor.from_data(
-            graph,
-            grid_coord,
-            {
-                "cell": np.eye(3),
-                "shape": [2, 2, 1],
-                "coordinate_unit": "bohr",
-                "density_unit": "electron/angstrom^3",
-            },
-        )
     with pytest.raises(ValueError, match="density unit"):
         predictor.from_data(
             graph,
@@ -603,6 +588,7 @@ def test_field_predictor_from_data_uses_standard_batch_contract():
 
 def test_field_cube_io_round_trip(tmp_path):
     import numpy as np
+    from ase.units import Bohr
 
     from ppmat.datasets.build_field import BuildField
     from ppmat.predictor.field_io import read_cube_density
@@ -639,10 +625,10 @@ def test_field_cube_io_round_trip(tmp_path):
     assert isinstance(loaded_info["cell"], np.ndarray)
     assert isinstance(loaded_info["origin"], np.ndarray)
     np.testing.assert_allclose(loaded_density, density)
-    np.testing.assert_allclose(loaded_info["origin"], info["origin"])
-    np.testing.assert_allclose(grid_coord[0], info["origin"])
+    np.testing.assert_allclose(loaded_info["origin"], info["origin"] / Bohr)
+    np.testing.assert_allclose(grid_coord[0], info["origin"] / Bohr)
     assert loaded_info["shape"] == info["shape"]
-    assert loaded_info["coordinate_unit"] == "angstrom"
+    assert loaded_info["coordinate_unit"] == "bohr"
     assert loaded_info["density_unit"] == "electron/angstrom^3"
     np.testing.assert_array_equal(loaded_info["atom_numbers"], [6])
 
@@ -913,15 +899,13 @@ def test_all_infgcn_configs_are_parseable_and_complete():
             "infgcn_mp.yaml",
         }
         dataset_format = expected_dataset_formats.get(config_path.stem, "fft")
-        coordinate_unit = "angstrom" if uses_angstrom else "bohr"
         expected_field_cfg = _build_field_cfg(
             dataset_format,
             "electron/angstrom^3" if uses_angstrom else "unknown",
-            coordinate_unit,
         )
         assert cfg["Global"]["build_field_cfg"] == expected_field_cfg
         graph_cutoff = 6.0 if config_path.stem == "infgcn_omol25_MC_5k_trimmed" else 3.0
-        expected_graph_cfg = _build_graph_cfg(graph_cutoff, coordinate_unit)
+        expected_graph_cfg = _build_graph_cfg(graph_cutoff)
         assert cfg["Global"]["build_graph_cfg"] == expected_graph_cfg
         assert cfg["Model"]["__init_params__"]["cutoff"] == graph_cutoff
 
@@ -990,19 +974,11 @@ def test_all_infgcn_configs_are_parseable_and_complete():
         assert (
             unresolved_cfg["Predict"]["build_graph_cfg"] == "${Global.build_graph_cfg}"
         )
-        expected_predict_field_cfg = _build_field_cfg(
-            "array",
-            expected_field_cfg["value_unit"],
-            coordinate_unit,
+        assert cfg["Predict"]["build_field_cfg"] == expected_field_cfg
+        assert (
+            unresolved_cfg["Predict"]["build_field_cfg"]
+            == "${Global.build_field_cfg}"
         )
-        assert cfg["Predict"]["build_field_cfg"] == expected_predict_field_cfg
-        assert unresolved_cfg["Predict"]["build_field_cfg"] == {
-            "format": "array",
-            "name": "${Global.build_field_cfg.name}",
-            "value_unit": "${Global.build_field_cfg.value_unit}",
-            "coordinate_unit": "${Global.build_field_cfg.coordinate_unit}",
-            "num_cpus": 1,
-        }
 
 
 def test_electronic_structure_train_wires_vocabulary_into_runtime():
@@ -1082,12 +1058,11 @@ def test_infgcn_bundled_molecule_builds_inference_grid():
     assert info["density_unit"] == "unknown"
 
 
-def test_infgcn_molecule_grid_converts_to_configured_bohr_unit():
+def test_infgcn_molecule_grid_always_uses_angstrom():
     import numpy as np
 
     from ppmat.datasets.build_field import BuildField
     from ppmat.models.common.graph_converter import RadiusGraphConverter
-    from ppmat.predictor.field_predictor import ANG2BOHR
     from ppmat.predictor.field_predictor import build_mol_sample
 
     example_mol = INFGCN_CONFIG_DIR / "example/methane.mol"
@@ -1106,7 +1081,6 @@ def test_infgcn_molecule_grid_converts_to_configured_bohr_unit():
         field_converter=field_converter,
         graph_converter=RadiusGraphConverter(
             cutoff=3.0,
-            coordinate_unit="angstrom",
             atom_vocab={},
         ),
     )
@@ -1124,18 +1098,17 @@ def test_infgcn_molecule_grid_converts_to_configured_bohr_unit():
         field_converter=field_converter_bohr,
         graph_converter=RadiusGraphConverter(
             cutoff=3.0,
-            coordinate_unit="bohr",
             atom_vocab={},
         ),
     )
 
     np.testing.assert_allclose(
         graph_bohr.node_feat["pos"],
-        graph_ang.node_feat["pos"] * ANG2BOHR,
+        graph_ang.node_feat["pos"],
     )
-    np.testing.assert_allclose(grid_bohr, grid_ang * ANG2BOHR, rtol=1e-6, atol=1e-6)
-    np.testing.assert_allclose(info_bohr["cell"], info_ang["cell"] * ANG2BOHR)
-    assert info_bohr["coordinate_unit"] == "bohr"
+    np.testing.assert_allclose(grid_bohr, grid_ang, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(info_bohr["cell"], info_ang["cell"])
+    assert info_bohr["coordinate_unit"] == "angstrom"
 
 
 def test_cube_field_builder_preserves_geometry(tmp_path):

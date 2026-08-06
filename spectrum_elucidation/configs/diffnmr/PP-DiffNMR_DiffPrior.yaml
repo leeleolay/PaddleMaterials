@@ -1,5 +1,3 @@
-Vocabulary: diffnmr_msdnmr_nless15
-
 Global:
   do_train: True
   do_eval: False
@@ -155,6 +153,7 @@ Model:
       init_graph_embed_l2norm: false
       graph_embed_scale: null
 
+Vocabulary: diffnmr_msdnmr_nless15
 
 CLIP:
     __class_name__: NMRNetCLIP

@@ -39,14 +39,8 @@ def read_cube_density(
         format="cube",
         name=field_converter.name,
         value_unit=field_converter.value_unit,
-        coordinate_unit=field_converter.coordinate_unit,
     )
     field = cube_field_converter(path, validate_coordinate_unit=False)
-    if field.grid.length_unit != field_converter.coordinate_unit:
-        field = field.to_length_unit(
-            field_converter.coordinate_unit,
-            value_scaling="none",
-        )
     grid = field.grid
     if field.structure is None:
         raise ValueError("Reference CUBE does not contain atomic structure data.")
@@ -128,12 +122,6 @@ def prepare_cube_info(
     cell = to_numpy(info["cell"]).astype(np.float32, copy=False)
     origin = to_numpy(info["origin"]).astype(np.float32, copy=False)
     coordinate_unit = normalize_coordinate_unit(info["coordinate_unit"])
-    if coordinate_unit != field_converter.coordinate_unit:
-        raise ValueError(
-            f"CUBE output uses {coordinate_unit} coordinates, but "
-            "Predict.field_converter expects "
-            f"{field_converter.coordinate_unit}."
-        )
     density_unit = info.get("density_unit")
     if not isinstance(density_unit, str) or not density_unit.strip():
         raise ValueError("CUBE output metadata must define a non-empty 'density_unit'.")
@@ -144,12 +132,13 @@ def prepare_cube_info(
             "Predict.field_converter expects "
             f"{field_converter.value_unit!r}."
         )
-    grid = field_converter.build_grid(
+    grid = BuildField.build_grid_one(
         {
             "shape": shape,
             "voxel_vectors": cell / np.asarray(shape, dtype=np.float32)[:, None],
             "origin": origin,
-        }
+        },
+        coordinate_unit,
     )
     actual_points = to_numpy(grid_coord).reshape(-1, 3)
     expected_points = grid.cartesian_coordinates()

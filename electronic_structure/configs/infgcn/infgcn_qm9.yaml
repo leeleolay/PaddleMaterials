@@ -8,15 +8,12 @@ Global:
     __class_name__: RadiusGraphConverter
     __init_params__:
       cutoff: ${Global.graph_cutoff}
-      coordinate_unit: ${Global.build_field_cfg.coordinate_unit}
       inclusive_cutoff: true
-      atom_vocab: {}
       include_distance: false
   build_field_cfg:
     format: chgcar
     name: density
     value_unit: electron/angstrom^3
-    coordinate_unit: angstrom
     num_cpus: 1
 
 Trainer:
@@ -73,8 +70,6 @@ Trainer:
   use_wandb: False
   use_tensorboard: True
 
-Vocabulary: infgcn_qm9
-
 Model:
   __class_name__: InfGCN
   __init_params__:
@@ -84,12 +79,14 @@ Model:
     radial_hidden_size: 128
     num_radial_layer: 2
     num_gcn_layer: 3
-    cutoff: ${Global.graph_cutoff}
+    cutoff: 3.0
     grid_cutoff: 3.0
     is_fc: false
     gauss_start: 0.5
     gauss_end: 5.0
     residual: true
+
+Vocabulary: infgcn_qm9
 
 Optimizer:
   __class_name__: Adam
@@ -174,10 +171,5 @@ Dataset:
       collate_fn: DensityCollator
 Predict:
   build_graph_cfg: ${Global.build_graph_cfg}
+  build_field_cfg: ${Global.build_field_cfg}
   grid_batch_size: 20000
-  build_field_cfg:
-    format: array
-    name: ${Global.build_field_cfg.name}
-    value_unit: ${Global.build_field_cfg.value_unit}
-    coordinate_unit: ${Global.build_field_cfg.coordinate_unit}
-    num_cpus: 1

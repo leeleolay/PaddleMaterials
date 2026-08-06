@@ -507,7 +507,8 @@ class RadiusGraphConverter:
         include_direction: Whether to include unit direction in PGL edge features.
         return_triplet_indices: Whether to cache SphereNet triplet indices.
         num_cpus: Number of CPUs for parallel graph construction.
-        coordinate_unit: Unit shared by positions and ``cutoff``.
+        coordinate_unit: Optional expected unit for input positions. When
+            omitted, processed coordinates are consumed without unit checks.
         inclusive_cutoff: Whether atom pairs exactly at ``cutoff`` are connected.
         vocab: Optional Dataset vocabulary. Its
             ``atom.atomic_number_to_id`` mapping overrides ``atom_vocab`` and
@@ -524,7 +525,7 @@ class RadiusGraphConverter:
         include_direction: bool = False,
         return_triplet_indices: bool = False,
         num_cpus: Optional[int] = None,
-        coordinate_unit: str = "angstrom",
+        coordinate_unit: Optional[str] = None,
         inclusive_cutoff: bool = False,
         vocab: Optional[Dict] = None,
     ) -> None:
@@ -549,7 +550,11 @@ class RadiusGraphConverter:
         self.include_direction = include_direction
         self.return_triplet_indices = return_triplet_indices
         self.num_cpus = 1 if num_cpus is None else int(num_cpus)
-        self.coordinate_unit = normalize_coordinate_unit(coordinate_unit)
+        self.coordinate_unit = (
+            normalize_coordinate_unit(coordinate_unit)
+            if coordinate_unit is not None
+            else None
+        )
         self.inclusive_cutoff = inclusive_cutoff
 
     def __call__(
@@ -602,7 +607,7 @@ class RadiusGraphConverter:
                 ``graph.node_feat``.
         """
 
-        if coordinate_unit is not None:
+        if coordinate_unit is not None and self.coordinate_unit is not None:
             coordinate_unit = normalize_coordinate_unit(coordinate_unit)
             if coordinate_unit != self.coordinate_unit:
                 raise ValueError(

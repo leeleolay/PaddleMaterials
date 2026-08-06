@@ -80,9 +80,8 @@ $$
 
 ### Recommended data fields
 - `atomic_numbers`: length-$N$ atomic numbers
-- `pos`: $N \times 3$ Cartesian coordinates in the unit declared by
-  `Global.build_field_cfg.coordinate_unit` (`angstrom` for
-  QM9/MP and `bohr` for MD17/OMol25)
+- `pos`: $N \times 3$ Cartesian coordinates prepared consistently with the
+  dataset's grid and cutoff values
 - `density`: 3D array (voxel grid), for example $n \times n \times n$, in the
   unit declared by `Global.build_field_cfg.value_unit`
 - `grid_meta` (optional): origin, spacing, and box vectors to define $x_i$

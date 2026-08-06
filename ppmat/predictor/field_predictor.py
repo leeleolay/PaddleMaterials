@@ -36,15 +36,10 @@ from ppmat.predictor.field_io import read_cube_density
 from ppmat.predictor.field_io import to_numpy
 from ppmat.predictor.field_io import write_cube_from_atom_types
 from ppmat.utils import logger
-from ppmat.utils.crystal import normalize_coordinate_unit
 from ppmat.utils.misc import set_random_seed
 from ppmat.utils.visualization import draw_volume
 from ppmat.utils.visualization import maybe_downsample_volume
 from ppmat.utils.visualization import safe_write_image
-
-BOHR2ANG = 0.529177
-ANG2BOHR = 1.0 / BOHR2ANG
-
 
 def _as_paddle_tensor(value, dtype):
     if isinstance(value, paddle.Tensor):
@@ -204,10 +199,9 @@ def build_mol_sample(
         [atom.GetAtomicNum() for atom in molecule.GetAtoms()],
         dtype=np.int64,
     )
-    coordinate_unit = field_converter.coordinate_unit
-    length_scale = ANG2BOHR if coordinate_unit == "bohr" else 1.0
-    atom_coord_np = atom_coord_np * length_scale
-    grid_padding = float(grid_padding) * length_scale
+    # MOL conformer coordinates are consumed directly in angstrom.
+    coordinate_unit = "angstrom"
+    grid_padding = float(grid_padding)
 
     atom_type_idx = []
     missing = set()
@@ -242,12 +236,13 @@ def build_mol_sample(
     center = 0.5 * (min_coord + max_coord)
     origin = center - 0.5 * axis_len
 
-    grid = field_converter.build_grid(
+    grid = BuildField.build_grid_one(
         {
             "shape": shape,
             "voxel_vectors": np.diag(axis_len / np.asarray(shape, dtype=np.float32)),
             "origin": origin,
-        }
+        },
+        coordinate_unit,
     )
     info = {
         "shape": list(grid.shape),
@@ -321,20 +316,10 @@ class FieldPredictor(BasePredictor):
         self.graph_converter_fn = build_graph_converter(
             self._get_build_config("build_graph_cfg")
         )
-        if self.field_converter.format != "array":
-            raise ValueError("Predict.build_field_cfg.format must be 'array'.")
         if not hasattr(self.graph_converter_fn, "from_arrays"):
             raise TypeError(
                 "Predict.build_graph_cfg must build an array-compatible graph "
                 "converter."
-            )
-        if (
-            getattr(self.graph_converter_fn, "coordinate_unit", None)
-            != self.field_converter.coordinate_unit
-        ):
-            raise ValueError(
-                "Predict build_field_cfg and build_graph_cfg must use the same "
-                "coordinate_unit."
             )
         model_cutoff = getattr(self.model, "cutoff", model_config.get("cutoff"))
         if model_cutoff is not None and not np.isclose(
@@ -351,7 +336,6 @@ class FieldPredictor(BasePredictor):
             )
         logger.info(
             f"Model loaded successfully on {self.device}; "
-            f"coordinate unit: {self.field_converter.coordinate_unit}; "
             f"field unit: {self.field_converter.value_unit}."
         )
 
@@ -489,13 +473,7 @@ class FieldPredictor(BasePredictor):
         info = dict(info)
         if "coordinate_unit" not in info:
             raise KeyError("Field prediction requires info['coordinate_unit'].")
-        sample_unit = normalize_coordinate_unit(info["coordinate_unit"])
-        if sample_unit != self.field_converter.coordinate_unit:
-            raise ValueError(
-                f"Field sample unit is {sample_unit}, but the model expects "
-                f"{self.field_converter.coordinate_unit}."
-            )
-        info["coordinate_unit"] = sample_unit
+        info["coordinate_unit"] = str(info["coordinate_unit"])
         if "density_unit" not in info:
             raise KeyError("Field prediction requires info['density_unit'].")
         density_unit = info["density_unit"]

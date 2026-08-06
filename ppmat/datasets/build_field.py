@@ -44,7 +44,9 @@ class BuildField:
         name: Semantic field name, such as ``"density"`` or ``"potential"``.
         value_unit: Physical unit of the values. Use ``"unknown"`` only when
             the source format does not define a unit.
-        coordinate_unit: Unit shared by the grid origin and voxel vectors.
+        coordinate_unit: Optional expected coordinate unit. File formats use
+            the unit parsed from the source. Array grids default to angstrom
+            when no unit is supplied by a dataset-specific workflow.
         format: Input format. ``"array"`` accepts real-space values together
             with a keyword-only :class:`cvve.GridSpec`. ``"fft"`` accepts
             half-space packed FFT coefficients for that same grid and inverts
@@ -57,8 +59,8 @@ class BuildField:
 
     name: str
     value_unit: str
-    coordinate_unit: str
     format: str
+    coordinate_unit: str | None = None
     num_cpus: int = 1
 
     @staticmethod
@@ -134,13 +136,14 @@ class BuildField:
     ) -> GridSpec | list[GridSpec]:
         """Build one grid or a list of grids for array and fft fields."""
 
+        coordinate_unit = self.coordinate_unit or "angstrom"
         if isinstance(grid_data, (list, tuple)):
             if not grid_data:
                 return []
             return p_map(
                 BuildField.build_grid_one,
                 grid_data,
-                [self.coordinate_unit] * len(grid_data),
+                [coordinate_unit] * len(grid_data),
                 num_cpus=self.num_cpus,
                 desc="Building grids",
                 dynamic_ncols=True,
@@ -148,7 +151,7 @@ class BuildField:
             )
         return self.build_grid_one(
             grid_data,
-            self.coordinate_unit,
+            coordinate_unit,
         )
 
     @staticmethod
@@ -157,7 +160,7 @@ class BuildField:
         format: str,
         name: str,
         value_unit: str,
-        coordinate_unit: str,
+        coordinate_unit: str | None,
         grid: GridSpec | None = None,
         validate_coordinate_unit: bool = True,
         atom_numbers: Any = None,
@@ -189,13 +192,22 @@ class BuildField:
             The normalized scalar field.
         """
 
-        coordinate_unit = normalize_coordinate_unit(coordinate_unit)
+        configured_coordinate_unit = (
+            normalize_coordinate_unit(coordinate_unit)
+            if coordinate_unit is not None
+            else None
+        )
         if format in {"array", "fft"}:
             if grid is None:
                 raise ValueError(f"grid is required when format is {format!r}.")
             if not isinstance(grid, GridSpec):
                 raise TypeError("grid must be a cvve.GridSpec instance.")
-            if validate_coordinate_unit and grid.length_unit != coordinate_unit:
+            coordinate_unit = configured_coordinate_unit or grid.length_unit
+            if (
+                validate_coordinate_unit
+                and configured_coordinate_unit is not None
+                and grid.length_unit != configured_coordinate_unit
+            ):
                 raise ValueError(
                     f"{format} grid uses "
                     f"{grid.length_unit!r}, but coordinate_unit is "
@@ -254,7 +266,11 @@ class BuildField:
                 periodic=(True, True, True),
                 cell=cell,
             )
-            if validate_coordinate_unit and parsed_grid.length_unit != coordinate_unit:
+            if (
+                validate_coordinate_unit
+                and configured_coordinate_unit is not None
+                and parsed_grid.length_unit != configured_coordinate_unit
+            ):
                 raise ValueError(
                     "json grid uses "
                     f"{parsed_grid.length_unit!r}, but coordinate_unit is "
@@ -322,7 +338,11 @@ class BuildField:
                 name=name,
                 kind="density" if name == "density" else "unknown",
             )
-        if validate_coordinate_unit and field.grid.length_unit != coordinate_unit:
+        if (
+            validate_coordinate_unit
+            and configured_coordinate_unit is not None
+            and field.grid.length_unit != configured_coordinate_unit
+        ):
             raise ValueError(
                 f"{format} grid uses {field.grid.length_unit!r}, but "
                 f"coordinate_unit is {coordinate_unit!r}."

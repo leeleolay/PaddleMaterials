@@ -280,11 +280,10 @@ def test_radius_graph_validates_units_features_and_cutoff_boundary():
     np.testing.assert_array_equal(inclusive_graph.edges, [[1, 0], [0, 1]])
 
     with pytest.raises(ValueError, match="expects 'angstrom'"):
-        RadiusGraphConverter(cutoff=1.0).from_arrays(
-            atomic_numbers,
-            positions,
-            coordinate_unit="bohr",
-        )
+        RadiusGraphConverter(
+            cutoff=1.0,
+            coordinate_unit="angstrom",
+        ).from_arrays(atomic_numbers, positions, coordinate_unit="bohr")
     with pytest.raises(ValueError, match="leading dimension 2"):
         RadiusGraphConverter(cutoff=1.0).from_arrays(
             atomic_numbers,

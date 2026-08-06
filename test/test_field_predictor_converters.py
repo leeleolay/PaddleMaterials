@@ -15,6 +15,7 @@
 import numpy as np
 import paddle
 import pytest
+from ase.units import Bohr
 
 from ppmat.datasets.build_field import BuildField
 from ppmat.models.common.graph_converter import RadiusGraphConverter
@@ -139,7 +140,7 @@ def test_field_predictor_requests_prediction_without_loss():
     assert list(prediction.shape) == [2]
 
 
-def test_field_predictor_requires_coordinate_unit_in_field_config(monkeypatch):
+def test_field_predictor_accepts_field_config_without_coordinate_unit(monkeypatch):
     monkeypatch.setattr(
         FieldPredictor,
         "load_inference_model",
@@ -157,8 +158,8 @@ def test_field_predictor_requires_coordinate_unit_in_field_config(monkeypatch):
         ),
     )
 
-    with pytest.raises(TypeError, match="coordinate_unit"):
-        FieldPredictor(config_path="unused", checkpoint_path="unused")
+    predictor = FieldPredictor(config_path="unused", checkpoint_path="unused")
+    assert predictor.field_converter.coordinate_unit is None
 
 
 def test_field_predictor_rejects_registry_config(monkeypatch):
@@ -222,7 +223,7 @@ def test_field_predictor_requires_graph_cutoff_to_match_model(monkeypatch):
         FieldPredictor(config_path="unused", checkpoint_path="unused")
 
 
-def test_reference_cube_converts_to_field_coordinate_unit(tmp_path):
+def test_reference_cube_keeps_parsed_coordinate_unit(tmp_path):
     cube_path = tmp_path / "density.cube"
     write_cube(
         cube_path,
@@ -247,8 +248,8 @@ def test_reference_cube_converts_to_field_coordinate_unit(tmp_path):
     )
 
     np.testing.assert_allclose(density, np.arange(8))
-    np.testing.assert_allclose(info["cell"], np.eye(3) * 2)
-    assert info["coordinate_unit"] == "angstrom"
+    np.testing.assert_allclose(info["cell"], np.eye(3) * (2 / Bohr), rtol=1e-6)
+    assert info["coordinate_unit"] == "bohr"
 
 
 def test_field_predictor_cube_writer_consumes_plain_vocab_mapping(monkeypatch):

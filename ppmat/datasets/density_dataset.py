@@ -323,6 +323,7 @@ class DensityDataset(paddle.io.Dataset):
 
 
 MD17_DENSITY_CACHE_SCHEMA_VERSION = 10
+MD17_COORDINATE_UNIT = "bohr"  # Published MD17 FFT coordinates use bohr.
 _MD17_CACHE_BATCH_SIZE = 16
 
 MD17_ATOMIC_NUMBERS: Dict[str, np.ndarray] = {
@@ -470,6 +471,7 @@ class MD17DensityDataset(paddle.io.Dataset):
         self.n_grid = int(n_grid)
         self.grid_size = float(grid_size)
         build_field_cfg = dict(build_field_cfg)
+        build_field_cfg.setdefault("coordinate_unit", MD17_COORDINATE_UNIT)
         self.build_graph_cfg = dict(build_graph_cfg)
         self.field_converter = BuildField(**build_field_cfg)
         if self.field_converter.format != "fft":
