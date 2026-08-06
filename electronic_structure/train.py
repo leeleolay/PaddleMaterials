@@ -30,9 +30,10 @@ from ppmat.utils import logger
 from ppmat.utils import misc
 from ppmat.utils.eager_comp_setting import setting_eager_mode
 from ppmat.utils.io import append_timestamp_to_output_dir
+from ppmat.vocab import build_vocab
 
 
-def read_independent_dataloader_config(config):
+def read_independent_dataloader_config(config, vocab=None):
     """
     Args:
         config (dict): config dict
@@ -42,14 +43,14 @@ def read_independent_dataloader_config(config):
         assert (
             train_data_cfg is not None
         ), "train_data_cfg must be defined, when do_train is true"
-        train_loader = build_dataloader(train_data_cfg)
+        train_loader = build_dataloader(train_data_cfg, vocab=vocab)
     else:
         train_loader = None
 
     if config["Global"].get("do_eval", False) or config["Global"].get("do_train", True):
         val_data_cfg = config["Dataset"].get("val")
         if val_data_cfg is not None:
-            val_loader = build_dataloader(val_data_cfg)
+            val_loader = build_dataloader(val_data_cfg, vocab=vocab)
         else:
             logger.info("No validation dataset defined.")
             val_loader = None
@@ -61,7 +62,7 @@ def read_independent_dataloader_config(config):
         assert (
             test_data_cfg is not None
         ), "test_data_cfg must be defined, when do_test is true"
-        test_loader = build_dataloader(test_data_cfg)
+        test_loader = build_dataloader(test_data_cfg, vocab=vocab)
     else:
         test_loader = None
     return train_loader, val_loader, test_loader
@@ -76,7 +77,7 @@ if __name__ == "__main__":
         "-c",
         "--config",
         type=str,
-        default="./electronic_structure/configs/infgcn_md17_benzene.yaml",
+        default="./electronic_structure/configs/infgcn/infgcn_md17_benzene.yaml",
         help="Path to config file",
     )
 
@@ -112,22 +113,24 @@ if __name__ == "__main__":
     white_list = config["Global"].get("prim_backward_white_list", None)
     setting_eager_mode(enabled, white_list)
 
+    vocab = build_vocab(config.get("Vocabulary"))
+
     # build model from config
     model_cfg = config["Model"]
-    model = build_model(model_cfg)
+    model = build_model(model_cfg, vocab=vocab)
 
     # build dataloader from config
     set_signal_handlers()
     if config["Dataset"].get("split_dataset_ratio") is not None:
         # Split the dataset into train/val/test and build corresponding dataloaders
-        loader = build_dataloader(config["Dataset"])
+        loader = build_dataloader(config["Dataset"], vocab=vocab)
         train_loader = loader.get("train", None)
         val_loader = loader.get("val", None)
         test_loader = loader.get("test", None)
     else:
         # Use pre-split (independent) train/val/test datasets and build dataloaders
         train_loader, val_loader, test_loader = read_independent_dataloader_config(
-            config
+            config, vocab=vocab
         )
 
     # build optimizer and learning rate scheduler from config

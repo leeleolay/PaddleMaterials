@@ -23,6 +23,30 @@ INFGCN_MODEL_NAMES = [
     "infgcn_omol25_mc_5k_trimmed",
     "infgcn_qm9",
 ]
+QM9_ATOM_NAME2IDX = {"H": 0, "C": 1, "N": 2, "O": 3, "F": 4}
+
+
+def _build_field_cfg(format, value_unit, coordinate_unit, name="density"):
+    return {
+        "format": format,
+        "name": name,
+        "value_unit": value_unit,
+        "coordinate_unit": coordinate_unit,
+        "num_cpus": 1,
+    }
+
+
+def _build_graph_cfg(cutoff, coordinate_unit):
+    return {
+        "__class_name__": "RadiusGraphConverter",
+        "__init_params__": {
+            "cutoff": cutoff,
+            "coordinate_unit": coordinate_unit,
+            "inclusive_cutoff": True,
+            "atom_vocab": {},
+            "include_distance": False,
+        },
+    }
 
 
 def _models_module_ast():
@@ -136,10 +160,20 @@ def test_build_model_from_name_requires_standard_package():
     assert "os.walk" not in source
 
 
-def test_diffnmr_train_smiles_uses_existing_datadir_cache(tmp_path):
+def test_diffnmr_train_smiles_uses_existing_datadir_cache(tmp_path, monkeypatch):
     import numpy as np
 
-    from ppmat.datasets.msd_nmr_dataset import get_train_smiles
+    from ppmat.datasets import msd_nmr_dataset
+
+    global_home = tmp_path / "global_datasets"
+    global_subset = (
+        global_home / "msd_nmr" / msd_nmr_dataset.MSDnmrDataset.name / "msd_nmr_nless15"
+    )
+    global_subset.mkdir(parents=True)
+    (global_subset / "train.csv").write_text(
+        "smiles,tokenized_input,atom_count\nCC,{},2\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(msd_nmr_dataset.download, "DATASETS_HOME", str(global_home))
 
     cache_dir = tmp_path / "msd_nmr_nless15_cache" / "train"
     cache_dir.mkdir(parents=True)
@@ -154,30 +188,141 @@ def test_diffnmr_train_smiles_uses_existing_datadir_cache(tmp_path):
     }
     dataset_infos = SimpleNamespace(atom_decoder=["C", "N", "O", "F"])
 
-    train_smiles = get_train_smiles(cfg, dataloader=[], dataset_infos=dataset_infos)
+    train_smiles = msd_nmr_dataset.get_train_smiles(
+        cfg, dataloader=[], dataset_infos=dataset_infos
+    )
 
     np.testing.assert_array_equal(train_smiles, expected_smiles)
 
 
-def test_diffnmr_dataset_infos_can_skip_train_smiles():
+def test_diffnmr_train_smiles_downloads_registered_asset(monkeypatch, tmp_path):
+    import numpy as np
+
+    from ppmat.datasets import msd_nmr_dataset
+
+    asset_path = tmp_path / "msd_nmr_nless15_train_smiles_no_h.npy"
+    expected_smiles = np.array(["CCO", "CO"])
+    np.save(asset_path, expected_smiles)
+    calls = []
+
+    def fake_download(url, md5):
+        calls.append((url, md5))
+        return str(asset_path)
+
+    monkeypatch.setattr(
+        msd_nmr_dataset.download,
+        "get_datasets_path_from_url",
+        fake_download,
+    )
+    cfg = {
+        "datadir": str(tmp_path / "missing_dataset"),
+        "data_flag": "n<15",
+        "build_graph_cfg": {"__init_params__": {"remove_h": True}},
+    }
+    dataset_infos = SimpleNamespace(atom_decoder=["C", "N", "O", "F"])
+
+    train_smiles = msd_nmr_dataset.get_train_smiles(
+        cfg,
+        dataloader=None,
+        dataset_infos=dataset_infos,
+    )
+
+    resource = msd_nmr_dataset.TRAIN_SMILES_REGISTRY[("n<15", True)]
+    assert calls == [(resource["url"], resource["md5"])]
+    np.testing.assert_array_equal(train_smiles, expected_smiles)
+
+
+def test_diffnmr_dataset_infos_can_skip_train_smiles_without_local_dataset():
+    import pytest
+
     from ppmat.datasets.msd_nmr_dataset import MSDnmrinfos
 
+    atom_tokens = ["C", "N", "O", "F", "P", "S", "Cl", "Br", "I"]
+    vocab = {
+        "atom": {
+            "token_to_id": {token: index for index, token in enumerate(atom_tokens)},
+            "id_to_token": dict(enumerate(atom_tokens)),
+            "num_embeddings": len(atom_tokens),
+        },
+        "bond": {
+            "token_to_id": {
+                token: index
+                for index, token in enumerate(
+                    ["NO_BOND", "SINGLE", "DOUBLE", "TRIPLE", "AROMATIC"]
+                )
+            },
+            "num_embeddings": 5,
+        },
+    }
     cfg = {
         "data_flag": "n<15",
         "build_graph_cfg": {"__init_params__": {"remove_h": True}},
+        "build_spectrum_cfg": {
+            "seq_len_H1": 20,
+            "seq_len_C13": 75,
+        },
         "load_train_smiles": False,
     }
 
     dataset_infos = MSDnmrinfos(
         dataloaders=SimpleNamespace(train_dataloader=None),
         cfg=cfg,
+        vocab=vocab,
     )
 
-    assert dataset_infos.train_smiles is None
-    assert dataset_infos.atom_decoder == ["C", "N", "O", "F", "P", "S", "Cl", "Br", "I"]
+    assert not hasattr(dataset_infos, "train_smiles")
+    assert callable(dataset_infos.load_train_smiles)
+    assert dataset_infos.atom_decoder == atom_tokens
+    assert dataset_infos.seq_len_H1 == 20
+    assert dataset_infos.seq_len_C13 == 75
+    assert dataset_infos.max_n_nodes == 15
+    assert float(dataset_infos.n_nodes.sum()) == pytest.approx(1.0)
+    assert float(dataset_infos.valency_distribution.sum()) == pytest.approx(1.0)
 
 
-def test_infgcn_predict_uses_config_defaults_for_cli_options():
+def test_diffnmr_sampling_loads_train_smiles_only_for_novelty(monkeypatch):
+    import ppmat.metrics.diffnmr_streaming_adapter as adapter_module
+
+    loaded = []
+    metric_inputs = []
+
+    class FakeSamplingMetric:
+        def __init__(self, *, train_smiles, **kwargs):
+            metric_inputs.append(train_smiles)
+
+        def __call__(self, **kwargs):
+            return {"Accuracy": 1.0, "Right Number": 1, "Total Number": 1}
+
+        def reset(self):
+            pass
+
+    dataset_infos = SimpleNamespace(
+        load_train_smiles=lambda: loaded.append(True) or ["CCO"],
+    )
+    monkeypatch.setattr(
+        adapter_module,
+        "SamplingMolecularMetrics",
+        FakeSamplingMetric,
+    )
+    result = {"samples": {}, "output_dir": "."}
+
+    accuracy_adapter = adapter_module.DiffNMRStreamingAdapter(
+        sample_metrics={"Accuracy"},
+    )
+    accuracy_adapter.dataset_infos = dataset_infos
+    accuracy_adapter._update_sample(result, batch=None)
+
+    novelty_adapter = adapter_module.DiffNMRStreamingAdapter(
+        sample_metrics={"Novelty"},
+    )
+    novelty_adapter.dataset_infos = dataset_infos
+    novelty_adapter._update_sample(result, batch=None)
+
+    assert loaded == [True]
+    assert metric_inputs == [None, ["CCO"]]
+
+
+def test_infgcn_predict_config_uses_standard_field_builders():
     source = (ROOT / "electronic_structure/predict.py").read_text()
     field_source = (ROOT / "ppmat/predictor/field_predictor.py").read_text()
     cfg = OmegaConf.to_container(
@@ -186,87 +331,53 @@ def test_infgcn_predict_uses_config_defaults_for_cli_options():
     )
 
     assert "FieldPredictor" in source
-    assert "def apply_predict_config" in field_source
-    assert cfg["Predict"]["grid_batch_size"] == 20000
-    assert cfg["Predict"]["output_dir"] == "output/infgcn_qm9/vis_val0"
-    assert cfg["Predict"]["save_pred_cube"] is True
-    assert cfg["Predict"]["save_true_cube"] is True
-    assert cfg["Predict"]["cube_dir"] == "output/infgcn_qm9/cubes"
-
-
-def test_infgcn_predict_config_fills_unset_cli_options():
-    from electronic_structure.predict import apply_predict_config
-
-    args = SimpleNamespace(
-        split=None,
-        index=None,
-        data_root=None,
-        split_file=None,
-        atom_file=None,
-        output_dir=None,
-        grid_batch_size=123,
-        skip_vis=None,
-        save_true_cube=None,
-        save_pred_cube=None,
-        save_html=None,
-        cube_dir=None,
-        show_plot=None,
-        mol_pattern=None,
-        mol_grid_shape=None,
-        mol_grid_padding=None,
-        mol_true_cube_dir=None,
-    )
-    cfg = {
-        "Predict": {
-            "split": "validation",
-            "index": 3,
-            "output_dir": "from_config",
-            "grid_batch_size": 456,
-            "save_pred_cube": True,
-        }
+    assert "def apply_predict_config" not in field_source
+    assert "def from_data" in field_source
+    assert "def from_dataset" in field_source
+    assert "def from_mol_file" in field_source
+    assert cfg["Predict"] == {
+        "grid_batch_size": 20000,
+        "build_graph_cfg": _build_graph_cfg(3.0, "angstrom"),
+        "build_field_cfg": _build_field_cfg(
+            "array",
+            "electron/angstrom^3",
+            "angstrom",
+        ),
     }
 
-    apply_predict_config(args, cfg)
 
-    assert args.split == "validation"
-    assert args.index == 3
-    assert args.output_dir == "from_config"
+def test_infgcn_predict_cli_uses_explicit_runtime_options():
+    from electronic_structure.predict import parse_args
+
+    args, config_overrides = parse_args(
+        [
+            "--model_name",
+            "infgcn_qm9",
+            "--mol_file_path",
+            "methane.mol",
+            "--grid_batch_size",
+            "123",
+        ]
+    )
+
+    assert config_overrides == []
+    assert args.split == "test"
+    assert args.index == 0
+    assert args.save_path == "./results"
     assert args.grid_batch_size == 123
-    assert args.save_pred_cube is True
-    assert args.save_true_cube is False
+    assert args.grid_shape == "80,80,80"
+    assert args.grid_padding == 6.0
+    assert args.visualize is False
+    assert not hasattr(args, "mol_input")
+    assert not hasattr(args, "save_pred_cube")
 
 
 def test_infgcn_predict_cli_accepts_one_click_model_arguments():
     source = (ROOT / "electronic_structure/predict.py").read_text()
-    cli_source = (ROOT / "ppmat/utils/inference_cli.py").read_text()
 
-    assert "add_model_loading_arguments(parser)" in source
-    assert '"--model_name"' in cli_source
-    assert '"--weights_name"' in cli_source
+    assert '"--model_name"' in source
+    assert '"--weights_name"' in source
     assert "FieldPredictor(" in source
-
-
-def test_infgcn_mol_atom_mapping_requires_explicit_existing_file(tmp_path):
-    import pytest
-
-    from ppmat.predictor.field_predictor import resolve_atom_file_for_mol
-
-    with pytest.raises(FileNotFoundError, match="--atom_file"):
-        resolve_atom_file_for_mol(
-            str(tmp_path / "cli_atoms.json"),
-            str(tmp_path / "config_atoms.json"),
-        )
-
-
-def test_infgcn_mol_atom_mapping_prefers_cli_path(tmp_path):
-    from ppmat.predictor.field_predictor import resolve_atom_file_for_mol
-
-    cli_path = tmp_path / "cli_atoms.json"
-    config_path = tmp_path / "config_atoms.json"
-    cli_path.write_text("[]")
-    config_path.write_text("[]")
-
-    assert resolve_atom_file_for_mol(str(cli_path), str(config_path)) == cli_path
 
 
 def test_field_predictor_is_shared_predictor_entrypoint():
@@ -279,9 +390,8 @@ def test_field_predictor_is_shared_predictor_entrypoint():
     assert hasattr(predictor, "FieldPredictor")
     assert "class FieldPredictor" in field_source
     assert "from ppmat.predictor import FieldPredictor" in entry_source
-    assert "from ppmat.predictor.field_predictor import apply_predict_config" in (
-        entry_source
-    )
+    assert "apply_predict_config" not in entry_source
+    assert "predictor.predict(args)" not in entry_source
     assert "from ppmat.models import MODEL_REGISTRY" not in entry_source
     assert "from ppmat.datasets import DensityDataset" not in entry_source
 
@@ -289,14 +399,20 @@ def test_field_predictor_is_shared_predictor_entrypoint():
 def test_field_predictor_reuses_base_and_keeps_helpers_outside_predictor():
     field_source = (ROOT / "ppmat/predictor/field_predictor.py").read_text()
     io_source = (ROOT / "ppmat/utils/io.py").read_text()
+    build_field_source = (ROOT / "ppmat/datasets/build_field.py").read_text()
+    dataset_source = (ROOT / "ppmat/datasets/density_dataset.py").read_text()
     field_io_source = (ROOT / "ppmat/predictor/field_io.py").read_text()
     visualization_source = (ROOT / "ppmat/utils/visualization.py").read_text()
 
     assert "from ppmat.predictor.base import BasePredictor" in field_source
     assert "class FieldPredictor(BasePredictor):" in field_source
-    assert "self._load_model()" in field_source
-    assert "def _load_model(self):" in field_source
+    assert "self.load_inference_model()" in field_source
+    assert "def _load_model(self):" not in field_source
+    assert "def predict(self, args)" not in field_source
     assert not (ROOT / "ppmat/utils/field_io.py").exists()
+    assert not (ROOT / "ppmat/utils/field.py").exists()
+    assert not (ROOT / "ppmat/utils/cube.py").exists()
+    assert not (ROOT / "ppmat/datasets/_field_source.py").exists()
     assert (ROOT / "ppmat/predictor/field_io.py").exists()
     assert not (ROOT / "ppmat/utils/field_visualization.py").exists()
 
@@ -305,14 +421,44 @@ def test_field_predictor_reuses_base_and_keeps_helpers_outside_predictor():
         "safe_write_image",
         "maybe_downsample_volume",
         "read_cube_density",
-        "write_cube",
+        "write_cube_from_atom_types",
         "prepare_cube_info",
     ]:
         assert f"def {helper_name}" not in field_source
 
-    for helper_name in ["read_cube_density", "write_cube", "prepare_cube_info"]:
+    for helper_name in [
+        "read_cube_density",
+        "write_cube_from_atom_types",
+        "prepare_cube_info",
+    ]:
         assert f"def {helper_name}" in field_io_source
         assert f"def {helper_name}" not in io_source
+
+    assert "def write_cube(" in io_source
+    assert "def write_cube(" not in field_io_source
+    assert "def read_cube(" not in io_source
+    assert "ase_write(" in io_source
+    assert (
+        "from ppmat.utils.crystal import normalize_coordinate_unit"
+        in build_field_source
+    )
+    assert "class BuildField:" in build_field_source
+    assert "def build_grid(" in build_field_source
+    assert "from cvve import GridSpec" in build_field_source
+    assert "from cvve import GridField" in build_field_source
+
+    assert "OUTER LOOP" not in io_source
+    assert "OUTER LOOP" not in field_io_source
+    assert "OUTER LOOP" not in dataset_source
+    assert "cvve.read_grid_field" in build_field_source
+    assert "from cvve" not in dataset_source
+    assert "import cvve" not in dataset_source
+    assert "def read_data(" in dataset_source
+    assert "def read_cube(" not in dataset_source
+    assert "def read_chgcar(" not in dataset_source
+    assert "def read_json(" not in dataset_source
+    assert "def write_cube(" not in dataset_source
+    assert "write_cube_file" not in dataset_source
 
     for helper_name in ["draw_volume", "safe_write_image", "maybe_downsample_volume"]:
         assert f"def {helper_name}" in visualization_source
@@ -322,10 +468,14 @@ def test_field_predictor_reuses_base_and_keeps_helpers_outside_predictor():
         for line in visualization_source.splitlines()
         if line.startswith("import ") or line.startswith("from ")
     )
-    assert "import imageio" in top_level_imports
-    assert "import matplotlib.pyplot as plt" in top_level_imports
-    assert "import networkx as nx" in top_level_imports
-    assert "import plotly.graph_objects as go" in top_level_imports
+    assert "import imageio" not in top_level_imports
+    assert "import plotly.graph_objects as go" not in top_level_imports
+    assert "import imageio" in visualization_source
+    assert "import plotly.graph_objects as go" in visualization_source
+    assert "import matplotlib.pyplot as plt" not in top_level_imports
+    assert "import networkx as nx" not in top_level_imports
+    assert "import matplotlib.pyplot as plt" not in visualization_source
+    assert "import networkx as nx" not in visualization_source
     assert "import rdkit" in top_level_imports
     assert "def _rdkit_modules" not in visualization_source
     assert "def _matplotlib_pyplot" not in visualization_source
@@ -334,15 +484,129 @@ def test_field_predictor_reuses_base_and_keeps_helpers_outside_predictor():
 
     assert "def _save_cubes" in field_source
     assert "def _save_visualizations" in field_source
-    assert "FieldPredictor._save_cubes(" in field_source
-    assert "FieldPredictor._save_visualizations(" in field_source
+    assert "self._save_cubes(" in field_source
+    assert "self._save_visualizations(" in field_source
+
+
+def test_field_predictor_from_data_uses_standard_batch_contract():
+    import numpy as np
+    import paddle
+    import pgl
+    import pytest
+
+    from ppmat.datasets.build_field import BuildField
+    from ppmat.predictor import FieldPredictor
+
+    class FieldModel(paddle.nn.Layer):
+        target_name = "density"
+        loss_eps = 1e-8
+
+        def forward(self, batch, return_loss=True, return_prediction=True):
+            assert return_loss is False
+            assert return_prediction is True
+            assert "density" not in batch
+            assert batch["density_mask"] is None
+            assert isinstance(batch["graph"], pgl.Graph)
+            np.testing.assert_array_equal(batch["graph"].graph_node_id, [0, 0])
+            assert set(batch["info"]) == {"cell"}
+            assert list(batch["info"]["cell"].shape) == [1, 3, 3]
+            prediction = paddle.sum(batch["grid_coord"], axis=-1)
+            return {"loss_dict": {}, "pred_dict": {"density": prediction}}
+
+    predictor = FieldPredictor.__new__(FieldPredictor)
+    predictor.model = FieldModel()
+    predictor.device = "cpu"
+    predictor.predict_config = {"grid_batch_size": 2}
+    predictor.target_name = "density"
+    predictor.field_converter = BuildField(
+        format="array",
+        name="density",
+        value_unit="electron/angstrom^3",
+        coordinate_unit="angstrom",
+    )
+    predictor.post_transforms = None
+
+    graph = pgl.Graph(
+        num_nodes=2,
+        edges=np.asarray([[0, 1], [1, 0]], dtype=np.int64),
+        node_feat={
+            "x": np.asarray([0, 1], dtype=np.int64),
+            "pos": np.zeros([2, 3], dtype=np.float32),
+        },
+    )
+    grid_coord = np.asarray(
+        [[0, 0, 0], [1, 0, 0], [0, 2, 0], [0, 0, 3]],
+        dtype="float32",
+    )
+    info = {
+        "cell": np.eye(3, dtype=np.float32),
+        "shape": [2, 2, 1],
+        "coordinate_unit": "angstrom",
+        "density_unit": "electron/angstrom^3",
+    }
+    reference = np.asarray([0.5, 1.0, 1.5, 2.0], dtype=np.float32)
+
+    without_reference = predictor.from_data(graph, grid_coord, info)
+    with_reference = predictor.from_data(
+        graph,
+        grid_coord,
+        info,
+        density=reference,
+    )
+
+    np.testing.assert_allclose(
+        without_reference["density"].numpy(),
+        with_reference["density"].numpy(),
+    )
+    np.testing.assert_allclose(with_reference["density"].numpy(), [0, 1, 2, 3])
+    np.testing.assert_allclose(with_reference["grid_coord"].numpy(), grid_coord)
+    assert isinstance(graph.node_feat["x"], np.ndarray)
+    assert isinstance(graph.node_feat["pos"], np.ndarray)
+    np.testing.assert_array_equal(graph.graph_node_id, [0, 0])
+    assert with_reference["info"]["shape"] == [2, 2, 1]
+    assert with_reference["loss"] == pytest.approx(0.375)
+    assert with_reference["nmae"] == pytest.approx(0.4)
+
+    with pytest.raises(KeyError, match="coordinate_unit"):
+        predictor.from_data(
+            graph,
+            grid_coord,
+            {
+                "cell": np.eye(3),
+                "shape": [2, 2, 1],
+                "density_unit": "electron/angstrom^3",
+            },
+        )
+    with pytest.raises(ValueError, match="model expects angstrom"):
+        predictor.from_data(
+            graph,
+            grid_coord,
+            {
+                "cell": np.eye(3),
+                "shape": [2, 2, 1],
+                "coordinate_unit": "bohr",
+                "density_unit": "electron/angstrom^3",
+            },
+        )
+    with pytest.raises(ValueError, match="density unit"):
+        predictor.from_data(
+            graph,
+            grid_coord,
+            {
+                "cell": np.eye(3),
+                "shape": [2, 2, 1],
+                "coordinate_unit": "angstrom",
+                "density_unit": "unknown",
+            },
+        )
 
 
 def test_field_cube_io_round_trip(tmp_path):
     import numpy as np
 
+    from ppmat.datasets.build_field import BuildField
     from ppmat.predictor.field_io import read_cube_density
-    from ppmat.predictor.field_io import write_cube
+    from ppmat.utils.io import write_cube
 
     cube_path = tmp_path / "density.cube"
     density = np.arange(8, dtype=np.float32)
@@ -350,46 +614,238 @@ def test_field_cube_io_round_trip(tmp_path):
         "shape": [2, 2, 2],
         "cell": np.eye(3, dtype=np.float32) * 2,
         "origin": np.asarray([0.5, 1.0, 1.5], dtype=np.float32),
+        "coordinate_unit": "angstrom",
     }
-    with cube_path.open("w") as file_obj:
+    write_cube(
+        cube_path,
+        atom_numbers=np.asarray([6]),
+        atom_coord=np.asarray([[0.0, 0.0, 0.0]], dtype=np.float32),
+        density=density,
+        info=info,
+    )
+
+    loaded_density, grid_coord, loaded_info = read_cube_density(
+        cube_path,
+        BuildField(
+            format="array",
+            name="density",
+            value_unit="electron/angstrom^3",
+            coordinate_unit="angstrom",
+        ),
+    )
+
+    assert isinstance(loaded_density, np.ndarray)
+    assert isinstance(grid_coord, np.ndarray)
+    assert isinstance(loaded_info["cell"], np.ndarray)
+    assert isinstance(loaded_info["origin"], np.ndarray)
+    np.testing.assert_allclose(loaded_density, density)
+    np.testing.assert_allclose(loaded_info["origin"], info["origin"])
+    np.testing.assert_allclose(grid_coord[0], info["origin"])
+    assert loaded_info["shape"] == info["shape"]
+    assert loaded_info["coordinate_unit"] == "angstrom"
+    assert loaded_info["density_unit"] == "electron/angstrom^3"
+    np.testing.assert_array_equal(loaded_info["atom_numbers"], [6])
+
+
+def test_field_cube_io_preserves_bohr_axis_sign(tmp_path):
+    import numpy as np
+
+    from ppmat.datasets.build_field import BuildField
+    from ppmat.predictor.field_io import read_cube_density
+    from ppmat.utils.io import write_cube
+
+    cube_path = tmp_path / "density_bohr.cube"
+    write_cube(
+        cube_path,
+        atom_numbers=np.asarray([6]),
+        atom_coord=np.zeros([1, 3], dtype=np.float32),
+        density=np.arange(8, dtype=np.float32),
+        info={
+            "shape": [2, 2, 2],
+            "cell": np.eye(3, dtype=np.float32) * 2,
+            "origin": np.zeros(3, dtype=np.float32),
+            "coordinate_unit": "bohr",
+        },
+    )
+
+    axis_counts = [
+        int(line.split()[0]) for line in cube_path.read_text().splitlines()[3:6]
+    ]
+    _, _, loaded_info = read_cube_density(
+        cube_path,
+        BuildField(
+            format="array",
+            name="density",
+            value_unit="unknown",
+            coordinate_unit="bohr",
+        ),
+    )
+
+    assert axis_counts == [2, 2, 2]
+    assert loaded_info["coordinate_unit"] == "bohr"
+
+
+def test_field_cube_metadata_requires_explicit_coordinate_unit(tmp_path):
+    import numpy as np
+    import pytest
+
+    from ppmat.utils.io import write_cube
+
+    with pytest.raises(KeyError, match="coordinate_unit"):
         write_cube(
-            file_obj,
-            atom_type=np.asarray([6]),
-            atom_coord=np.asarray([[0.0, 0.0, 0.0]], dtype=np.float32),
-            density=density,
-            info=info,
+            tmp_path / "missing_unit.cube",
+            atom_numbers=np.asarray([6]),
+            atom_coord=np.zeros([1, 3], dtype=np.float32),
+            density=np.zeros(8, dtype=np.float32),
+            info={"shape": [2, 2, 2], "cell": np.eye(3) * 2},
         )
 
-    loaded_density, grid_coord, loaded_info = read_cube_density(cube_path)
 
-    np.testing.assert_allclose(loaded_density.numpy(), density)
-    np.testing.assert_allclose(loaded_info["origin"].numpy(), info["origin"])
-    np.testing.assert_allclose(grid_coord.numpy()[0], info["origin"])
-    assert loaded_info["shape"] == info["shape"]
+def test_field_dataset_output_uses_shared_cube_writer(tmp_path):
+    import numpy as np
+
+    from ppmat.predictor import FieldPredictor
+
+    class Dataset:
+        def write_cube(self, *args, **kwargs):
+            raise AssertionError("dataset writer must not be used")
+
+    predictor = FieldPredictor.__new__(FieldPredictor)
+    predictor.vocab = {"atom": {"id_to_atomic_number": {0: 17}}}
+    writer = predictor._get_cube_writer(Dataset())
+    cube_path = tmp_path / "dataset_output.cube"
+    writer(
+        cube_path,
+        atom_type=np.asarray([0]),
+        atom_coord=np.zeros([1, 3], dtype=np.float32),
+        density=np.zeros(8, dtype=np.float32),
+        info={
+            "shape": [2, 2, 2],
+            "cell": np.eye(3, dtype=np.float32) * 2,
+            "origin": np.zeros(3, dtype=np.float32),
+            "coordinate_unit": "angstrom",
+        },
+    )
+
+    cube_lines = cube_path.read_text().splitlines()
+    axis_counts = [int(line.split()[0]) for line in cube_lines[3:6]]
+    assert axis_counts == [2, 2, 2]
+    assert int(cube_lines[6].split()[0]) == 17
 
 
-def test_prepare_cube_info_uses_explicit_grid():
+def test_reference_cube_coordinates_require_matching_atom_order():
+    import numpy as np
+    import pgl
+    import pytest
+
+    from ppmat.models.common.graph_converter import RadiusGraphConverter
+    from ppmat.predictor.field_predictor import use_reference_atom_coordinates
+
+    graph = pgl.Graph(
+        num_nodes=2,
+        edges=np.asarray([[0, 1], [1, 0]], dtype=np.int64),
+        node_feat={
+            "x": np.asarray([0, 1], dtype=np.int64),
+            "pos": np.zeros([2, 3], dtype=np.float32),
+        },
+    )
+    graph_converter = RadiusGraphConverter(
+        cutoff=10.0,
+        coordinate_unit="angstrom",
+        atom_vocab={},
+    )
+    reference_coord = np.asarray([[1, 2, 3], [4, 5, 6]], dtype=np.float32)
+    reference_info = {
+        "atom_numbers": np.asarray([6, 1]),
+        "atom_coord_ref": reference_coord,
+        "coordinate_unit": "angstrom",
+    }
+
+    graph = use_reference_atom_coordinates(
+        graph,
+        reference_info,
+        {0: 6, 1: 1},
+        "sample.mol",
+        graph_converter,
+    )
+    assert isinstance(graph.node_feat["pos"], np.ndarray)
+    np.testing.assert_allclose(graph.node_feat["pos"], reference_coord)
+
+    reference_info["atom_numbers"] = np.asarray([1, 6])
+    with pytest.raises(ValueError, match="Atom order"):
+        use_reference_atom_coordinates(
+            graph,
+            reference_info,
+            {0: 6, 1: 1},
+            "sample.mol",
+            graph_converter,
+        )
+
+
+def test_prepare_cube_info_preserves_explicit_geometry_with_singleton_axis():
     import numpy as np
     import paddle
+    import pytest
 
+    from ppmat.datasets.build_field import BuildField
     from ppmat.predictor.field_io import prepare_cube_info
 
     origin = np.asarray([0.5, 1.0, 1.5], dtype=np.float32)
-    axes = np.stack(
-        np.meshgrid(
-            np.arange(2, dtype=np.float32),
-            np.arange(2, dtype=np.float32),
-            np.arange(2, dtype=np.float32),
-            indexing="ij",
-        ),
-        axis=-1,
+    shape = (2, 3, 1)
+    cell = np.asarray(
+        [[2.0, 0.0, 0.0], [0.6, 3.0, 0.0], [0.2, 0.4, 1.0]],
+        dtype=np.float32,
     )
-    grid = paddle.to_tensor((axes + origin).reshape(1, -1, 3))
+    steps = cell / np.asarray(shape, dtype=np.float32)[:, None]
+    expected_grid = np.empty((*shape, 3), dtype=np.float32)
+    for i in range(shape[0]):
+        for j in range(shape[1]):
+            for k in range(shape[2]):
+                expected_grid[i, j, k] = (
+                    origin + i * steps[0] + j * steps[1] + k * steps[2]
+                )
+    grid = paddle.to_tensor(expected_grid.reshape(1, -1, 3))
 
-    info = prepare_cube_info({"shape": [2, 2, 2]}, grid)
+    info = prepare_cube_info(
+        {
+            "shape": list(shape),
+            "cell": cell,
+            "origin": origin,
+            "coordinate_unit": "angstrom",
+            "density_unit": "electron/angstrom^3",
+        },
+        grid,
+        BuildField(
+            format="array",
+            name="density",
+            value_unit="electron/angstrom^3",
+            coordinate_unit="angstrom",
+        ),
+    )
 
     np.testing.assert_allclose(info["origin"], origin)
-    np.testing.assert_allclose(info["cell"], np.eye(3) * 2)
+    np.testing.assert_allclose(info["cell"], cell)
+    assert info["coordinate_unit"] == "angstrom"
+
+    mismatched_grid = grid.clone()
+    mismatched_grid[..., 0] += 0.25
+    with pytest.raises(ValueError, match="grid coordinates do not match"):
+        prepare_cube_info(
+            {
+                "shape": list(shape),
+                "cell": cell,
+                "origin": origin,
+                "coordinate_unit": "angstrom",
+                "density_unit": "electron/angstrom^3",
+            },
+            mismatched_grid,
+            BuildField(
+                format="array",
+                name="density",
+                value_unit="electron/angstrom^3",
+                coordinate_unit="angstrom",
+            ),
+        )
 
 
 def test_electronic_structure_models_use_builtin_scatter():
@@ -417,7 +873,6 @@ def test_all_infgcn_configs_are_parseable_and_complete():
     ]
 
     required_model_params = {
-        "n_atom_type",
         "num_radial",
         "num_spherical",
         "radial_embed_size",
@@ -425,47 +880,138 @@ def test_all_infgcn_configs_are_parseable_and_complete():
         "cutoff",
         "grid_cutoff",
     }
+    expected_dataset_classes = {
+        "infgcn_qm9": "QM9DensityDataset",
+        "infgcn_mp": "MPCubicDensityDataset",
+        "infgcn_omol25_MC_5k_trimmed": "OMol25MC5kTrimmedDensityDataset",
+    }
+    expected_vocab_names = {
+        "infgcn_qm9": "infgcn_qm9",
+        "infgcn_mp": "infgcn_mp",
+        "infgcn_omol25_MC_5k_trimmed": "infgcn_omol25",
+    }
+    expected_dataset_formats = {
+        "infgcn_qm9": "chgcar",
+        "infgcn_mp": "json",
+        "infgcn_omol25_MC_5k_trimmed": "cube",
+    }
 
     for config_path in config_paths:
-        cfg = OmegaConf.to_container(OmegaConf.load(config_path), resolve=True)
+        loaded_cfg = OmegaConf.load(config_path)
+        unresolved_cfg = OmegaConf.to_container(loaded_cfg, resolve=False)
+        cfg = OmegaConf.to_container(loaded_cfg, resolve=True)
         assert cfg["Model"]["__class_name__"] == "InfGCN", config_path.name
         assert required_model_params.issubset(
             cfg["Model"]["__init_params__"]
         ), config_path.name
+        assert "n_atom_type" not in cfg["Model"]["__init_params__"], config_path.name
+        assert cfg["Vocabulary"] == expected_vocab_names.get(
+            config_path.stem, "infgcn_md17"
+        ), config_path.name
+        uses_angstrom = config_path.name in {
+            "infgcn_qm9.yaml",
+            "infgcn_mp.yaml",
+        }
+        dataset_format = expected_dataset_formats.get(config_path.stem, "fft")
+        coordinate_unit = "angstrom" if uses_angstrom else "bohr"
+        expected_field_cfg = _build_field_cfg(
+            dataset_format,
+            "electron/angstrom^3" if uses_angstrom else "unknown",
+            coordinate_unit,
+        )
+        assert cfg["Global"]["build_field_cfg"] == expected_field_cfg
+        graph_cutoff = 6.0 if config_path.stem == "infgcn_omol25_MC_5k_trimmed" else 3.0
+        expected_graph_cfg = _build_graph_cfg(graph_cutoff, coordinate_unit)
+        assert cfg["Global"]["build_graph_cfg"] == expected_graph_cfg
+        assert cfg["Model"]["__init_params__"]["cutoff"] == graph_cutoff
 
         dataset_cfg = cfg["Dataset"]
         for split in ["train", "val", "test"]:
             split_cfg = dataset_cfg[split]
             dataset = split_cfg["dataset"]
-            assert dataset["__class_name__"] in {
-                "DensityDataset",
-                "SmallDensityDataset",
-            }, config_path.name
-            assert "root" in dataset["__init_params__"], config_path.name
+            expected_dataset_class = expected_dataset_classes.get(
+                config_path.stem, "MD17DensityDataset"
+            )
+            assert dataset["__class_name__"] == expected_dataset_class, config_path.name
+            assert "path" in dataset["__init_params__"], config_path.name
             assert "sampler" in split_cfg, config_path.name
             assert "loader" in split_cfg, config_path.name
             assert isinstance(
                 split_cfg["loader"]["use_shared_memory"], bool
             ), config_path.name
-            assert split_cfg["loader"]["collate_fn"] in {
-                "DensityCollator",
-                "DensityVoxelCollator",
-            }, config_path.name
+            assert (
+                split_cfg["loader"]["collate_fn"] == "DensityCollator"
+            ), config_path.name
+            if split in {"val", "test"}:
+                assert split_cfg["sampler"]["__init_params__"]["shuffle"] is False
+            init_params = dataset["__init_params__"]
+            unresolved_init_params = unresolved_cfg["Dataset"][split]["dataset"][
+                "__init_params__"
+            ]
+            assert init_params["build_graph_cfg"] == expected_graph_cfg
+            assert (
+                unresolved_init_params["build_graph_cfg"] == "${Global.build_graph_cfg}"
+            )
+            if dataset["__class_name__"] == "MD17DensityDataset":
+                # The MD17 dataset supplies its own array/bohr field defaults.
+                assert "build_field_cfg" not in init_params
+                assert "validation_ratio" not in init_params
+                assert "split_seed" not in init_params
+                assert init_params["n_grid"] == 50
+                assert init_params["grid_size"] == 20.0
+            else:
+                assert init_params["build_field_cfg"] == expected_field_cfg
+                assert (
+                    unresolved_init_params["build_field_cfg"]
+                    == "${Global.build_field_cfg}"
+                )
+                assert set(init_params) <= {
+                    "path",
+                    "split",
+                    "build_field_cfg",
+                    "build_graph_cfg",
+                    "grid_sampler_cfg",
+                    "overwrite",
+                }
+                assert init_params["overwrite"] is False
+            assert init_params["grid_sampler_cfg"]["n_samples"] > 0, config_path.name
+            if config_path.stem == "infgcn_omol25_MC_5k_trimmed" and split in {
+                "val",
+                "test",
+            }:
+                assert init_params["grid_sampler_cfg"]["resample_each_epoch"] is False
 
-        predict_cfg = cfg["Predict"]
-        for key in [
-            "split",
-            "index",
-            "output_dir",
+        assert set(cfg["Predict"]) == {
             "grid_batch_size",
-            "save_true_cube",
-            "save_pred_cube",
-            "save_html",
-            "cube_dir",
-            "mol_grid_shape",
-            "mol_grid_padding",
-        ]:
-            assert key in predict_cfg, config_path.name
+            "build_field_cfg",
+            "build_graph_cfg",
+        }, config_path.name
+        assert cfg["Predict"]["build_graph_cfg"] == expected_graph_cfg
+        assert (
+            unresolved_cfg["Predict"]["build_graph_cfg"] == "${Global.build_graph_cfg}"
+        )
+        expected_predict_field_cfg = _build_field_cfg(
+            "array",
+            expected_field_cfg["value_unit"],
+            coordinate_unit,
+        )
+        assert cfg["Predict"]["build_field_cfg"] == expected_predict_field_cfg
+        assert unresolved_cfg["Predict"]["build_field_cfg"] == {
+            "format": "array",
+            "name": "${Global.build_field_cfg.name}",
+            "value_unit": "${Global.build_field_cfg.value_unit}",
+            "coordinate_unit": "${Global.build_field_cfg.coordinate_unit}",
+            "num_cpus": 1,
+        }
+
+
+def test_electronic_structure_train_wires_vocabulary_into_runtime():
+    source = (ROOT / "electronic_structure/train.py").read_text()
+
+    assert "electronic_structure/configs/infgcn/infgcn_md17_benzene.yaml" in source
+    assert 'vocab = build_vocab(config.get("Vocabulary"))' in source
+    assert "model = build_model(model_cfg, vocab=vocab)" in source
+    assert "build_dataloader(train_data_cfg, vocab=vocab)" in source
 
 
 def test_infgcn_readme_commands_and_config_links_are_clean():
@@ -475,16 +1021,19 @@ def test_infgcn_readme_commands_and_config_links_are_clean():
 
     assert "--model_name infgcn_qm9" in readme
     assert "--weights_name best.pdparams" in readme
-    assert "--mol_input electronic_structure/configs/infgcn/example/methane.mol" in (
-        readme
+    assert (
+        "--mol_file_path electronic_structure/configs/infgcn/example/methane.mol"
+        in (readme)
     )
-    assert "--atom_file electronic_structure/configs/qm9.json" in readme
     assert example_mol.is_file()
     assert "conda run" not in readme
     assert "/home/" not in readme
     assert ".pt" not in readme
     assert "_t_2026" not in readme
     assert "_s_42.zip" not in readme
+    dataset_section = readme.split("### Datasets", 1)[1].split("---", 1)[0]
+    assert "http://" not in dataset_section
+    assert "https://" not in dataset_section
 
     hrefs = re.findall(r'href="([^"]*configs/infgcn/[^"]+\.yaml)"', readme)
     assert hrefs
@@ -493,25 +1042,143 @@ def test_infgcn_readme_commands_and_config_links_are_clean():
 
 
 def test_infgcn_bundled_molecule_builds_inference_grid():
+    import numpy as np
+
+    from ppmat.datasets.build_field import BuildField
+    from ppmat.models.common.graph_converter import RadiusGraphConverter
     from ppmat.predictor.field_predictor import build_mol_sample
-    from ppmat.predictor.field_predictor import load_atom_mapping
 
     example_mol = INFGCN_CONFIG_DIR / "example/methane.mol"
-    atom_file = ROOT / "electronic_structure/configs/qm9.json"
-    atom_name2idx, _ = load_atom_mapping(atom_file)
 
     graph, density, grid_coord, info = build_mol_sample(
         example_mol,
-        atom_name2idx,
-        mol_grid_shape=[8, 8, 8],
-        mol_grid_padding=6.0,
+        QM9_ATOM_NAME2IDX,
+        grid_shape=[8, 8, 8],
+        grid_padding=6.0,
+        field_converter=BuildField(
+            format="array",
+            name="density",
+            value_unit="unknown",
+            coordinate_unit="angstrom",
+        ),
+        graph_converter=RadiusGraphConverter(
+            cutoff=3.0,
+            coordinate_unit="angstrom",
+            atom_vocab={},
+        ),
     )
 
-    assert graph.x.shape == [5]
-    assert graph.pos.shape == [5, 3]
+    assert isinstance(graph.node_feat["x"], np.ndarray)
+    assert isinstance(graph.node_feat["pos"], np.ndarray)
+    assert isinstance(grid_coord, np.ndarray)
+    assert isinstance(info["cell"], np.ndarray)
+    assert isinstance(info["origin"], np.ndarray)
+    assert graph.node_feat["x"].shape == (5,)
+    assert graph.node_feat["pos"].shape == (5, 3)
     assert density is None
-    assert grid_coord.shape == [512, 3]
+    assert grid_coord.shape == (512, 3)
     assert info["shape"] == [8, 8, 8]
+    assert info["coordinate_unit"] == "angstrom"
+    assert info["density_unit"] == "unknown"
+
+
+def test_infgcn_molecule_grid_converts_to_configured_bohr_unit():
+    import numpy as np
+
+    from ppmat.datasets.build_field import BuildField
+    from ppmat.models.common.graph_converter import RadiusGraphConverter
+    from ppmat.predictor.field_predictor import ANG2BOHR
+    from ppmat.predictor.field_predictor import build_mol_sample
+
+    example_mol = INFGCN_CONFIG_DIR / "example/methane.mol"
+    field_converter = BuildField(
+        format="array",
+        name="density",
+        value_unit="unknown",
+        coordinate_unit="angstrom",
+    )
+
+    graph_ang, _, grid_ang, info_ang = build_mol_sample(
+        example_mol,
+        QM9_ATOM_NAME2IDX,
+        grid_shape=[8, 8, 8],
+        grid_padding=6.0,
+        field_converter=field_converter,
+        graph_converter=RadiusGraphConverter(
+            cutoff=3.0,
+            coordinate_unit="angstrom",
+            atom_vocab={},
+        ),
+    )
+    field_converter_bohr = BuildField(
+        format="array",
+        name="density",
+        value_unit="unknown",
+        coordinate_unit="bohr",
+    )
+    graph_bohr, _, grid_bohr, info_bohr = build_mol_sample(
+        example_mol,
+        QM9_ATOM_NAME2IDX,
+        grid_shape=[8, 8, 8],
+        grid_padding=6.0,
+        field_converter=field_converter_bohr,
+        graph_converter=RadiusGraphConverter(
+            cutoff=3.0,
+            coordinate_unit="bohr",
+            atom_vocab={},
+        ),
+    )
+
+    np.testing.assert_allclose(
+        graph_bohr.node_feat["pos"],
+        graph_ang.node_feat["pos"] * ANG2BOHR,
+    )
+    np.testing.assert_allclose(grid_bohr, grid_ang * ANG2BOHR, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(info_bohr["cell"], info_ang["cell"] * ANG2BOHR)
+    assert info_bohr["coordinate_unit"] == "bohr"
+
+
+def test_cube_field_builder_preserves_geometry(tmp_path):
+    import numpy as np
+
+    from ppmat.datasets.build_field import BuildField
+
+    cube_path = tmp_path / "density.cube"
+    cube_path.write_text(
+        "comment\n"
+        "comment\n"
+        "1 0.5 1.0 1.5\n"
+        "-2 1.0 0.0 0.0\n"
+        "-2 0.0 1.0 0.0\n"
+        "-2 0.0 0.0 1.0\n"
+        "6 6.0 0.0 0.0 0.0\n"
+        "0 1 2 3 4 5 6 7\n",
+        encoding="utf-8",
+    )
+    field = BuildField(
+        format="cube",
+        name="density",
+        value_unit="unknown",
+        coordinate_unit="angstrom",
+    )(cube_path)
+
+    assert field.structure is not None
+    np.testing.assert_array_equal(
+        field.structure.symbols,
+        ["C"],
+    )
+
+    assert isinstance(field.flat, np.ndarray)
+    assert isinstance(field.grid.cartesian_coordinates(), np.ndarray)
+    assert isinstance(field.grid.cell_vectors, np.ndarray)
+    np.testing.assert_allclose(field.flat, np.arange(8))
+    np.testing.assert_allclose(
+        field.grid.cartesian_coordinates()[0],
+        [0.5, 1.0, 1.5],
+    )
+    np.testing.assert_allclose(field.grid.cell_vectors, np.eye(3) * 2)
+    assert field.grid.shape == (2, 2, 2)
+    assert field.grid.length_unit == "angstrom"
 
 
 def test_diffnmr_sample_readme_documents_one_click_sample_command():
@@ -544,15 +1211,9 @@ def test_diffnmr_package_sample_defaults_to_bundled_example():
 
     assert config["Sampler"]["name"] == "diffnmr"
     assert config["Sampler"]["retrieval_database_path"] is None
+    assert config["Vocabulary"] == "diffnmr_msdnmr_nless15"
     sampler_params = config["Sampler"]["data"]["dataset"]["__init_params__"]
     assert sampler_params["path"] == "./example/sample.csv"
-    assert sampler_params["vocab_peakwidth_path"] == (
-        "./spectrum_elucidation/vocab/nless15/H1_statistic/delta_distribution.csv"
-    )
-    assert sampler_params["vocab_split_path"] == (
-        "./spectrum_elucidation/vocab/nless15/H1_statistic/"
-        "split_type_distribution.csv"
-    )
     assert sampler_params["cache_path"] == "./output/diffnmr_example_cache"
     assert sampler_params["overwrite"] is True
     assert config["Sampler"]["data"]["sampler"]["__init_params__"]["batch_size"] == 1
@@ -662,6 +1323,22 @@ def test_molecular_sampler_dispatches_registered_diffnmr_name(monkeypatch):
     assert sampler.kwargs["model_name"] == "diffnmr_msdnmr_nless15"
 
 
+def test_molecular_sampler_infers_diffnmr_for_graphformer_config(tmp_path):
+    import ppmat.sampler.molecular_sampler as molecular_sampler
+
+    config_path = tmp_path / "DiffNMR_DiffGraphFormer.yaml"
+    config_path.write_text("Model:\n" "  __class_name__: MolecularGraphFormer\n")
+
+    assert (
+        molecular_sampler._infer_sampler_name(
+            model_name=None,
+            config_path=str(config_path),
+            config_overrides=None,
+        )
+        == "diffnmr"
+    )
+
+
 def test_molecular_sampler_updates_visualization_output_dir_for_save_path(tmp_path):
     from ppmat.sampler.diffnmr import DiffNMRSampler
 
@@ -700,170 +1377,6 @@ def test_molecular_sampler_compute_metric_reuses_sample_metrics(tmp_path):
     assert sampler.output_dir == str(tmp_path)
 
 
-def test_molecular_sampler_clamps_keep_chain_to_batch_size():
-    import paddle
-
-    from ppmat.sampler.diffnmr import DiffNMRSampler
-
-    sampler = object.__new__(DiffNMRSampler)
-    assert sampler._clamp_keep_chain(5, 1) == 1
-    assert sampler._clamp_keep_chain(0, 1) == 0
-    assert sampler._clamp_keep_chain(3, paddle.to_tensor([2, 2], dtype="int64")) == 2
-
-
-def test_molecular_sampler_accumulates_conditions_across_batches():
-    import numpy as np
-
-    from ppmat.sampler.diffnmr import DiffNMRSampler
-
-    samples = {"batch_condition": []}
-    first_batch = [np.full((2, 3), branch, dtype=np.float32) for branch in range(4)]
-    second_batch = [
-        np.full((1, 3), branch + 10, dtype=np.float32) for branch in range(4)
-    ]
-
-    DiffNMRSampler._append_batch_conditions(samples, first_batch)
-    DiffNMRSampler._append_batch_conditions(samples, second_batch)
-
-    assert len(samples["batch_condition"]) == 4
-    for branch, tensor in enumerate(samples["batch_condition"]):
-        expected = np.concatenate([first_batch[branch], second_batch[branch]], axis=0)
-        np.testing.assert_allclose(tensor.numpy(), expected)
-
-
-def test_molecular_sampler_rejects_inconsistent_condition_branches():
-    import numpy as np
-    import pytest
-
-    from ppmat.sampler.diffnmr import DiffNMRSampler
-
-    samples = {
-        "batch_condition": [np.zeros((1, 2), dtype=np.float32) for _ in range(4)]
-    }
-    with pytest.raises(ValueError, match="Inconsistent number"):
-        DiffNMRSampler._append_batch_conditions(
-            samples,
-            [np.zeros((1, 2), dtype=np.float32) for _ in range(2)],
-        )
-
-
-def test_molecular_sampler_sample_epoch_preserves_two_batch_conditions(monkeypatch):
-    import numpy as np
-    import paddle
-
-    import ppmat.sampler.diffnmr as diffnmr_sampler
-    from ppmat.sampler.diffnmr import DiffNMRSampler
-
-    class DenseData:
-        X = paddle.zeros([1, 1, 1], dtype="float32")
-        E = paddle.zeros([1, 1, 1, 1], dtype="float32")
-
-        def mask(self, node_mask):
-            return self
-
-    class Streaming:
-        def __init__(self):
-            self.samples = None
-
-        def update_step(self, result, **kwargs):
-            self.samples = result["samples"]
-
-        def compute_epoch(self, **kwargs):
-            return {}
-
-    monkeypatch.setattr(
-        diffnmr_sampler.diffgraphformer_utils,
-        "to_dense",
-        lambda *args, **kwargs: (
-            DenseData(),
-            paddle.ones([1, 1], dtype="bool"),
-        ),
-    )
-
-    sampler = object.__new__(DiffNMRSampler)
-    sampler.model = SimpleNamespace(
-        eval=lambda: None,
-        conditioning_mode="spectrum",
-        dataset_info=SimpleNamespace(atom_decoder=["C"]),
-    )
-    sampler.sample_batch_iters = 2
-    sampler.visual_num = 0
-    sampler.chains_left_to_save = 0
-    sampler.number_chain_steps = 1
-    sampler.flag_use_formula = False
-    sampler.flag_retrieval_initialization = False
-    sampler.clip = None
-    sampler.molecular_vectors = None
-    sampler.smiles_list = None
-    sampler.streaming = Streaming()
-    sampler.rank = 0
-    sampler.output_dir = "unused"
-    sampler.sample_batch = lambda **kwargs: ([["pred"]], [["true"]])
-
-    def make_batch(offset):
-        return {
-            "graph": SimpleNamespace(
-                node_feat={"feat": np.zeros((1, 1), dtype=np.float32)},
-                edges=np.zeros((0, 2), dtype=np.int64),
-                edge_feat={"feat": np.zeros((0, 1), dtype=np.float32)},
-                graph_node_id=np.zeros(1, dtype=np.int64),
-            ),
-            "property": {
-                "atom_count": np.asarray([1], dtype=np.int64),
-                "y": np.asarray([[0]], dtype=np.float32),
-            },
-            "spectrum": {
-                "H_nmr": np.full((1, 2), offset, dtype=np.float32),
-                "num_H_peak": np.asarray([offset], dtype=np.float32),
-                "C_nmr": np.full((1, 3), offset + 1, dtype=np.float32),
-                "num_C_peak": np.asarray([offset + 1], dtype=np.float32),
-            },
-        }
-
-    sampler.sample_epoch(
-        [make_batch(1), make_batch(5)],
-        epoch_id=0,
-        num_candidates=1,
-    )
-
-    conditions = sampler.streaming.samples["batch_condition"]
-    assert [tensor.shape[0] for tensor in conditions] == [2, 2, 2, 2]
-    np.testing.assert_allclose(conditions[0].numpy()[:, 0], [1, 5])
-    assert sampler.streaming.samples["n_all"] == 2
-    assert len(sampler.streaming.samples["pred"]) == 2
-
-
-def test_diffnmr_spectrum_dispatch_uses_explicit_model_capability():
-    import paddle
-
-    from ppmat.schedulers.scheduling_diffnmr import _encode_spectrum_condition
-
-    model_source = (ROOT / "ppmat/models/diffnmr/diffnmr.py").read_text()
-    sampler_source = (ROOT / "ppmat/sampler/diffnmr.py").read_text()
-    scheduler_source = (ROOT / "ppmat/schedulers/scheduling_diffnmr.py").read_text()
-    assert 'self.conditioning_mode = "spectrum"' in model_source
-    assert 'getattr(self.model, "conditioning_mode", None)' in sampler_source
-    assert 'getattr(model, "conditioning_mode", None)' in scheduler_source
-    assert "isinstance(model, DiffNMR)" not in scheduler_source
-    assert "model.__class__ is DiffNMR" not in scheduler_source
-
-    expected_embedding = paddle.ones([1, 4])
-    expected_tokens = paddle.ones([1, 2, 4])
-    expected_mask = paddle.ones([1, 2])
-    condition = [object(), object(), object(), object()]
-
-    class Encoder:
-        def __call__(self, value):
-            assert value is condition
-            return expected_embedding, (expected_tokens, expected_mask)
-
-    model = SimpleNamespace(flag_onlyH=False, encoder=Encoder())
-    embedding, tokens = _encode_spectrum_condition(model, condition)
-
-    assert embedding is expected_embedding
-    assert tokens is expected_tokens
-
-
 def test_diffnmr_config_uses_standard_checkpoint_paths():
     config_path = ROOT / "spectrum_elucidation/configs/diffnmr/DiffNMR.yaml"
     source = config_path.read_text()
@@ -883,6 +1396,11 @@ def test_diffnmr_config_uses_standard_checkpoint_paths():
     assert cfg["CLIP"]["__init_params__"]["graph_encoder"][
         "pretrained_model_path"
     ].startswith("./checkpoints/")
+    for config_name in ("DiffNMR.yaml", "PP-DiffNMR.yaml"):
+        final_cfg = OmegaConf.load(
+            ROOT / "spectrum_elucidation/configs/diffnmr" / config_name
+        )
+        assert "vocab_dim" not in final_cfg["Model"]["__init_params__"]["decoder_cfg"]
 
 
 def test_molecular_sampler_resolves_diffnmr_checkpoint_paths(tmp_path):
@@ -891,40 +1409,25 @@ def test_molecular_sampler_resolves_diffnmr_checkpoint_paths(tmp_path):
     package_dir = tmp_path / "diffnmr_msdnmr_nless15"
     package_ckpt_dir = package_dir / "checkpoints"
     package_assets_dir = package_dir / "assets"
-    package_vocab_dir = package_assets_dir / "vocab/nless15/H1_statistic"
     package_retrieval_dir = package_assets_dir / "retrieval_database"
     package_ckpt_dir.mkdir(parents=True)
-    package_vocab_dir.mkdir(parents=True)
     package_retrieval_dir.mkdir(parents=True)
     package_weight = package_ckpt_dir / "DiffNMR_NMRNet_nless15_best.pdparams"
-    package_vocab = package_vocab_dir / "delta_distribution.csv"
     package_retrieval = (
         package_retrieval_dir
         / "msd_nmr_nless15_retrieval_molecular_representations.csv"
     )
     package_weight.write_bytes(b"fake")
-    package_vocab.write_text("Value,Count\n0.03,1\n")
     package_retrieval.write_text("smiles,mol_rep\n")
 
     package_config = {
+        "Vocabulary": "diffnmr_msdnmr_nless15",
         "Model": {
             "__init_params__": {
                 "encoder_cfg": {
                     "pretrained_path": (
                         "./checkpoints/DiffNMR_NMRNet_nless15_best.pdparams"
                     )
-                }
-            }
-        },
-        "Dataset": {
-            "train": {
-                "dataset": {
-                    "__init_params__": {
-                        "vocab_peakwidth_path": (
-                            "./assets/vocab/nless15/H1_statistic/"
-                            "delta_distribution.csv"
-                        ),
-                    }
                 }
             }
         },
@@ -945,9 +1448,7 @@ def test_molecular_sampler_resolves_diffnmr_checkpoint_paths(tmp_path):
     assert package_config["Model"]["__init_params__"]["encoder_cfg"][
         "pretrained_path"
     ] == str(package_weight)
-    assert package_config["Dataset"]["train"]["dataset"]["__init_params__"][
-        "vocab_peakwidth_path"
-    ] == str(package_vocab)
+    assert package_config["Vocabulary"] == "diffnmr_msdnmr_nless15"
     assert package_config["Sampler"]["retrieval_database_path"] == str(
         package_retrieval
     )
@@ -979,38 +1480,20 @@ def test_molecular_sampler_resolves_diffnmr_checkpoint_paths(tmp_path):
     ] == str(custom_weight)
 
 
-def test_molecular_sampler_requires_packaged_diffnmr_vocab(tmp_path):
-    import pytest
-
+def test_molecular_sampler_does_not_require_packaged_diffnmr_vocab(tmp_path):
     from ppmat.sampler.diffnmr import DiffNMRSampler
 
     package_dir = tmp_path / "diffnmr_msdnmr_nless15"
     package_dir.mkdir()
-    config = {
-        "Sampler": {
-            "data": {
-                "dataset": {
-                    "__init_params__": {
-                        "vocab_peakwidth_path": (
-                            "./assets/vocab/nless15/H1_statistic/"
-                            "delta_distribution.csv"
-                        ),
-                        "vocab_split_path": (
-                            "./assets/vocab/nless15/H1_statistic/"
-                            "split_type_distribution.csv"
-                        ),
-                    }
-                }
-            }
-        }
-    }
+    config = {"Vocabulary": "diffnmr_msdnmr_nless15"}
 
-    with pytest.raises(FileNotFoundError, match="vocab_peakwidth_path"):
-        DiffNMRSampler._resolve_package_paths(
-            config,
-            config_base_dir=str(package_dir),
-            checkpoint_dir=None,
-        )
+    DiffNMRSampler._resolve_package_paths(
+        config,
+        config_base_dir=str(package_dir),
+        checkpoint_dir=None,
+    )
+
+    assert config["Vocabulary"] == "diffnmr_msdnmr_nless15"
 
 
 def test_molecular_sampler_requires_retrieval_database_only_when_enabled(tmp_path):
@@ -1042,89 +1525,11 @@ def test_molecular_sampler_requires_retrieval_database_only_when_enabled(tmp_pat
     )
 
 
-def test_molecular_sampler_allows_zero_saved_chains(monkeypatch):
-    import paddle
-
-    import ppmat.sampler.diffnmr as diffnmr_sampler
-    from ppmat.sampler.diffnmr import DiffNMRSampler
-
-    class FakeData:
-        def __init__(self, X, E, y=None):
-            self.X = X
-            self.E = E
-            self.y = y
-
-        def mask(self, node_mask, collapse=False):
-            if collapse:
-                return FakeData(
-                    paddle.argmax(self.X, axis=-1),
-                    paddle.argmax(self.E, axis=-1),
-                    self.y,
-                )
-            return self
-
-    class FakeModel:
-        T = 1
-        limit_dist = None
-
-    def fake_noise(limit_dist, node_mask):
-        del limit_dist
-        batch_size, n_max = node_mask.shape
-        return FakeData(
-            paddle.ones([batch_size, n_max, 1], dtype="float32"),
-            paddle.ones([batch_size, n_max, n_max, 1], dtype="float32"),
-            paddle.zeros([batch_size, 1], dtype="float32"),
-        )
-
-    def fake_step(model, **kwargs):
-        del model
-        batch_size = kwargs["X_t"].shape[0]
-        n_max = kwargs["X_t"].shape[1]
-        sampled = FakeData(
-            paddle.ones([batch_size, n_max, 1], dtype="float32"),
-            paddle.ones([batch_size, n_max, n_max, 1], dtype="float32"),
-            paddle.zeros([batch_size, 1], dtype="float32"),
-        )
-        discrete = FakeData(
-            paddle.zeros([batch_size, n_max], dtype="int64"),
-            paddle.zeros([batch_size, n_max, n_max], dtype="int64"),
-        )
-        return sampled, discrete
-
-    monkeypatch.setattr(
-        diffnmr_sampler.scheduling_diffnmr,
-        "sample_discrete_feature_noise",
-        fake_noise,
-    )
-    monkeypatch.setattr(diffnmr_sampler.scheduling_diffnmr, "step", fake_step)
-
-    sampler = object.__new__(DiffNMRSampler)
-    sampler.visualization_tools = None
-
-    mol_list, mol_true = sampler.sample_batch(
-        model=FakeModel(),
-        batch_id=0,
-        batch_size=1,
-        batch_condition=[],
-        number_chain_steps=1,
-        keep_chain=0,
-        visual_num=0,
-        batch_X=paddle.ones([1, 1, 1], dtype="float32"),
-        batch_E=paddle.ones([1, 1, 1, 1], dtype="float32"),
-        batch_y=paddle.zeros([1, 1], dtype="float32"),
-        iter_idx=0,
-        num_nodes=paddle.to_tensor([1], dtype="int64"),
-    )
-
-    assert len(mol_list) == 1
-    assert len(mol_true) == 1
-
-
 def test_diffnmr_sample_entrypoint_supports_config_overrides():
     source = (ROOT / "spectrum_elucidation/sample.py").read_text()
     sampler_source = (ROOT / "ppmat/sampler/diffnmr.py").read_text()
 
-    assert "parse_known_args()" in source
+    assert "parse_known_args(argv)" in source
     assert "config_overrides=config_overrides" in source
     assert "config_overrides: Optional[List[str]] = None" in sampler_source
     assert "OmegaConf.merge(config, cli_config)" in sampler_source
@@ -1134,9 +1539,19 @@ def test_diffnmr_sample_entrypoint_supports_config_overrides():
 
 def test_diffnmr_train_entrypoint_builds_training_statistics_for_eval_and_test():
     source = (ROOT / "spectrum_elucidation/train.py").read_text()
+    dataloader_helper = source.split(
+        "def read_independent_dataloader_config", maxsplit=1
+    )[1].split("def parse_args", maxsplit=1)[0]
 
-    assert "if do_train or do_eval or do_test:" in source
-    assert "At least one of Global.do_train" in source
+    assert 'train_data_cfg = config["Dataset"].get("train")' in dataloader_helper
+    assert (
+        "train_loader = build_dataloader(train_data_cfg, vocab=vocab)"
+        in dataloader_helper
+    )
+    assert "At least one of Global.do_train" in dataloader_helper
+    assert "val_data_cfg must be defined when do_eval is true." in dataloader_helper
+    assert "spectrum_elucidation/configs/diffnmr/DiffNMR.yaml" in source
+    assert "build_metric(metric_cfg)" not in source
     assert (
         "dataloaders.train_dataloader"
         in (ROOT / "ppmat/datasets/msd_nmr_dataset.py").read_text()

@@ -16,12 +16,19 @@ import math
 
 import numpy as np
 import paddle
+import pytest
+from cvve import Structure as CVVEStructure
+from pymatgen.core import Lattice
+from pymatgen.core import Structure as PymatgenStructure
 from rdkit import Chem
 from scipy import special
 
+import ppmat.models.common.graph_converter as graph_converter_module
 from ppmat.datasets.build_molecule import BuildMolecule
 from ppmat.datasets.collate_fn import RadiusGraphCollator
 from ppmat.models.common import initializer
+from ppmat.models.common.graph_converter import CrystalNN
+from ppmat.models.common.graph_converter import FindPointsInSpheres
 from ppmat.models.common.graph_converter import RadiusGraphConverter
 from ppmat.models.common.spherical_fourier_bessel import RealSphericalHarmonics
 from ppmat.models.common.spherical_fourier_bessel import SphericalBesselBasis
@@ -61,6 +68,231 @@ def test_radius_graph_matches_pyg_edge_and_triplet_order():
     )
     np.testing.assert_array_equal(graph.edge_feat["ti_idx_kj"], [3, 5, 1, 4, 0, 2])
     np.testing.assert_array_equal(graph.edge_feat["ti_idx_ji"], [0, 1, 2, 3, 4, 5])
+
+
+def test_radius_graph_from_arrays_matches_rdkit_and_merges_node_features():
+    atomic_numbers = np.array([6, 7, 8], dtype=np.int64)
+    positions = np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        dtype=np.float32,
+    )
+    molecule = BuildMolecule(format="dict", sanitize=False)(
+        {
+            "atomic_numbers": atomic_numbers,
+            "positions": positions,
+        }
+    )
+    converter = RadiusGraphConverter(cutoff=2.0)
+
+    molecule_graph = converter(molecule)
+    array_graph = converter.from_arrays(
+        atomic_numbers,
+        positions,
+        coordinate_unit="angstrom",
+        node_features={"x": np.array([1, 2, 3], dtype=np.int64)},
+    )
+
+    np.testing.assert_array_equal(array_graph.edges, molecule_graph.edges)
+    np.testing.assert_allclose(
+        array_graph.node_feat["pos"],
+        molecule_graph.node_feat["pos"],
+    )
+    np.testing.assert_array_equal(
+        array_graph.node_feat["atomic_number"],
+        molecule_graph.node_feat["atomic_number"],
+    )
+    np.testing.assert_array_equal(array_graph.node_feat["x"], [1, 2, 3])
+
+
+def test_radius_graph_from_cvve_and_pymatgen_structures():
+    cvve_structure = CVVEStructure(
+        symbols=["X6", "O"],
+        positions=np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]),
+        position_unit="bohr",
+    )
+    cvve_graph = RadiusGraphConverter(
+        cutoff=1.0,
+        coordinate_unit="bohr",
+        inclusive_cutoff=True,
+    ).from_structure(
+        cvve_structure,
+        node_features={"x": np.array([0, 1], dtype=np.int64)},
+    )
+
+    np.testing.assert_array_equal(cvve_graph.edges, [[1, 0], [0, 1]])
+    np.testing.assert_array_equal(cvve_graph.node_feat["atomic_number"], [[6], [8]])
+    np.testing.assert_array_equal(cvve_graph.node_feat["x"], [0, 1])
+
+    pymatgen_structure = PymatgenStructure(
+        lattice=Lattice.cubic(10.0),
+        species=["H", "O"],
+        coords=[[0.0, 0.0, 0.0], [0.1, 0.0, 0.0]],
+    )
+    pymatgen_graph = RadiusGraphConverter(
+        cutoff=1.1,
+        coordinate_unit="angstrom",
+    ).from_structure(pymatgen_structure)
+
+    np.testing.assert_array_equal(pymatgen_graph.edges, [[1, 0], [0, 1]])
+    np.testing.assert_allclose(
+        pymatgen_graph.node_feat["pos"],
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+    )
+
+
+def test_crystal_converters_share_pgl_graph_contract():
+    structure = PymatgenStructure(
+        lattice=Lattice.cubic(4.0),
+        species=["H", "O"],
+        coords=[[0.0, 0.0, 0.0], [0.25, 0.0, 0.0]],
+    )
+    edges = np.asarray([[0, 1], [1, 0]], dtype=np.int64)
+    images = np.zeros([2, 3], dtype=np.float32)
+
+    graphs = [
+        object.__new__(converter_type).build_pgl_graph(structure, edges, images)
+        for converter_type in (FindPointsInSpheres, CrystalNN)
+    ]
+
+    for graph in graphs:
+        np.testing.assert_array_equal(graph.edges, edges)
+        np.testing.assert_array_equal(graph.node_feat["atom_types"], [1, 8])
+        np.testing.assert_allclose(
+            graph.edge_feat["bond_vec"], [[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]]
+        )
+        np.testing.assert_array_equal(graph.edge_feat["num_edges"], [2])
+
+
+def test_radius_graph_from_structures_preserves_order_and_empty_input():
+    structures = [
+        CVVEStructure(
+            symbols=["C", "O"],
+            positions=np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]),
+            position_unit="angstrom",
+        ),
+        PymatgenStructure(
+            lattice=Lattice.cubic(10.0),
+            species=["H", "O"],
+            coords=[[0.0, 0.0, 0.0], [0.1, 0.0, 0.0]],
+        ),
+    ]
+    converter = RadiusGraphConverter(cutoff=1.1)
+
+    graphs = converter.from_structures(structures)
+
+    assert len(graphs) == 2
+    np.testing.assert_array_equal(
+        graphs[0].node_feat["atomic_number"].reshape(-1),
+        [6, 8],
+    )
+    np.testing.assert_array_equal(
+        graphs[1].node_feat["atomic_number"].reshape(-1),
+        [1, 8],
+    )
+    assert converter.from_structures(()) == []
+
+
+def test_radius_graph_from_structures_uses_parallel_map(monkeypatch):
+    structure = CVVEStructure(
+        symbols=["C"],
+        positions=np.zeros((1, 3)),
+        position_unit="angstrom",
+    )
+    calls = []
+
+    def fake_p_map(function, values, **kwargs):
+        calls.append(kwargs)
+        return [function(value) for value in values]
+
+    monkeypatch.setattr(graph_converter_module, "p_map", fake_p_map)
+    graphs = RadiusGraphConverter(num_cpus=2).from_structures([structure])
+
+    assert len(graphs) == 1
+    assert calls == [
+        {
+            "num_cpus": 2,
+            "desc": "Building graphs",
+            "dynamic_ncols": True,
+            "mininterval": 0.2,
+        }
+    ]
+
+
+def test_radius_graph_uses_dataset_atom_vocabulary():
+    structure = CVVEStructure(
+        symbols=["X6", "O"],
+        positions=np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]),
+        position_unit="bohr",
+    )
+    vocab = {
+        "atom": {
+            "atomic_number_to_id": {
+                8: 0,
+                6: 1,
+            }
+        }
+    }
+
+    graph = RadiusGraphConverter(
+        cutoff=1.0,
+        coordinate_unit="bohr",
+        inclusive_cutoff=True,
+        atom_vocab={},
+        vocab=vocab,
+    ).from_structure(structure)
+
+    np.testing.assert_array_equal(graph.node_feat["x"], [1, 0])
+    np.testing.assert_array_equal(
+        graph.node_feat["feat"],
+        [[0.0, 1.0], [1.0, 0.0]],
+    )
+
+
+def test_radius_graph_rejects_atom_missing_from_dataset_vocabulary():
+    converter = RadiusGraphConverter(
+        vocab={"atom": {"atomic_number_to_id": {6: 0}}},
+    )
+
+    with pytest.raises(KeyError, match="Atomic number 8"):
+        converter.from_arrays(
+            np.array([8], dtype=np.int64),
+            np.zeros((1, 3), dtype=np.float32),
+        )
+
+
+def test_radius_graph_validates_units_features_and_cutoff_boundary():
+    atomic_numbers = np.array([1, 1], dtype=np.int64)
+    positions = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+
+    strict_graph = RadiusGraphConverter(cutoff=1.0).from_arrays(
+        atomic_numbers,
+        positions,
+    )
+    inclusive_graph = RadiusGraphConverter(
+        cutoff=1.0,
+        inclusive_cutoff=True,
+    ).from_arrays(
+        atomic_numbers,
+        positions,
+    )
+
+    assert strict_graph.edges.shape == (0, 2)
+    np.testing.assert_array_equal(inclusive_graph.edges, [[1, 0], [0, 1]])
+
+    with pytest.raises(ValueError, match="expects 'angstrom'"):
+        RadiusGraphConverter(cutoff=1.0).from_arrays(
+            atomic_numbers,
+            positions,
+            coordinate_unit="bohr",
+        )
+    with pytest.raises(ValueError, match="leading dimension 2"):
+        RadiusGraphConverter(cutoff=1.0).from_arrays(
+            atomic_numbers,
+            positions,
+            node_features={"x": np.array([0], dtype=np.int64)},
+        )
+    with pytest.raises(ValueError, match="either 'angstrom' or 'bohr'"):
+        RadiusGraphConverter(cutoff=1.0, coordinate_unit="nanometer")
 
 
 def test_build_molecule_from_dict():

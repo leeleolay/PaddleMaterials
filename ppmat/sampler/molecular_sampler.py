@@ -24,6 +24,7 @@ SAMPLER_REGISTRY = {
 
 MODEL_CLASS_TO_SAMPLER = {
     "DiffNMR": "diffnmr",
+    "MolecularGraphFormer": "diffnmr",
 }
 
 MODEL_NAME_TO_SAMPLER = {

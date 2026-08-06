@@ -15,138 +15,132 @@
 import argparse
 
 from ppmat.predictor import FieldPredictor
-from ppmat.predictor.field_predictor import apply_predict_config
-from ppmat.utils.inference_cli import add_model_loading_arguments
-from ppmat.utils.inference_cli import validate_config_overrides
-from ppmat.utils.inference_cli import validate_model_loading_arguments
-
-__all__ = ["FieldPredictor", "apply_predict_config", "build_parser", "main"]
 
 
-def build_parser():
-    parser = argparse.ArgumentParser(description="Electron density field inference")
-    add_model_loading_arguments(parser)
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Electron-density field prediction")
+    # Select exactly one model source: a registered package or a local config.
+    model_source = parser.add_mutually_exclusive_group(required=True)
+    model_source.add_argument("--model_name", help="Registered model name.")
+    model_source.add_argument("--config_path", help="Path to a local config file.")
+    parser.add_argument("--weights_name", help="Weight filename in a model package.")
+    parser.add_argument(
+        "--checkpoint_path",
+        help="Checkpoint path or URL; defaults to Predict.checkpoint_path in config.",
+    )
+    parser.add_argument("--device", help="Paddle device, for example cpu or gpu:0.")
+
+    parser.add_argument(
+        "--mol_file_path",
+        help="Path to one MOL file or a directory containing MOL files.",
+    )
     parser.add_argument(
         "--split",
-        default=None,
-        choices=["train", "validation", "test"],
-        help="Dataset split to sample from",
+        default="test",
+        choices=["train", "val", "validation", "test"],
+        help="Configured dataset split used when --mol_file_path is omitted.",
     )
     parser.add_argument(
         "--index",
-        default=None,
+        default=0,
         type=int,
-        help="Index within the chosen split",
+        help="Sample index in the configured dataset split.",
     )
+    parser.add_argument("--data_root", help="Override the configured dataset root.")
     parser.add_argument(
-        "--data_root",
-        default=None,
-        help="Override dataset root; defaults to value in config",
+        "--split_file_path",
+        help="Override the configured dataset split-file path.",
     )
+
     parser.add_argument(
-        "--split_file",
-        default=None,
-        help="Override split file path; defaults to value in config",
-    )
-    parser.add_argument(
-        "--atom_file",
-        default=None,
-        help="Override atom info file; defaults to value in config",
-    )
-    parser.add_argument(
-        "--output_dir",
-        default=None,
-        help="Directory to store predictions/visualizations",
+        "--save_path",
+        default="./results",
+        help="Directory used for predicted CUBE files and visualizations.",
     )
     parser.add_argument(
         "--grid_batch_size",
-        default=None,
         type=int,
-        help="Number of grid points per forward pass",
+        help="Maximum grid points per forward pass; defaults to Predict config.",
     )
     parser.add_argument(
-        "--skip_vis",
-        action="store_true",
-        default=None,
-        help="Skip writing/visualizing density plots",
+        "--grid_shape",
+        default="80,80,80",
+        help="MOL grid shape as N or Nx,Ny,Nz.",
+    )
+    parser.add_argument(
+        "--grid_padding",
+        default=6.0,
+        type=float,
+        help="Padding around MOL coordinates in Angstrom.",
+    )
+    parser.add_argument(
+        "--reference_cube_dir",
+        help="Directory containing optional reference CUBE files for MOL inputs.",
     )
     parser.add_argument(
         "--save_true_cube",
         action="store_true",
-        default=None,
-        help="Save reference (DFT) electron density as a cube file",
+        help="Also save the reference density when it is available.",
     )
     parser.add_argument(
-        "--save_pred_cube",
+        "--visualize",
         action="store_true",
-        default=None,
-        help="Save predicted electron density as a cube file",
+        help="Write density visualizations as PNG files.",
     )
     parser.add_argument(
         "--save_html",
         action="store_true",
-        default=None,
-        help="Save Plotly figures as interactive HTML (in addition to PNG)",
-    )
-    parser.add_argument(
-        "--cube_dir",
-        default=None,
-        help="Directory to store cube files (defaults to output_dir)",
+        help="Also write interactive HTML visualizations.",
     )
     parser.add_argument(
         "--show_plot",
         action="store_true",
-        default=None,
-        help="Display plotly figures inline (requires kaleido)",
+        help="Display generated Plotly figures.",
     )
-    parser.add_argument(
-        "--mol_input",
-        default=None,
-        help=(
-            "Path to a .mol file or a directory of .mol files for direct "
-            "structure inference"
-        ),
-    )
-    parser.add_argument(
-        "--mol_pattern",
-        default=None,
-        help="Glob pattern when --mol_input is a directory",
-    )
-    parser.add_argument(
-        "--mol_grid_shape",
-        default=None,
-        help="Grid shape for MOL inference, e.g. '80' or '80,80,80'",
-    )
-    parser.add_argument(
-        "--mol_grid_padding",
-        default=None,
-        type=float,
-        help="Padding (Angstrom) around molecular coordinates for MOL grid generation",
-    )
-    parser.add_argument(
-        "--mol_true_cube_dir",
-        default=None,
-        help=(
-            "Optional directory containing reference/true CUBE files for MOL inputs. "
-            "Expected names: <mol_basename>.cube or <mol_basename>_true.cube"
-        ),
-    )
-    return parser
+    args, config_overrides = parser.parse_known_args(argv)
+    if args.model_name is not None and args.checkpoint_path is not None:
+        parser.error("--checkpoint_path cannot be combined with --model_name")
+    if args.config_path is not None and args.weights_name is not None:
+        parser.error("--weights_name can only be used with --model_name")
+    if any(value.startswith("-") or "=" not in value for value in config_overrides):
+        parser.error("unrecognized arguments: " + " ".join(config_overrides))
+    return args, config_overrides
 
 
 def main():
-    parser = build_parser()
-    args, config_overrides = parser.parse_known_args()
-    validate_model_loading_arguments(parser, args)
-    validate_config_overrides(parser, config_overrides)
+    args, config_overrides = parse_args()
     predictor = FieldPredictor(
         model_name=args.model_name,
         weights_name=args.weights_name,
         config_path=args.config_path,
         checkpoint_path=args.checkpoint_path,
+        device=args.device,
         config_overrides=config_overrides,
     )
-    predictor.predict(args)
+    output_options = {
+        "save_path": args.save_path,
+        "grid_batch_size": args.grid_batch_size,
+        "save_true_cube": args.save_true_cube,
+        "visualize": args.visualize,
+        "save_html": args.save_html,
+        "show_plot": args.show_plot,
+    }
+    if args.mol_file_path is not None:
+        predictor.from_mol_file(
+            mol_file_path=args.mol_file_path,
+            grid_shape=args.grid_shape,
+            grid_padding=args.grid_padding,
+            reference_cube_dir=args.reference_cube_dir,
+            **output_options,
+        )
+    else:
+        predictor.from_dataset(
+            split=args.split,
+            index=args.index,
+            data_root=args.data_root,
+            split_file_path=args.split_file_path,
+            **output_options,
+        )
 
 
 if __name__ == "__main__":

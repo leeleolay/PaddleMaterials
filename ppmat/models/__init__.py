@@ -15,6 +15,7 @@
 import copy
 import inspect
 from typing import Any
+from typing import Callable
 from typing import Dict
 from typing import Optional
 
@@ -48,6 +49,7 @@ from ppmat.utils import logger
 from ppmat.utils import save_load
 from ppmat.utils.model_package import get_model_config_path
 from ppmat.utils.model_package import resolve_model_package_dir
+from ppmat.vocab import build_vocab
 
 __all__ = [
     "iComformer",
@@ -75,7 +77,17 @@ __all__ = [
     "SphereNet",
 ]
 
-# Warning: The key of the dictionary must be consistent with the file name of the value
+# Warning:
+# Registered pretrained models must use a predictable archive layout. The archive
+# name, top-level directory, and configuration stem must all match the
+# `MODEL_REGISTRY` key:
+#
+# <model_name>.zip
+# └── <model_name>/
+#     ├── <model_name>.yaml
+#     └── checkpoints/
+#         ├── best.pdparams
+#         └── latest.pdparams
 MODEL_REGISTRY = {
     "comformer_mp2018_train_60k_e_form": "https://paddle-org.bj.bcebos.com/paddlematerial/checkpoints/property_prediction/comformer/comformer_mp2018_train_60k_e_form.zip",
     "comformer_mp2018_train_60k_band_gap": "https://paddle-org.bj.bcebos.com/paddlematerials/checkpoints/property_prediction/comformer/comformer_mp2018_train_60k_band_gap.zip",
@@ -154,7 +166,7 @@ MODEL_REGISTRY = {
 }
 
 
-def build_graph_converter(cfg: Dict):
+def build_graph_converter(cfg: Dict, vocab=None):
     """Build graph converter.
 
     Args:
@@ -165,6 +177,8 @@ def build_graph_converter(cfg: Dict):
     cfg = copy.deepcopy(cfg)
     class_name = cfg.pop("__class_name__")
     init_params = cfg.pop("__init_params__")
+    if vocab is not None:
+        init_params["vocab"] = vocab
     graph_converter = eval(class_name)(**init_params)
     logger.debug(str(graph_converter))
 
@@ -173,6 +187,7 @@ def build_graph_converter(cfg: Dict):
 
 def build_model(
     cfg: Dict[str, Any],
+    vocab=None,
     strict_unused: bool = False,  # True → raise if some runtime deps are not consumed
     override: bool = True,  # True → runtime_deps override same-named __init_params__
     **runtime_deps,
@@ -193,6 +208,7 @@ def build_model(
             Conflict policy when a key exists in both `__init_params__` and
             `runtime_deps`. If True, the value from `runtime_deps` wins; otherwise the
             config value is kept and the runtime value is ignored.
+        vocab: Optional vocabulary objects used by models with explicit vocabularies.
         runtime_deps: Runtime objects, such as dataset_infos=...
 
     Returns:
@@ -211,6 +227,8 @@ def build_model(
 
     params = dict(init_params)
     consumed = set()
+    if vocab is not None:
+        runtime_deps["vocab"] = vocab
 
     if accepts_kwargs:
         if override:
@@ -236,7 +254,11 @@ def build_model(
     return model
 
 
-def build_model_from_name(model_name: str, weights_name: Optional[str] = None):
+def build_model_from_name(
+    model_name: str,
+    weights_name: Optional[str] = None,
+    model_config_modifier: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
+):
     extracted_path = download.get_weights_path_from_url(MODEL_REGISTRY[model_name])
     path = resolve_model_package_dir(model_name, extracted_path)
     logger.info(f"Save model and configuration files in path: {path}")
@@ -247,7 +269,11 @@ def build_model_from_name(model_name: str, weights_name: Optional[str] = None):
 
     model_config = config.get("Model", None)
     assert model_config is not None, "Model config must be provided."
-    model = build_model(model_config)
+    if model_config_modifier is not None:
+        model_config = model_config_modifier(model_config)
+        config["Model"] = model_config
+    vocab = build_vocab(config.get("Vocabulary"))
+    model = build_model(model_config, vocab=vocab)
 
     save_load.load_pretrain(model, path, weights_name)
 

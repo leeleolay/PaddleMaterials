@@ -16,14 +16,16 @@ import argparse
 
 from ppmat.sampler import MolecularSampler
 from ppmat.utils import logger
-from ppmat.utils.inference_cli import add_model_loading_arguments
-from ppmat.utils.inference_cli import validate_config_overrides
-from ppmat.utils.inference_cli import validate_model_loading_arguments
 
 
-def build_parser():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Molecular structure sampling")
-    add_model_loading_arguments(parser)
+    # Select exactly one model source: a registered package or a local config.
+    model_source = parser.add_mutually_exclusive_group(required=True)
+    model_source.add_argument("--model_name", help="Registered model name.")
+    model_source.add_argument("--config_path", help="Path to a local config file.")
+    parser.add_argument("--weights_name", help="Weight filename in a model package.")
+    parser.add_argument("--checkpoint_path", help="Path to a local checkpoint.")
     parser.add_argument(
         "--output_dir",
         default="results",
@@ -34,14 +36,16 @@ def build_parser():
         choices=["by_dataloader", "compute_metric"],
         default="by_dataloader",
     )
-    return parser
+    args, config_overrides = parser.parse_known_args(argv)
+    if (args.config_path is None) != (args.checkpoint_path is None):
+        parser.error("--config_path and --checkpoint_path must be provided together")
+    if any(value.startswith("-") or "=" not in value for value in config_overrides):
+        parser.error("unrecognized arguments: " + " ".join(config_overrides))
+    return args, config_overrides
 
 
 def main():
-    parser = build_parser()
-    args, config_overrides = parser.parse_known_args()
-    validate_model_loading_arguments(parser, args)
-    validate_config_overrides(parser, config_overrides)
+    args, config_overrides = parse_args()
 
     sampler = MolecularSampler(
         model_name=args.model_name,

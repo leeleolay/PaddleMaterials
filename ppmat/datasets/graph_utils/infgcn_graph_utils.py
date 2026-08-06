@@ -16,6 +16,32 @@ import numpy as np
 import paddle
 
 
+def randomly_truncate_neighbors(
+    edge_index: paddle.Tensor,
+    max_num_neighbors: int = 32,
+    sort_by_source: bool = False,
+) -> paddle.Tensor:
+    """Randomly retain at most ``max_num_neighbors`` edges per source node."""
+
+    if edge_index.shape[1] == 0 or max_num_neighbors >= 1000000:
+        return edge_index
+
+    if sort_by_source:
+        num_nodes = int(paddle.max(edge_index).item()) + 1
+        order = paddle.argsort(edge_index[0] * num_nodes + edge_index[1])
+        edge_index = edge_index[:, order]
+    source = edge_index[0]
+    unique_sources, counts = paddle.unique(source, return_counts=True)
+    keep_mask = paddle.ones_like(source, dtype="bool")
+    for node, count in zip(unique_sources, counts):
+        count = int(count.item())
+        if count > max_num_neighbors:
+            edge_ids = paddle.nonzero(source == node, as_tuple=True)[0]
+            permutation = paddle.randperm(count)
+            keep_mask[edge_ids[permutation[max_num_neighbors:]]] = False
+    return edge_index[:, keep_mask]
+
+
 def radius_graph(
     x: paddle.Tensor,
     r: float,
@@ -29,9 +55,7 @@ def radius_graph(
     # For small graphs (<= 1000 nodes), use simple distance matrix calculation
     if x.shape[0] <= 1000:
         return radius_graph_simple(x, r, batch, loop, max_num_neighbors)
-    # For large graphs (> 1000 nodes), use grid-based spatial partitioning for efficiency
-    else:
-        return radius_graph_grid(x, r, batch, loop, max_num_neighbors)
+    return radius_graph_grid(x, r, batch, loop, max_num_neighbors)
 
 
 def radius(
@@ -92,20 +116,9 @@ def radius_graph_simple(
         row, col = paddle.nonzero(adj, as_tuple=True)
 
         if row.shape[0] > 0:
-            if max_num_neighbors < 1000000:
-                unique_rows, counts = paddle.unique(row, return_counts=True)
-                keep_mask = paddle.ones_like(row, dtype="bool")
-
-                for node, count in zip(unique_rows, counts):
-                    if count > max_num_neighbors:
-                        node_mask = row == node
-                        edge_indices = paddle.nonzero(node_mask, as_tuple=True)[0]
-                        perm = paddle.randperm(count.item())
-                        drop_indices = edge_indices[perm[max_num_neighbors:]]
-                        keep_mask[drop_indices] = False
-
-                row = row[keep_mask]
-                col = col[keep_mask]
+            row, col = randomly_truncate_neighbors(
+                paddle.stack([row, col]), max_num_neighbors
+            )
 
             row_global = subset_idx[row]
             col_global = subset_idx[col]
@@ -157,20 +170,9 @@ def radius_simple(
         row, col = paddle.nonzero(adj, as_tuple=True)
 
         if row.shape[0] > 0:
-            if max_num_neighbors < 1000000:
-                unique_rows, counts = paddle.unique(row, return_counts=True)
-                keep_mask = paddle.ones_like(row, dtype="bool")
-
-                for node, count in zip(unique_rows, counts):
-                    if count > max_num_neighbors:
-                        node_mask = row == node
-                        edge_indices = paddle.nonzero(node_mask, as_tuple=True)[0]
-                        perm = paddle.randperm(count.item())
-                        drop_indices = edge_indices[perm[max_num_neighbors:]]
-                        keep_mask[drop_indices] = False
-
-                row = row[keep_mask]
-                col = col[keep_mask]
+            row, col = randomly_truncate_neighbors(
+                paddle.stack([row, col]), max_num_neighbors
+            )
 
             x_global = idx_x[row]
             y_global = idx_y[col]
@@ -211,7 +213,6 @@ def radius_atoms_to_grids(
         grid_indices = paddle.nonzero(grid_mask, as_tuple=True)[0]
 
         min_coords = np.min(atoms, axis=0) - r
-        max_coords = np.max(atoms, axis=0) + r
         cell_size = r
 
         atom_grid = {}
@@ -309,7 +310,6 @@ def radius_graph_grid(
         n = subset_x.shape[0]
 
         min_coords = np.min(subset_x, axis=0) - r
-        max_coords = np.max(subset_x, axis=0) + r
         cell_size = r
 
         grid_dict = {}
@@ -405,9 +405,6 @@ def radius_grid(
 
         min_coords = (
             np.min(np.vstack([subset_x.min(axis=0), subset_y.min(axis=0)]), axis=0) - r
-        )
-        max_coords = (
-            np.max(np.vstack([subset_x.max(axis=0), subset_y.max(axis=0)]), axis=0) + r
         )
         cell_size = r
 

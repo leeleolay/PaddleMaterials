@@ -14,27 +14,29 @@
 
 
 import copy
-import json
+from collections.abc import Mapping
 from functools import partial
 from pathlib import Path
+from typing import Optional
+from typing import Sequence
 
 import numpy as np
 import paddle
-from omegaconf import OmegaConf
 from tqdm import tqdm
 
+import ppmat.datasets as datasets
 from ppmat.datasets import DensityDataset
-from ppmat.datasets import SmallDensityDataset
-from ppmat.datasets.geometric_data_type.data import Data
-from ppmat.models import build_model
-from ppmat.models import build_model_from_name
+from ppmat.datasets import MD17DensityDataset
+from ppmat.datasets.build_field import BuildField
+from ppmat.datasets.build_molecule import BuildMolecule
+from ppmat.models import build_graph_converter
 from ppmat.predictor.base import BasePredictor
 from ppmat.predictor.field_io import prepare_cube_info
 from ppmat.predictor.field_io import read_cube_density
-from ppmat.predictor.field_io import unavailable_cube_writer
-from ppmat.predictor.field_io import write_cube
+from ppmat.predictor.field_io import to_numpy
+from ppmat.predictor.field_io import write_cube_from_atom_types
 from ppmat.utils import logger
-from ppmat.utils import save_load
+from ppmat.utils.crystal import normalize_coordinate_unit
 from ppmat.utils.misc import set_random_seed
 from ppmat.utils.visualization import draw_volume
 from ppmat.utils.visualization import maybe_downsample_volume
@@ -44,221 +46,109 @@ BOHR2ANG = 0.529177
 ANG2BOHR = 1.0 / BOHR2ANG
 
 
-def apply_predict_config(args, cfg):
-    predict_cfg = cfg.get("Predict", {}) or {}
-    defaults = {
-        "split": "test",
-        "index": 0,
-        "data_root": None,
-        "split_file": None,
-        "atom_file": None,
-        "output_dir": "./results",
-        "grid_batch_size": 4096,
-        "skip_vis": False,
-        "save_true_cube": False,
-        "save_pred_cube": False,
-        "save_html": False,
-        "cube_dir": None,
-        "show_plot": False,
-        "mol_pattern": "*.mol",
-        "mol_grid_shape": "80,80,80",
-        "mol_grid_padding": 6.0,
-        "mol_true_cube_dir": None,
-    }
-
-    for name, default in defaults.items():
-        if getattr(args, name) is None:
-            setattr(args, name, predict_cfg.get(name, default))
-
-    return args
+def _as_paddle_tensor(value, dtype):
+    if isinstance(value, paddle.Tensor):
+        return value.astype(dtype)
+    return paddle.to_tensor(np.asarray(value), dtype=dtype)
 
 
-def inference_model(model, g, density, grid_coord, infos, grid_batch_size=8196):
-    with paddle.no_grad():
-        model.eval()
-        device = paddle.get_device()
-        prepared_infos = (
-            model._prepare_infos(infos, device)
-            if hasattr(model, "_prepare_infos")
-            else infos
-        )
-        if grid_batch_size is None:
-            if hasattr(model, "_forward_density"):
-                preds = model._forward_density(
-                    g.x, g.pos, grid_coord, g.batch, prepared_infos
-                ).squeeze(0)
-            else:
-                # Fallback for legacy models expecting raw tensors
-                preds = model(g.x, g.pos, grid_coord, g.batch, prepared_infos).squeeze(
-                    0
-                )
-        else:
-            preds = []
-            total = grid_coord.shape[1]
-            step = grid_batch_size
-            num_iter = (total + step - 1) // step
-            for start in tqdm(range(0, total, step), total=num_iter):
-                end = min(start + step, total)
-                grid = grid_coord[:, start:end]
-                if hasattr(model, "_forward_density"):
-                    preds.append(
-                        model._forward_density(
-                            g.x, g.pos, grid, g.batch, prepared_infos
-                        ).squeeze(0)
-                    )
-                else:
-                    preds.append(
-                        model(g.x, g.pos, grid, g.batch, prepared_infos).squeeze(0)
-                    )
-            preds = paddle.concat(preds, axis=0)
-
-        if density is None:
-            return preds, None, None
-
-        mask = (density > 0).astype(dtype="float32")
-        preds = preds * mask
-        density = density * mask
-        diff = paddle.abs(preds - density)
-        loss = diff.pow(2).sum()
-        denom = paddle.clip(density.sum(), min=1e-12)
-        mae = diff.sum() / denom
-    return preds, loss, mae
+def _graph_node_feature(graph, name):
+    node_feat = getattr(graph, "node_feat", None)
+    if not isinstance(node_feat, Mapping) or name not in node_feat:
+        raise KeyError(f"Field graph requires node_feat[{name!r}].")
+    return node_feat[name]
 
 
-def parse_grid_shape(shape_str):
-    parts = [p.strip() for p in str(shape_str).split(",") if p.strip()]
+def parse_grid_shape(grid_shape):
+    """Normalize a scalar or three-dimensional grid shape."""
+
+    if isinstance(grid_shape, Sequence) and not isinstance(grid_shape, str):
+        parts = list(grid_shape)
+    else:
+        parts = [part.strip() for part in str(grid_shape).split(",") if part.strip()]
     if len(parts) == 1:
         n = int(parts[0])
         if n <= 1:
-            raise ValueError(
-                f"Invalid mol_grid_shape {shape_str}, each dimension must be > 1"
-            )
+            raise ValueError(f"Invalid grid_shape {grid_shape}: dimensions must be > 1")
         return [n, n, n]
     if len(parts) == 3:
-        shape = [int(p) for p in parts]
-        if any(s <= 1 for s in shape):
-            raise ValueError(
-                f"Invalid mol_grid_shape {shape_str}, each dimension must be > 1"
-            )
+        shape = [int(part) for part in parts]
+        if any(size <= 1 for size in shape):
+            raise ValueError(f"Invalid grid_shape {grid_shape}: dimensions must be > 1")
         return shape
-    raise ValueError(f"Invalid mol_grid_shape {shape_str}, expected 'N' or 'Nx,Ny,Nz'")
+    raise ValueError(f"Invalid grid_shape {grid_shape}: expected N or Nx,Ny,Nz")
 
 
-def normalize_element_symbol(symbol):
-    sym = str(symbol).strip()
-    if len(sym) == 0:
-        return sym
-    if len(sym) == 1:
-        return sym.upper()
-    return sym[0].upper() + sym[1:].lower()
-
-
-def load_atom_mapping(atom_file):
-    with Path(atom_file).open() as f:
-        atom_info = json.load(f)
-
-    atom_name2idx = {}
-    idx2atom_num = {}
-    for idx, item in enumerate(atom_info):
-        sym = normalize_element_symbol(item["name"])
-        atom_name2idx[sym] = idx
-        idx2atom_num[idx] = int(item["atom_num"])
-    return atom_name2idx, idx2atom_num
-
-
-def resolve_atom_file_for_mol(args_atom_file, dataset_atom_file):
-    candidates = []
-    if args_atom_file is not None:
-        candidates.append(Path(args_atom_file).expanduser())
-    if dataset_atom_file is not None:
-        candidates.append(Path(dataset_atom_file).expanduser())
-
-    for cand in candidates:
-        if cand.exists():
-            return cand
-
-    raise FileNotFoundError(
-        "Could not resolve atom_file for MOL inference. Set --atom_file or "
-        "Predict.atom_file to an existing file. "
-        f"Checked: {[str(candidate) for candidate in candidates]}"
-    )
-
-
-def collect_mol_files(mol_input, mol_pattern):
-    mol_path = Path(mol_input).expanduser()
+def collect_mol_files(mol_file_path):
+    mol_path = Path(mol_file_path).expanduser()
     if mol_path.is_file():
+        if mol_path.suffix.lower() != ".mol":
+            raise ValueError(f"Expected a .mol file, but got: {mol_path}")
         return [mol_path]
     if not mol_path.is_dir():
-        raise FileNotFoundError(f"mol_input path not found: {mol_path}")
+        raise FileNotFoundError(f"MOL input path not found: {mol_path}")
 
-    files = sorted([p for p in mol_path.glob(mol_pattern) if p.is_file()])
-    if not files:
-        files = sorted(
-            [
-                p
-                for p in mol_path.iterdir()
-                if p.is_file() and p.suffix.lower() == ".mol"
-            ]
-        )
+    files = sorted(
+        path
+        for path in mol_path.iterdir()
+        if path.is_file() and path.suffix.lower() == ".mol"
+    )
     if not files:
         raise FileNotFoundError(f"No .mol files found in directory: {mol_path}")
     return files
 
 
-def align_mol_atoms_to_cube(g, atom_coord_ref, sample_name, tol=0.05):
-    if atom_coord_ref is None:
-        return g
-    ref = np.asarray(atom_coord_ref, dtype=np.float32)
-    mol = g.pos.numpy().astype(np.float32)
-    if ref.ndim != 2 or ref.shape[1] != 3:
-        logger.warning(
-            f"Invalid reference atom coordinates for {sample_name}, skip alignment"
+def use_reference_atom_coordinates(
+    graph,
+    reference_info,
+    idx2atom_num,
+    sample_name,
+    graph_converter,
+):
+    """Use verified CUBE atom coordinates for reference-grid inference."""
+
+    reference_atom_numbers = np.asarray(reference_info.get("atom_numbers"))
+    reference_atom_coord = np.asarray(
+        reference_info.get("atom_coord_ref"), dtype=np.float32
+    )
+    expected_atom_numbers = np.asarray(
+        [
+            idx2atom_num[int(atom_type)]
+            for atom_type in to_numpy(_graph_node_feature(graph, "x")).reshape(-1)
+        ],
+        dtype=np.int64,
+    )
+    if (
+        reference_atom_numbers.shape != expected_atom_numbers.shape
+        or not np.array_equal(reference_atom_numbers, expected_atom_numbers)
+    ):
+        raise ValueError(
+            f"Atom order in the reference CUBE does not match {sample_name}: "
+            f"expected {expected_atom_numbers.tolist()}, got "
+            f"{reference_atom_numbers.tolist()}."
         )
-        return g
-    if mol.shape != ref.shape:
-        logger.warning(
-            f"Atom count mismatch for {sample_name} "
-            f"(mol={mol.shape[0]}, cube={ref.shape[0]}), "
-            "skip alignment"
+    if reference_atom_coord.shape != (len(expected_atom_numbers), 3):
+        raise ValueError(
+            f"Invalid reference atom coordinates for {sample_name}: "
+            f"{reference_atom_coord.shape}."
         )
-        return g
-
-    mol_center = mol.mean(axis=0)
-    ref_center = ref.mean(axis=0)
-    mol_c = mol - mol_center
-    ref_c = ref - ref_center
-    denom = float(np.sqrt((mol_c * mol_c).sum()))
-    numer = float(np.sqrt((ref_c * ref_c).sum()))
-    if denom < 1e-12 or numer < 1e-12:
-        return g
-
-    scale = numer / denom
-    aligned = mol_c * scale + ref_center
-    rms = float(np.sqrt(np.mean((aligned - ref) ** 2)))
-
-    # Typical unit mismatch is Angstrom->Bohr (about 1.8897).
-    # Apply alignment when scale differs from 1.0 or residual is tiny after scaling.
-    if abs(scale - 1.0) > tol or rms < 1e-3:
-        g.pos = paddle.to_tensor(aligned, dtype="float32")
-        logger.info(
-            f"Aligned MOL coordinates to CUBE frame for {sample_name}: "
-            f"scale={scale:.6f} (A->Bohr~{ANG2BOHR:.6f}), rms={rms:.6e}"
-        )
-    else:
-        logger.info(
-            f"No coordinate rescale needed for {sample_name}: "
-            f"scale={scale:.6f}, rms={rms:.6e}"
-        )
-    return g
+    return graph_converter.from_arrays(
+        expected_atom_numbers,
+        reference_atom_coord,
+        coordinate_unit=reference_info["coordinate_unit"],
+        node_features={
+            "x": to_numpy(_graph_node_feature(graph, "x")).reshape(-1),
+        },
+    )
 
 
-def resolve_true_cube_for_mol(mol_path, true_cube_dir=None):
+def resolve_true_cube_for_mol(mol_path, reference_cube_dir=None):
+    if reference_cube_dir is None:
+        return None
+
     base = sanitize_base_name(mol_path.name)
     base_density = f"{base[:-3]}Density" if base.endswith("Opt") else f"{base}Density"
-    roots = []
-    if true_cube_dir is not None:
-        roots.append(Path(true_cube_dir).expanduser())
-    roots.append(mol_path.parent)
+    root = Path(reference_cube_dir).expanduser()
 
     stems = [base, f"{base}_true", base_density]
     exts = [
@@ -283,70 +173,41 @@ def resolve_true_cube_for_mol(mol_path, true_cube_dir=None):
             uniq_candidates.append(name)
             seen.add(name)
 
-    for root in roots:
-        if not root.exists():
-            continue
-        for name in uniq_candidates:
-            p = root / name
-            if p.is_file():
-                return p
+    if not root.is_dir():
+        raise FileNotFoundError(f"Reference CUBE directory not found: {root}")
+    for name in uniq_candidates:
+        path = root / name
+        if path.is_file():
+            return path
     return None
 
 
-def parse_mol_v2000(mol_path):
-    lines = mol_path.read_text(errors="replace").splitlines()
-    if len(lines) < 4:
-        raise ValueError(f"MOL file too short: {mol_path}")
-
-    counts = lines[3]
-    if "V3000" in counts.upper():
-        raise NotImplementedError(f"V3000 MOL is not supported yet: {mol_path}")
-
-    try:
-        n_atom = int(counts[:3])
-    except Exception:
-        parts = counts.split()
-        if len(parts) < 2:
-            raise ValueError(f"Failed to parse counts line in MOL file: {mol_path}")
-        n_atom = int(parts[0])
-
-    atom_start = 4
-    atom_end = atom_start + n_atom
-    if len(lines) < atom_end:
-        raise ValueError(f"Atom block incomplete in MOL file: {mol_path}")
-
-    coords = []
-    symbols = []
-    for line in lines[atom_start:atom_end]:
-        parts = line.split()
-        x = y = z = None
-        sym = None
-        if len(parts) >= 4:
-            try:
-                x, y, z = float(parts[0]), float(parts[1]), float(parts[2])
-                sym = parts[3]
-            except Exception:
-                x = y = z = None
-                sym = None
-        if x is None:
-            try:
-                x = float(line[0:10])
-                y = float(line[10:20])
-                z = float(line[20:30])
-                sym = line[31:34].strip()
-            except Exception as e:
-                raise ValueError(
-                    f"Failed to parse atom line in {mol_path}: {line}"
-                ) from e
-
-        coords.append([x, y, z])
-        symbols.append(normalize_element_symbol(sym))
-
-    return np.asarray(coords, dtype=np.float32), symbols
-
-
-def build_mol_sample(mol_path, atom_name2idx, mol_grid_shape, mol_grid_padding):
-    atom_coord_np, atom_symbols = parse_mol_v2000(mol_path)
+def build_mol_sample(
+    mol_path,
+    atom_name2idx,
+    grid_shape,
+    grid_padding,
+    field_converter: BuildField,
+    graph_converter,
+):
+    molecule = BuildMolecule(format="mol_file", sanitize=False)(mol_path)
+    if molecule is None:
+        raise ValueError(f"RDKit failed to parse MOL file: {mol_path}")
+    if molecule.GetNumConformers() == 0:
+        raise ValueError(f"MOL file does not contain atom coordinates: {mol_path}")
+    atom_coord_np = np.asarray(
+        molecule.GetConformer().GetPositions(),
+        dtype=np.float32,
+    )
+    atom_symbols = [atom.GetSymbol() for atom in molecule.GetAtoms()]
+    atom_numbers = np.asarray(
+        [atom.GetAtomicNum() for atom in molecule.GetAtoms()],
+        dtype=np.int64,
+    )
+    coordinate_unit = field_converter.coordinate_unit
+    length_scale = ANG2BOHR if coordinate_unit == "bohr" else 1.0
+    atom_coord_np = atom_coord_np * length_scale
+    grid_padding = float(grid_padding) * length_scale
 
     atom_type_idx = []
     missing = set()
@@ -358,85 +219,83 @@ def build_mol_sample(mol_path, atom_name2idx, mol_grid_shape, mol_grid_padding):
             atom_type_idx.append(idx)
     if missing:
         raise ValueError(
-            "Found atoms not covered by atom_file mapping in "
+            "Found atoms not covered by the atom vocabulary in "
             f"{mol_path}: {sorted(missing)}"
         )
 
-    atom_type = paddle.to_tensor(atom_type_idx, dtype="int64")
-    atom_coord = paddle.to_tensor(atom_coord_np, dtype="float32")
-    g = Data(x=atom_type, pos=atom_coord)
+    g = graph_converter.from_arrays(
+        atom_numbers,
+        atom_coord_np,
+        coordinate_unit=coordinate_unit,
+        node_features={"x": np.asarray(atom_type_idx, dtype=np.int64)},
+    )
+    if g is None:
+        raise ValueError(f"No radius edges were found for {mol_path}.")
 
-    shape = [int(s) for s in mol_grid_shape]
+    shape = [int(size) for size in grid_shape]
     min_coord = atom_coord_np.min(axis=0)
     max_coord = atom_coord_np.max(axis=0)
     span = np.maximum(
         max_coord - min_coord, np.array([1e-3, 1e-3, 1e-3], dtype=np.float32)
     )
-    axis_len = span + 2.0 * float(mol_grid_padding)
+    axis_len = span + 2.0 * float(grid_padding)
     center = 0.5 * (min_coord + max_coord)
     origin = center - 0.5 * axis_len
 
-    x = np.linspace(
-        origin[0],
-        origin[0] + axis_len[0],
-        num=shape[0],
-        endpoint=False,
-        dtype=np.float32,
+    grid = field_converter.build_grid(
+        {
+            "shape": shape,
+            "voxel_vectors": np.diag(axis_len / np.asarray(shape, dtype=np.float32)),
+            "origin": origin,
+        }
     )
-    y = np.linspace(
-        origin[1],
-        origin[1] + axis_len[1],
-        num=shape[1],
-        endpoint=False,
-        dtype=np.float32,
-    )
-    z = np.linspace(
-        origin[2],
-        origin[2] + axis_len[2],
-        num=shape[2],
-        endpoint=False,
-        dtype=np.float32,
-    )
-    grid = (
-        np.stack(np.meshgrid(x, y, z, indexing="ij"), axis=-1)
-        .reshape(-1, 3)
-        .astype(np.float32)
-    )
-    grid_coord = paddle.to_tensor(grid, dtype="float32")
-
-    cell = np.diag(axis_len.astype(np.float32))
     info = {
-        "shape": shape,
-        "cell": paddle.to_tensor(cell, dtype="float32"),
-        "origin": paddle.to_tensor(origin.astype(np.float32), dtype="float32"),
+        "shape": list(grid.shape),
+        "cell": np.asarray(grid.cell_vectors, dtype=np.float32),
+        "origin": np.asarray(grid.origin, dtype=np.float32),
         "file_name": mol_path.name,
+        "coordinate_unit": grid.length_unit,
+        "density_unit": field_converter.value_unit,
     }
 
-    return g, None, grid_coord, info
+    return (
+        g,
+        None,
+        np.asarray(grid.cartesian_coordinates(), dtype=np.float32),
+        info,
+    )
 
 
 def sanitize_base_name(sample_name):
     base_name = Path(sample_name).name
-    for suf in [".lz4", ".zst", ".gz"]:
-        if base_name.endswith(suf):
-            base_name = base_name[: -len(suf)]
-    for suf in [".cube", ".CHGCAR", ".json", ".mol"]:
-        if base_name.endswith(suf):
-            base_name = base_name[: -len(suf)]
+    compression_suffixes = {".lz4", ".zst", ".gz", ".xz"}
+    data_suffixes = {".cube", ".cub", ".chgcar", ".json", ".mol"}
+    suffix = Path(base_name).suffix
+    while suffix.lower() in compression_suffixes:
+        base_name = base_name[: -len(suffix)]
+        suffix = Path(base_name).suffix
+    if suffix.lower() in data_suffixes:
+        base_name = base_name[: -len(suffix)]
     return base_name
 
 
 class FieldPredictor(BasePredictor):
-    """Electron-density field predictor."""
+    """Predict scalar fields on molecular or crystal grids.
+
+    The predictor owns inference orchestration and output formatting. Models only
+    need to follow the electronic-structure batch contract and return their field
+    tensor through ``output["pred_dict"][target_name]``.
+    """
 
     def __init__(
         self,
-        model_name=None,
-        weights_name=None,
-        config_path=None,
-        checkpoint_path=None,
-        config_overrides=None,
-        seed=42,
+        model_name: Optional[str] = None,
+        weights_name: Optional[str] = None,
+        config_path: Optional[str] = None,
+        checkpoint_path: Optional[str] = None,
+        device: Optional[str] = None,
+        config_overrides: Optional[Sequence[str]] = None,
+        seed: int = 42,
     ):
         super().__init__(
             model_name=model_name,
@@ -444,211 +303,731 @@ class FieldPredictor(BasePredictor):
             config_path=config_path,
             checkpoint_path=checkpoint_path,
             work_dir="",
-            device=None,
+            device=device,
+            config_overrides=config_overrides,
         )
-        self.config_overrides = config_overrides
         set_random_seed(seed)
-        self._load_model()
-        self.model.eval()
-        logger.info("Model loaded successfully.")
-
-    def _load_model(self):
-        if self.model_name is not None:
-            logger.info(f"Loading registered model: {self.model_name}")
-            self.model, self.config = build_model_from_name(
-                self.model_name, self.weights_name
+        self.load_inference_model()
+        model_config = self.config.get("Model", {}).get("__init_params__", {})
+        self.target_name = getattr(
+            self.model, "target_name", model_config.get("target_name", "density")
+        )
+        self.field_converter = BuildField(
+            **self._get_build_config("build_field_cfg"),
+        )
+        # Fill the base-class converter slot instead of shadowing its
+        # ``graph_converter`` method: field configs name this
+        # ``Predict.build_graph_cfg`` rather than ``Predict.graph_converter``.
+        self.graph_converter_fn = build_graph_converter(
+            self._get_build_config("build_graph_cfg")
+        )
+        if self.field_converter.format != "array":
+            raise ValueError("Predict.build_field_cfg.format must be 'array'.")
+        if not hasattr(self.graph_converter_fn, "from_arrays"):
+            raise TypeError(
+                "Predict.build_graph_cfg must build an array-compatible graph "
+                "converter."
             )
-            if self.config_overrides:
-                cfg = OmegaConf.merge(
-                    OmegaConf.create(self.config),
-                    OmegaConf.from_dotlist(self.config_overrides),
-                )
-                self.config = OmegaConf.to_container(cfg, resolve=True)
-        else:
-            assert self.config_path is not None and self.checkpoint_path is not None, (
-                "config_path and checkpoint_path must be provided when model_name "
-                "is None."
+        if (
+            getattr(self.graph_converter_fn, "coordinate_unit", None)
+            != self.field_converter.coordinate_unit
+        ):
+            raise ValueError(
+                "Predict build_field_cfg and build_graph_cfg must use the same "
+                "coordinate_unit."
             )
-            logger.info(f"Loading the pretrained model from {self.checkpoint_path}")
-            cfg = OmegaConf.load(self.config_path)
-            if self.config_overrides:
-                cfg = OmegaConf.merge(
-                    cfg, OmegaConf.from_dotlist(self.config_overrides)
-                )
-            self.config = OmegaConf.to_container(cfg, resolve=True)
-            model_config = self.config.get("Model")
-            if model_config is None:
-                raise ValueError(f"Model config is missing from {self.config_path}.")
-            self.model = build_model(model_config)
-            save_load.load_pretrain(self.model, self.checkpoint_path)
+        model_cutoff = getattr(self.model, "cutoff", model_config.get("cutoff"))
+        if model_cutoff is not None and not np.isclose(
+            self.graph_converter_fn.cutoff,
+            float(model_cutoff),
+        ):
+            raise ValueError(
+                "Predict build_graph_cfg cutoff must match the model cutoff."
+            )
+        if self.field_converter.name != self.target_name:
+            raise ValueError(
+                f"Predict.build_field_cfg.name is {self.field_converter.name!r}, "
+                f"but the model target_name is {self.target_name!r}."
+            )
+        logger.info(
+            f"Model loaded successfully on {self.device}; "
+            f"coordinate unit: {self.field_converter.coordinate_unit}; "
+            f"field unit: {self.field_converter.value_unit}."
+        )
 
-    def predict(self, args):
-        return run_prediction(args, self.model, self.config)
+    def _get_build_config(self, name):
+        build_config = self.predict_config.get(name)
+        if build_config is None:
+            raise KeyError(f"Predict.{name} is required for field prediction.")
+        if not isinstance(build_config, Mapping):
+            raise TypeError(f"Predict.{name} must be a mapping.")
+        return dict(build_config)
 
     @staticmethod
+    def _canonical_split(split: str) -> str:
+        """Return the dataset's own split name, accepting the ``val`` alias."""
+
+        if split == "val":
+            split = "validation"
+        if split not in {"train", "validation", "test"}:
+            raise ValueError(
+                f"Unsupported split '{split}'. Expected train, validation, or test."
+            )
+        return split
+
+    def _resolve_grid_batch_size(self, grid_batch_size: Optional[int]) -> int:
+        if grid_batch_size is None:
+            grid_batch_size = self.predict_config.get("grid_batch_size", 4096)
+        grid_batch_size = int(grid_batch_size)
+        if grid_batch_size <= 0:
+            raise ValueError("grid_batch_size must be a positive integer.")
+        return grid_batch_size
+
+    def _extract_prediction(self, output) -> paddle.Tensor:
+        if not isinstance(output, Mapping):
+            raise TypeError(
+                "Field models must return a mapping containing a 'pred_dict'."
+            )
+        pred_dict = output.get("pred_dict")
+        if not isinstance(pred_dict, Mapping):
+            raise TypeError("Field model output['pred_dict'] must be a mapping.")
+        if self.target_name not in pred_dict:
+            raise KeyError(
+                f"Prediction key '{self.target_name}' is missing from pred_dict; "
+                f"available keys: {list(pred_dict)}."
+            )
+        prediction = pred_dict[self.target_name]
+        if not isinstance(prediction, paddle.Tensor):
+            raise TypeError(
+                f"Prediction '{self.target_name}' must be a paddle.Tensor, "
+                f"but got {type(prediction)}."
+            )
+        if len(prediction.shape) == 2 and prediction.shape[0] == 1:
+            prediction = prediction.squeeze(0)
+        if len(prediction.shape) != 1:
+            raise ValueError(
+                "Field prediction for one structure must have shape [num_grid] or "
+                f"[1, num_grid], but got {list(prediction.shape)}."
+            )
+        return prediction
+
+    def _predict_grid(
+        self,
+        graph,
+        grid_coord: paddle.Tensor,
+        info: dict,
+        grid_batch_size: int,
+    ) -> paddle.Tensor:
+        num_grid = int(grid_coord.shape[1])
+        if num_grid == 0:
+            raise ValueError("grid_coord must contain at least one grid point.")
+        starts = range(0, num_grid, grid_batch_size)
+        if num_grid > grid_batch_size:
+            starts = tqdm(
+                starts,
+                total=(num_grid + grid_batch_size - 1) // grid_batch_size,
+                desc="Grid inference",
+                leave=False,
+            )
+
+        predictions = []
+        self.model.eval()
+        with paddle.no_grad():
+            for start in starts:
+                grid = grid_coord[:, start : start + grid_batch_size]
+                batch = {
+                    "graph": graph,
+                    "density_mask": None,
+                    "grid_coord": grid,
+                    "info": {
+                        "cell": info["cell"].unsqueeze(0),
+                    },
+                }
+                output = self.post_process(
+                    self.model(
+                        batch,
+                        return_loss=False,
+                        return_prediction=True,
+                    )
+                )
+                prediction = self._extract_prediction(output)
+                expected_size = int(grid.shape[1])
+                if prediction.shape[0] != expected_size:
+                    raise ValueError(
+                        "Field model returned an unexpected number of grid values: "
+                        f"expected {expected_size}, got {prediction.shape[0]}."
+                    )
+                predictions.append(prediction)
+        return paddle.concat(predictions, axis=0)
+
+    def from_data(
+        self,
+        graph,
+        grid_coord,
+        info,
+        density=None,
+        grid_batch_size: Optional[int] = None,
+    ):
+        """Predict one field sample already represented as graph and grid data.
+
+        Args:
+            graph: PGL graph with ``x`` and ``pos`` node features.
+            grid_coord: Grid coordinates with shape ``[num_grid, 3]`` or
+                ``[1, num_grid, 3]``.
+            info: Metadata mapping containing the lattice ``cell`` and explicit
+                ``coordinate_unit`` (``"angstrom"`` or ``"bohr"``).
+            density: Optional reference density used only for metrics.
+            grid_batch_size: Maximum grid points processed per forward pass.
+
+        Returns:
+            A dict containing the predicted field and, when ``density`` is given,
+            the mean squared error and normalized mean absolute error (NMAE).
+        """
+        paddle.set_device(self.device)
+        if not isinstance(info, Mapping):
+            raise TypeError(f"info must be a mapping, but got {type(info)}.")
+        info = dict(info)
+        if "coordinate_unit" not in info:
+            raise KeyError("Field prediction requires info['coordinate_unit'].")
+        sample_unit = normalize_coordinate_unit(info["coordinate_unit"])
+        if sample_unit != self.field_converter.coordinate_unit:
+            raise ValueError(
+                f"Field sample unit is {sample_unit}, but the model expects "
+                f"{self.field_converter.coordinate_unit}."
+            )
+        info["coordinate_unit"] = sample_unit
+        if "density_unit" not in info:
+            raise KeyError("Field prediction requires info['density_unit'].")
+        density_unit = info["density_unit"]
+        if not isinstance(density_unit, str) or not density_unit.strip():
+            raise ValueError("info['density_unit'] must be a non-empty string.")
+        density_unit = density_unit.strip()
+        if density_unit != self.field_converter.value_unit:
+            raise ValueError(
+                f"Field sample density unit is {density_unit!r}, but the model "
+                f"expects {self.field_converter.value_unit!r}."
+            )
+        info["density_unit"] = density_unit
+        if "cell" not in info:
+            raise KeyError("Field prediction requires info['cell'].")
+        info["cell"] = _as_paddle_tensor(info["cell"], "float32")
+        if list(info["cell"].shape) != [3, 3]:
+            raise ValueError(
+                f"info['cell'] must have shape [3, 3], but got "
+                f"{list(info['cell'].shape)}."
+            )
+        info["cell"] = info["cell"].to(self.device)
+
+        grid_coord = _as_paddle_tensor(grid_coord, "float32")
+        if len(grid_coord.shape) == 2:
+            grid_coord = grid_coord.unsqueeze(0)
+        elif len(grid_coord.shape) != 3 or grid_coord.shape[0] != 1:
+            raise ValueError(
+                "grid_coord must have shape [num_grid, 3] or [1, num_grid, 3], "
+                f"but got {list(grid_coord.shape)}."
+            )
+        if grid_coord.shape[-1] != 3:
+            raise ValueError("The last dimension of grid_coord must be 3.")
+
+        atom_types = to_numpy(_graph_node_feature(graph, "x")).reshape(-1)
+        atom_coord = to_numpy(_graph_node_feature(graph, "pos"))
+        if atom_types.shape[0] != atom_coord.shape[0] or atom_coord.ndim != 2:
+            raise ValueError("Graph atom types and positions are inconsistent.")
+        if atom_coord.shape[1] != 3:
+            raise ValueError("Graph positions must have shape [num_atoms, 3].")
+        grid_coord = grid_coord.to(self.device)
+        grid_batch_size = self._resolve_grid_batch_size(grid_batch_size)
+        prediction = self._predict_grid(
+            graph,
+            grid_coord,
+            info,
+            grid_batch_size,
+        )
+
+        prediction_cpu = prediction.detach().cpu()
+        result_info = {
+            key: value.detach().cpu() if isinstance(value, paddle.Tensor) else value
+            for key, value in info.items()
+        }
+        result = {
+            self.target_name: prediction_cpu,
+            "grid_coord": grid_coord.squeeze(0).detach().cpu(),
+            "info": result_info,
+        }
+        if density is not None:
+            density = _as_paddle_tensor(density, prediction.dtype)
+            density = density.reshape([-1]).to(self.device)
+            if density.shape[0] != prediction.shape[0]:
+                raise ValueError(
+                    "Reference density and prediction must contain the same number "
+                    f"of grid points, but got {density.shape[0]} and "
+                    f"{prediction.shape[0]}."
+                )
+            difference = prediction - density
+            result["reference_density"] = density.detach().cpu()
+            result["loss"] = float(paddle.mean(difference**2))
+            loss_eps = float(getattr(self.model, "loss_eps", 1e-8))
+            denominator = paddle.sum(density) + loss_eps
+            result["nmae"] = float(paddle.sum(paddle.abs(difference)) / denominator)
+        return result
+
+    def _dataset_config(self, split: str):
+        split = self._canonical_split(split)
+        split_key = "val" if split == "validation" else split
+        dataset_config = copy.deepcopy(
+            self.config.get("Dataset", {}).get(split_key, {}).get("dataset")
+        )
+        if dataset_config is None:
+            raise KeyError(f"Dataset.{split_key}.dataset is not defined in config.")
+        return split, dataset_config
+
+    @staticmethod
+    def _build_dataset(dataset_config, dataset_params):
+        class_name = dataset_config.get("__class_name__", "DensityDataset")
+        dataset_class = getattr(datasets, class_name, None)
+        if not isinstance(dataset_class, type) or not issubclass(
+            dataset_class,
+            (DensityDataset, MD17DensityDataset),
+        ):
+            raise ValueError(f"Unsupported field dataset class: {class_name}")
+        return dataset_class(**dataset_params)
+
+    def _get_cube_writer(self, dataset):
+        idx2atom_num = getattr(dataset, "idx2atom_num", None)
+        if idx2atom_num is None:
+            idx2atom_num = self.vocab["atom"]["id_to_atomic_number"]
+        return partial(write_cube_from_atom_types, idx2atom_num=idx2atom_num)
+
+    def from_dataset(
+        self,
+        split: str = "test",
+        index: int = 0,
+        save_path: Optional[str] = None,
+        data_root: Optional[str] = None,
+        split_file_path: Optional[str] = None,
+        grid_batch_size: Optional[int] = None,
+        save_true_cube: bool = False,
+        visualize: bool = False,
+        save_html: bool = False,
+        show_plot: bool = False,
+    ):
+        """Predict one sample from a configured field dataset."""
+        split, dataset_config = self._dataset_config(split)
+        dataset_params = copy.deepcopy(dataset_config.get("__init_params__", {}))
+        dataset_params["split"] = split
+        dataset_class_name = dataset_config.get("__class_name__", "DensityDataset")
+        if data_root is not None:
+            configured_path = Path(dataset_params["path"])
+            suffix_parts = (
+                configured_path.parts[-2:]
+                if dataset_class_name == "MD17DensityDataset"
+                else configured_path.parts[-1:]
+            )
+            dataset_params["path"] = str(
+                Path(data_root).expanduser().joinpath(*suffix_parts)
+            )
+        if split_file_path is not None:
+            dataset_params["path"] = split_file_path
+        # Configured train/eval sampling must not truncate a prediction grid.
+        # Inference memory is bounded by grid_batch_size instead.
+        dataset_params.pop("grid_sampler_cfg", None)
+        dataset_params["vocab"] = self.vocab
+
+        dataset = self._build_dataset(dataset_config, dataset_params)
+        if index < 0 or index >= len(dataset):
+            raise IndexError(
+                f"Index {index} is outside dataset split '{split}' with "
+                f"{len(dataset)} samples."
+            )
+
+        sample = dataset[index]
+        graph = sample["graph"]
+        density = sample["density"]
+        grid_coord = sample["grid_coord"]
+        info = sample["info"]
+        sample_name = info.get("file_name", f"{split}_{index}")
+        logger.info(f"Starting prediction for sample: {sample_name}")
+        result = self.from_data(
+            graph,
+            grid_coord,
+            info,
+            density=density,
+            grid_batch_size=grid_batch_size,
+        )
+        saved_paths = self._save_outputs(
+            save_path=save_path,
+            cube_writer=self._get_cube_writer(dataset),
+            sample_name=sample_name,
+            graph=graph,
+            density=density,
+            prediction=result[self.target_name],
+            info=info,
+            grid_coord=grid_coord,
+            save_true_cube=save_true_cube,
+            visualize=visualize,
+            save_html=save_html,
+            show_plot=show_plot,
+        )
+        if saved_paths:
+            result["saved_paths"] = saved_paths
+        self._log_metrics(sample_name, result)
+        return result
+
+    def from_mol_file(
+        self,
+        mol_file_path: str,
+        save_path: Optional[str] = None,
+        grid_shape="80,80,80",
+        grid_padding: float = 6.0,
+        reference_cube_dir: Optional[str] = None,
+        grid_batch_size: Optional[int] = None,
+        save_true_cube: bool = False,
+        visualize: bool = False,
+        save_html: bool = False,
+        show_plot: bool = False,
+    ):
+        """Predict from one MOL file or every MOL file in a directory.
+
+        ``save_path`` is an output directory. When provided, predicted CUBE files
+        are always written; visualization flags add PNG or HTML files there.
+        """
+        input_path = Path(mol_file_path).expanduser()
+        mol_files = collect_mol_files(input_path)
+        grid_shape = parse_grid_shape(grid_shape)
+        if grid_padding < 0:
+            raise ValueError("grid_padding must be non-negative.")
+
+        atom_name2idx = self.vocab["atom"]["token_to_id"]
+        idx2atom_num = self.vocab["atom"]["id_to_atomic_number"]
+        cube_writer = partial(write_cube_from_atom_types, idx2atom_num=idx2atom_num)
+
+        logger.info(
+            f"MOL inference: {len(mol_files)} file(s), "
+            f"grid_shape={grid_shape}, grid_padding={grid_padding}."
+        )
+        sample_iter = (
+            tqdm(mol_files, desc="MOL inference") if len(mol_files) > 1 else mol_files
+        )
+        results = []
+        for mol_path in sample_iter:
+            graph, density, grid_coord, info = build_mol_sample(
+                mol_path,
+                atom_name2idx,
+                grid_shape,
+                grid_padding,
+                self.field_converter,
+                self.graph_converter_fn,
+            )
+            reference_cube_path = resolve_true_cube_for_mol(
+                mol_path,
+                reference_cube_dir,
+            )
+            if reference_cube_path is not None:
+                density, grid_coord, reference_info = read_cube_density(
+                    reference_cube_path,
+                    self.field_converter,
+                )
+                graph = use_reference_atom_coordinates(
+                    graph,
+                    reference_info,
+                    idx2atom_num,
+                    mol_path.name,
+                    self.graph_converter_fn,
+                )
+                info = dict(reference_info)
+                info["file_name"] = mol_path.name
+                info["reference_cube_file"] = str(reference_cube_path)
+                logger.info(
+                    f"Using reference CUBE for {mol_path.name}: "
+                    f"{reference_cube_path}"
+                )
+            elif reference_cube_dir is not None:
+                logger.warning(f"No matching reference CUBE for {mol_path.name}.")
+
+            sample_name = info.get("file_name", mol_path.name)
+            result = self.from_data(
+                graph,
+                grid_coord,
+                info,
+                density=density,
+                grid_batch_size=grid_batch_size,
+            )
+            saved_paths = self._save_outputs(
+                save_path=save_path,
+                cube_writer=cube_writer,
+                sample_name=sample_name,
+                graph=graph,
+                density=density,
+                prediction=result[self.target_name],
+                info=info,
+                grid_coord=grid_coord,
+                save_true_cube=save_true_cube,
+                visualize=visualize,
+                save_html=save_html,
+                show_plot=show_plot,
+            )
+            if saved_paths:
+                result["saved_paths"] = saved_paths
+            self._log_metrics(sample_name, result)
+            results.append(result)
+
+        return results[0] if input_path.is_file() else results
+
+    @staticmethod
+    def _log_metrics(sample_name, result):
+        if "loss" in result:
+            logger.info(
+                f"Prediction completed for {sample_name}, "
+                f"MSE: {float(result['loss']):.6f}, "
+                f"NMAE: {float(result['nmae']):.6f}."
+            )
+        else:
+            logger.info(
+                f"Prediction completed for {sample_name} (no reference density)."
+            )
+
+    def _save_outputs(
+        self,
+        save_path,
+        cube_writer,
+        sample_name,
+        graph,
+        density,
+        prediction,
+        info,
+        grid_coord,
+        save_true_cube,
+        visualize,
+        save_html,
+        show_plot,
+    ):
+        needs_output_path = save_true_cube or visualize or save_html or show_plot
+        if save_path is None:
+            if needs_output_path:
+                raise ValueError(
+                    "save_path is required when saving reference data or "
+                    "visualizations."
+                )
+            return {}
+
+        self._validate_output_grid(info, grid_coord, prediction, density)
+        output_dir = Path(save_path)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        sample_tag = sanitize_base_name(sample_name)
+        saved_paths = self._save_cubes(
+            output_dir,
+            cube_writer,
+            sample_name,
+            sample_tag,
+            graph,
+            density,
+            prediction,
+            info,
+            grid_coord,
+            save_true_cube,
+        )
+        if visualize or save_html or show_plot:
+            saved_paths["visualizations"] = self._save_visualizations(
+                output_dir,
+                sample_tag,
+                graph,
+                density,
+                prediction,
+                info,
+                grid_coord,
+                save_html,
+                show_plot,
+            )
+        return saved_paths
+
+    @staticmethod
+    def _validate_output_grid(info, grid_coord, prediction, density):
+        shape = info.get("shape")
+        if shape is None or len(shape) != 3:
+            raise ValueError("Field output requires a three-dimensional grid shape.")
+        shape = [int(size) for size in shape]
+        expected_size = int(np.prod(shape))
+        grid_size = int(grid_coord.shape[-2])
+        prediction_size = int(prediction.shape[0])
+        if grid_size != expected_size or prediction_size != expected_size:
+            raise ValueError(
+                "Grid shape, coordinates, and prediction size are inconsistent: "
+                f"shape={shape} ({expected_size}), grid={grid_size}, "
+                f"prediction={prediction_size}."
+            )
+        if density is not None and int(density.reshape([-1]).shape[0]) != expected_size:
+            raise ValueError(
+                "Reference density size is inconsistent with grid shape: "
+                f"shape={shape} ({expected_size}), "
+                f"density={density.reshape([-1]).shape[0]}."
+            )
+
     def _save_cubes(
-        args,
-        cube_dir,
+        self,
+        output_dir,
         cube_writer,
         sample_name,
         sample_tag,
-        g,
+        graph,
         density,
-        preds,
+        prediction,
         info,
         grid_coord,
+        save_true_cube,
     ):
-        if not (args.save_true_cube or args.save_pred_cube):
-            return
+        atom_type = to_numpy(_graph_node_feature(graph, "x")).reshape(-1)
+        atom_coord = to_numpy(_graph_node_feature(graph, "pos"))
+        cube_info = prepare_cube_info(
+            info,
+            grid_coord,
+            self.field_converter,
+        )
+        saved_paths = {}
 
-        atom_type_np = g.x.detach().cpu().numpy()
-        atom_coord_np = g.pos.detach().cpu().numpy()
-        info_cube = prepare_cube_info(info, grid_coord)
+        prediction_path = output_dir / f"{sample_tag}_pred.cube"
+        cube_writer(
+            prediction_path,
+            atom_type,
+            atom_coord,
+            to_numpy(prediction),
+            cube_info,
+        )
+        saved_paths["prediction_cube"] = str(prediction_path)
+        logger.info(f"Saved predicted density CUBE to: {prediction_path}")
 
-        if args.save_true_cube:
+        if save_true_cube:
             if density is None:
                 logger.warning(
-                    f"Skipping true cube for {sample_name}: "
-                    "no reference density available"
+                    f"Skipping reference CUBE for {sample_name}: no reference "
+                    "density is available."
                 )
             else:
-                true_cube_path = cube_dir / f"{sample_tag}_true.cube"
-                with true_cube_path.open("w") as f:
-                    cube_writer(
-                        f,
-                        atom_type_np,
-                        atom_coord_np,
-                        density.detach().cpu().numpy(),
-                        info_cube,
-                    )
-                logger.info(f"Saved reference density cube to: {true_cube_path}")
-
-        if args.save_pred_cube:
-            pred_cube_path = cube_dir / f"{sample_tag}_pred.cube"
-            with pred_cube_path.open("w") as f:
+                reference_path = output_dir / f"{sample_tag}_true.cube"
                 cube_writer(
-                    f,
-                    atom_type_np,
-                    atom_coord_np,
-                    preds.detach().cpu().numpy(),
-                    info_cube,
+                    reference_path,
+                    atom_type,
+                    atom_coord,
+                    to_numpy(density),
+                    cube_info,
                 )
-            logger.info(f"Saved predicted density cube to: {pred_cube_path}")
+                saved_paths["reference_cube"] = str(reference_path)
+                logger.info(f"Saved reference density CUBE to: {reference_path}")
+        return saved_paths
 
     @staticmethod
     def _save_visualizations(
-        args,
         output_dir,
         sample_tag,
-        g,
+        graph,
         density,
-        preds,
+        prediction,
         info,
         grid_coord,
+        save_html,
+        show_plot,
     ):
-        if args.skip_vis:
-            return
-
-        grid_np = grid_coord.detach().cpu().numpy()
-        preds_np = preds.detach().cpu().numpy()
+        grid = to_numpy(grid_coord)
+        prediction = to_numpy(prediction)
         shape = info.get("shape")
-        atom_type = g.x.detach().cpu().numpy()
-        atom_coord = g.pos.detach().cpu().numpy()
-        shape = shape if shape is None else [int(s) for s in shape]
+        atom_type = to_numpy(_graph_node_feature(graph, "x")).reshape(-1)
+        atom_coord = to_numpy(_graph_node_feature(graph, "pos"))
+        shape = shape if shape is None else [int(size) for size in shape]
+        saved_paths = []
 
         if density is not None:
-            density_np = density.detach().cpu().numpy()
-            diff_np = density_np - preds_np
-            (
-                grid_vis,
-                (density_vis, diff_vis, preds_vis),
-                did_downsample,
-                stride,
-            ) = maybe_downsample_volume(
-                grid_np,
-                [density_np, diff_np, preds_np],
+            reference = to_numpy(density)
+            difference = reference - prediction
+            grid_vis, values, did_downsample, stride = maybe_downsample_volume(
+                grid,
+                [reference, difference, prediction],
                 shape,
             )
-            FieldPredictor._log_downsample(grid_np, grid_vis, did_downsample, stride)
+            FieldPredictor._log_downsample(
+                grid,
+                grid_vis,
+                did_downsample,
+                stride,
+            )
+            plot_specs = [
+                (
+                    "true_density",
+                    "DFT electron density",
+                    values[0],
+                    0.05,
+                    3.5,
+                    5,
+                ),
+                (
+                    "diff_density",
+                    "Electron Density Difference",
+                    values[1],
+                    -0.06,
+                    0.06,
+                    4,
+                ),
+                (
+                    "pred_density",
+                    "Predicted Electron Density",
+                    values[2],
+                    0.05,
+                    3.5,
+                    5,
+                ),
+            ]
+        else:
+            grid_vis, values, did_downsample, stride = maybe_downsample_volume(
+                grid,
+                [prediction],
+                shape,
+            )
+            FieldPredictor._log_downsample(
+                grid,
+                grid_vis,
+                did_downsample,
+                stride,
+            )
+            plot_specs = [
+                (
+                    "pred_density",
+                    "Predicted Electron Density",
+                    values[0],
+                    0.05,
+                    3.5,
+                    5,
+                )
+            ]
 
-            FieldPredictor._write_volume_plot(
-                args,
-                output_dir,
-                sample_tag,
-                "true_density",
-                "DFT electron density",
-                grid_vis,
-                density_vis,
-                atom_type,
-                atom_coord,
-                isomin=0.05,
-                isomax=3.5,
-                surface_count=5,
+        for suffix, title, values, isomin, isomax, surface_count in plot_specs:
+            saved_paths.extend(
+                FieldPredictor._write_volume_plot(
+                    output_dir,
+                    sample_tag,
+                    suffix,
+                    title,
+                    grid_vis,
+                    values,
+                    atom_type,
+                    atom_coord,
+                    isomin,
+                    isomax,
+                    surface_count,
+                    save_html,
+                    show_plot,
+                )
             )
-            FieldPredictor._write_volume_plot(
-                args,
-                output_dir,
-                sample_tag,
-                "diff_density",
-                "Electron Density Difference",
-                grid_vis,
-                diff_vis,
-                atom_type,
-                atom_coord,
-                isomin=-0.06,
-                isomax=0.06,
-                surface_count=4,
-            )
-            FieldPredictor._write_volume_plot(
-                args,
-                output_dir,
-                sample_tag,
-                "pred_density",
-                "Predicted Electron Density",
-                grid_vis,
-                preds_vis,
-                atom_type,
-                atom_coord,
-                isomin=0.05,
-                isomax=3.5,
-                surface_count=5,
-            )
-            return
-
-        (
-            grid_vis,
-            (preds_vis,),
-            did_downsample,
-            stride,
-        ) = maybe_downsample_volume(grid_np, [preds_np], shape)
-        FieldPredictor._log_downsample(grid_np, grid_vis, did_downsample, stride)
-        FieldPredictor._write_volume_plot(
-            args,
-            output_dir,
-            sample_tag,
-            "pred_density",
-            "Predicted Electron Density",
-            grid_vis,
-            preds_vis,
-            atom_type,
-            atom_coord,
-            isomin=0.05,
-            isomax=3.5,
-            surface_count=5,
-        )
+        return saved_paths
 
     @staticmethod
-    def _log_downsample(grid_np, grid_vis, did_downsample, stride):
+    def _log_downsample(grid, grid_vis, did_downsample, stride):
         if did_downsample:
             logger.warning(
-                f"Downsampled volume grid from {grid_np.shape[0]} "
-                f"to {grid_vis.shape[0]} points for visualization "
-                f"(stride={stride}) to keep HTML output responsive."
+                f"Downsampled volume grid from {grid.shape[0]} to "
+                f"{grid_vis.shape[0]} points for visualization (stride={stride}) "
+                "to keep HTML output responsive."
             )
 
     @staticmethod
     def _write_volume_plot(
-        args,
         output_dir,
         sample_tag,
         suffix,
@@ -660,9 +1039,11 @@ class FieldPredictor(BasePredictor):
         isomin,
         isomax,
         surface_count,
+        save_html,
+        show_plot,
     ):
         logger.info(f"Visualizing {title}")
-        fig = draw_volume(
+        figure = draw_volume(
             grid,
             values,
             atom_type,
@@ -673,169 +1054,12 @@ class FieldPredictor(BasePredictor):
             title=title,
         )
         image_path = output_dir / f"{sample_tag}_{suffix}.png"
-        safe_write_image(fig, image_path, show_plot=args.show_plot)
-        if args.save_html:
-            fig.write_html(output_dir / f"{sample_tag}_{suffix}.html")
-
-
-def run_prediction(args, model, cfg):
-    apply_predict_config(args, cfg)
-
-    split_key = "val" if args.split == "validation" else args.split
-    ds_cfg_full = cfg["Dataset"][split_key]["dataset"]
-    dataset_cfg = ds_cfg_full.get("__init_params__", {})
-    dataset_params = copy.deepcopy(dataset_cfg)
-    dataset_params["split"] = args.split
-    if args.data_root is not None:
-        dataset_params["root"] = args.data_root
-    if args.split_file is not None:
-        dataset_params["split_file"] = args.split_file
-    if args.atom_file is not None:
-        dataset_params["atom_file"] = args.atom_file
-
-    use_mol_mode = args.mol_input is not None
-
-    dataset = None
-    cube_writer = None
-    idx2atom_num = None
-    atom_name2idx = None
-    mol_files = []
-    mol_grid_shape = None
-
-    if use_mol_mode:
-        atom_file_path = resolve_atom_file_for_mol(
-            args.atom_file,
-            dataset_params.get("atom_file"),
-        )
-        atom_name2idx, idx2atom_num = load_atom_mapping(atom_file_path)
-        mol_files = collect_mol_files(args.mol_input, args.mol_pattern)
-        mol_grid_shape = parse_grid_shape(args.mol_grid_shape)
-        cube_writer = partial(write_cube, idx2atom_num=idx2atom_num)
-        logger.info(
-            f"MOL mode enabled: {len(mol_files)} file(s), atom_file={atom_file_path}, "
-            f"grid_shape={mol_grid_shape}, padding={args.mol_grid_padding}, "
-            f"true_cube_dir={args.mol_true_cube_dir}"
-        )
-    else:
-        dataset_cls_name = ds_cfg_full.get("__class_name__", "DensityDataset")
-        dataset_cls_map = {
-            "DensityDataset": DensityDataset,
-            "SmallDensityDataset": SmallDensityDataset,
-        }
-        if dataset_cls_name not in dataset_cls_map:
-            raise ValueError(f"Unsupported dataset class {dataset_cls_name}")
-        dataset = dataset_cls_map[dataset_cls_name](**dataset_params)
-        cube_writer = getattr(dataset, "write_cube", None)
-        idx2atom_num = getattr(dataset, "idx2atom_num", None)
-        if cube_writer is None:
-            if isinstance(dataset, SmallDensityDataset):
-                # Atom order in SmallDensityDataset: C=0, H=1, O=2
-                idx2atom_num = np.array([6, 1, 8], dtype=np.int64)
-                cube_writer = partial(
-                    write_cube,
-                    idx2atom_num=idx2atom_num,
-                )
-            else:
-                cube_writer = unavailable_cube_writer
-        if args.index >= len(dataset):
-            raise IndexError(
-                f"Index {args.index} exceeds dataset size {len(dataset)} "
-                f"for split {args.split}"
-            )
-
-    device = "gpu" if paddle.is_compiled_with_cuda() else "cpu"
-    paddle.set_device(device)
-    logger.info(f"Running inference on device: {device}")
-
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    cube_dir = Path(args.cube_dir) if args.cube_dir is not None else output_dir
-    cube_dir.mkdir(parents=True, exist_ok=True)
-
-    if use_mol_mode:
-        sample_iter = tqdm(mol_files, desc="MOL inference")
-    else:
-        sample_iter = [args.index]
-
-    for sample_item in sample_iter:
-        if use_mol_mode:
-            mol_path = sample_item
-            g, density, grid_coord, info = build_mol_sample(
-                mol_path,
-                atom_name2idx,
-                mol_grid_shape,
-                args.mol_grid_padding,
-            )
-            true_cube_path = resolve_true_cube_for_mol(mol_path, args.mol_true_cube_dir)
-            if true_cube_path is not None:
-                try:
-                    density, grid_coord, info_ref = read_cube_density(true_cube_path)
-                    g = align_mol_atoms_to_cube(
-                        g, info_ref.get("atom_coord_ref"), mol_path.name
-                    )
-                    info = dict(info_ref)
-                    info["file_name"] = mol_path.name
-                    info["true_cube_file"] = str(true_cube_path)
-                    logger.info(
-                        f"Using reference cube for {mol_path.name}: {true_cube_path}"
-                    )
-                except Exception as e:
-                    logger.warning(
-                        f"Failed to read reference cube for {mol_path.name} "
-                        f"at {true_cube_path}: {e}"
-                    )
-            sample_name = info.get("file_name", mol_path.name)
-        else:
-            sample_name = f"{args.split}_{args.index}"
-            g, density, grid_coord, info = dataset[args.index]
-            sample_name = info.get("file_name", sample_name)
-
-        g.batch = paddle.zeros_like(g.x)
-        g = g.to(device)
-        if density is not None:
-            density = density.to(device)
-        grid_coord = grid_coord.to(device)
-
-        logger.info(f"Starting prediction for sample: {sample_name}")
-        preds, loss, mae = inference_model(
-            model,
-            g,
-            density,
-            grid_coord[None],
-            [info],
-            grid_batch_size=args.grid_batch_size,
-        )
-        if loss is not None and mae is not None:
-            logger.info(
-                f"Prediction completed for {sample_name}, "
-                f"Loss: {float(loss):.6f}, MAE: {float(mae):.6f}"
-            )
-        else:
-            logger.info(
-                f"Prediction completed for {sample_name} (no reference density)"
-            )
-
-        sample_tag = sanitize_base_name(sample_name)
-
-        FieldPredictor._save_cubes(
-            args,
-            cube_dir,
-            cube_writer,
-            sample_name,
-            sample_tag,
-            g,
-            density,
-            preds,
-            info,
-            grid_coord,
-        )
-        FieldPredictor._save_visualizations(
-            args,
-            output_dir,
-            sample_tag,
-            g,
-            density,
-            preds,
-            info,
-            grid_coord,
-        )
+        saved_path = safe_write_image(figure, image_path, show_plot=show_plot)
+        saved_paths = [] if saved_path is None else [str(saved_path)]
+        if save_html:
+            html_path = output_dir / f"{sample_tag}_{suffix}.html"
+            figure.write_html(html_path)
+            html_path = str(html_path)
+            if html_path not in saved_paths:
+                saved_paths.append(html_path)
+        return saved_paths

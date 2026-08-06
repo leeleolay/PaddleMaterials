@@ -3,6 +3,21 @@ Global:
   do_eval: True
   do_test: False
   use_voxel: False
+  graph_cutoff: 6.0
+  build_graph_cfg:
+    __class_name__: RadiusGraphConverter
+    __init_params__:
+      cutoff: ${Global.graph_cutoff}
+      coordinate_unit: ${Global.build_field_cfg.coordinate_unit}
+      inclusive_cutoff: true
+      atom_vocab: {}
+      include_distance: false
+  build_field_cfg:
+    format: cube
+    name: density
+    value_unit: unknown
+    coordinate_unit: bohr
+    num_cpus: 1
 
 Trainer:
   # Max epochs to train
@@ -58,17 +73,18 @@ Trainer:
   use_wandb: False
   use_tensorboard: False
 
+Vocabulary: infgcn_omol25
+
 Model:
   __class_name__: InfGCN
   __init_params__:
-    n_atom_type: 84
     num_radial: 32
     num_spherical: 7
     radial_embed_size: 32
     radial_hidden_size: 128
     num_radial_layer: 2
     num_gcn_layer: 3
-    cutoff: 6.0
+    cutoff: ${Global.graph_cutoff}
     grid_cutoff: 6.0
     is_fc: True
     gauss_start: 0.5
@@ -98,19 +114,27 @@ Optimizer:
 Dataset:
   train:
     dataset:
-      __class_name__: DensityDataset
+      __class_name__: OMol25MC5kTrimmedDensityDataset
       __init_params__:
-        root: ./data/dataset_OMol25_MC_5k
-        split_file: omol25_s1_trimmed.json
-        atom_file: ./data/dataset_OMol25_MC_5k/omol25.json
-        extension: cube
-        compression: lz4
-        pbc: false
+        path: ./data/omol25_mc_5k_trimmed_split.json
         split: train
+        build_field_cfg: ${Global.build_field_cfg}
+        build_graph_cfg: ${Global.build_graph_cfg}
+        overwrite: false
+        grid_sampler_cfg:
+          n_samples: 2048
+          sampling_mode: uniform
+          uniform_random_offset: true
+          sampling_seed: 42
+          importance_sampling: true
+          importance_threshold: 1.0e-05
+          importance_ratio: 0.6
+          extreme_threshold: 100.0
+          extreme_ratio: 0.05
     sampler:
       __class_name__: BatchSampler
       __init_params__:
-        shuffle: false
+        shuffle: true
         drop_last: false
         batch_size: 1
     loader:
@@ -118,27 +142,27 @@ Dataset:
       use_shared_memory: false
       collate_fn: DensityCollator
       collate_params:
-        n_samples: 2048
-        sampling_mode: uniform
-        uniform_random_offset: true
-        sampling_seed: 42
         clip_max: 200.0
-        importance_sampling: true
-        importance_threshold: 1.0e-05
-        importance_ratio: 0.6
-        extreme_threshold: 100.0
-        extreme_ratio: 0.05
   val:
     dataset:
-      __class_name__: DensityDataset
+      __class_name__: OMol25MC5kTrimmedDensityDataset
       __init_params__:
-        root: ./data/dataset_OMol25_MC_5k
-        split_file: omol25_s1_trimmed.json
-        atom_file: ./data/dataset_OMol25_MC_5k/omol25.json
-        extension: cube
-        compression: lz4
-        pbc: false
+        path: ./data/omol25_mc_5k_trimmed_split.json
         split: validation
+        build_field_cfg: ${Global.build_field_cfg}
+        build_graph_cfg: ${Global.build_graph_cfg}
+        overwrite: false
+        grid_sampler_cfg:
+          n_samples: 2048
+          sampling_mode: uniform
+          uniform_random_offset: true
+          sampling_seed: 42
+          resample_each_epoch: false
+          importance_sampling: true
+          importance_threshold: 1.0e-05
+          importance_ratio: 0.6
+          extreme_threshold: 100.0
+          extreme_ratio: 0.05
     sampler:
       __class_name__: BatchSampler
       __init_params__:
@@ -150,29 +174,27 @@ Dataset:
       use_shared_memory: false
       collate_fn: DensityCollator
       collate_params:
-        n_samples: 2048
-        sampling_mode: uniform
-        uniform_random_offset: true
-        sampling_seed: 42
         clip_max: 200.0
-        importance_sampling: true
-        importance_threshold: 1.0e-05
-        importance_ratio: 0.6
-        extreme_threshold: 100.0
-        extreme_ratio: 0.05
-
   test:
     dataset:
-      __class_name__: DensityDataset
+      __class_name__: OMol25MC5kTrimmedDensityDataset
       __init_params__:
-        root: ./data/dataset_OMol25_MC_5k
-        split_file: omol25_s1_trimmed.json
-        atom_file: ./data/dataset_OMol25_MC_5k/omol25.json
-        extension: cube
-        compression: lz4
-        pbc: false
+        path: ./data/omol25_mc_5k_trimmed_split.json
         split: test
-        rotate: false
+        build_field_cfg: ${Global.build_field_cfg}
+        build_graph_cfg: ${Global.build_graph_cfg}
+        overwrite: false
+        grid_sampler_cfg:
+          n_samples: 2048
+          sampling_mode: uniform
+          uniform_random_offset: true
+          sampling_seed: 42
+          resample_each_epoch: false
+          importance_sampling: true
+          importance_threshold: 1.0e-05
+          importance_ratio: 0.6
+          extreme_threshold: 100.0
+          extreme_ratio: 0.05
     sampler:
       __class_name__: BatchSampler
       __init_params__:
@@ -184,33 +206,13 @@ Dataset:
       use_shared_memory: false
       collate_fn: DensityCollator
       collate_params:
-        n_samples: 2048
-        sampling_mode: uniform
-        uniform_random_offset: true
-        sampling_seed: 42
         clip_max: 200.0
-        importance_sampling: true
-        importance_threshold: 1.0e-05
-        importance_ratio: 0.6
-        extreme_threshold: 100.0
-        extreme_ratio: 0.05
-
 Predict:
-  eval_with_no_grad: True
-  num_infer: null
-  num_vis: 2
-  inf_samples: 4096
-  split: test
-  index: 0
-  output_dir: output/infgcn_omol25/mol_predict
+  build_graph_cfg: ${Global.build_graph_cfg}
   grid_batch_size: 4096
-  skip_vis: False
-  save_true_cube: False
-  save_pred_cube: True
-  save_html: True
-  cube_dir: output/infgcn_omol25/mol_predict/cubes
-  show_plot: False
-  mol_pattern: "*.mol"
-  mol_grid_shape: "80,80,80"
-  mol_grid_padding: 6.0
-  mol_true_cube_dir: null
+  build_field_cfg:
+    format: array
+    name: ${Global.build_field_cfg.name}
+    value_unit: ${Global.build_field_cfg.value_unit}
+    coordinate_unit: ${Global.build_field_cfg.coordinate_unit}
+    num_cpus: 1

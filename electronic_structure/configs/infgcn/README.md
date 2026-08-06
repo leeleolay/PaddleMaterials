@@ -80,16 +80,28 @@ $$
 
 ### Recommended data fields
 - `atomic_numbers`: length-$N$ atomic numbers
-- `pos`: $N \times 3$ Cartesian coordinates (Angstroms)
-- `density`: 3D array (voxel grid), for example $n \times n \times n$
+- `pos`: $N \times 3$ Cartesian coordinates in the unit declared by
+  `Global.build_field_cfg.coordinate_unit` (`angstrom` for
+  QM9/MP and `bohr` for MD17/OMol25)
+- `density`: 3D array (voxel grid), for example $n \times n \times n$, in the
+  unit declared by `Global.build_field_cfg.value_unit`
 - `grid_meta` (optional): origin, spacing, and box vectors to define $x_i$
 - Optional tags: `mol_id`, `frame_id`, normalization/scaling factors
 
 ### Datasets
-- **QM9_EC**: Electron densities stored as `*.CHGCAR.lz4` in `dataset_ES/data_qm9` (train 123,835 / val 50 / test 10,000). [Data](https://paddle-org.bj.bcebos.com/paddlematerials/datasets/QM9_ES/qm9_es.tar), [Atom dictionary](https://paddle-org.bj.bcebos.com/paddlematerials/datasets/QM9_ES/qm9.json), [Split file](https://paddle-org.bj.bcebos.com/paddlematerials/datasets/QM9_ES/qm9_data_split.json).
-- **MP_EC (cubic)**: Materials Project-style crystals serialized as `.json.xz` under `dataset_ES/data_cubic` (train 14,421 / val 1,000 / test 1,000). [Data](https://paddle-org.bj.bcebos.com/paddlematerials/datasets/MP_ES/mp_es.tar), [Atom dictionary](https://paddle-org.bj.bcebos.com/paddlematerials/datasets/MP_ES/crystal.json), [Split file](https://paddle-org.bj.bcebos.com/paddlematerials/datasets/MP_ES/crystal_data_split.json).
-- **OMol25_EC**: Organic molecule cubes expected under `data/dataset_OMol25_MC_5k` (train 16 / val 2 / test 2). [Data](https://paddle-org.bj.bcebos.com/paddlematerials/datasets/OMol25_ES/MC_5k/omol25_mc_5k.tar), [Atom dictionary](https://paddle-org.bj.bcebos.com/paddlematerials/datasets/OMol25_ES/MC_5k/omol25.json), [Split file](https://paddle-org.bj.bcebos.com/paddlematerials/datasets/OMol25_ES/MC_5k/omol25_data_split.json).
-- **MD17_EC**: Small molecules (for example, ethanol, benzene, phenol, resorcinol) from the MD17 electron-density release in `dataset_ES/data_md`; default config trains on ethanol. [Data](https://paddle-org.bj.bcebos.com/paddlematerials/datasets/MD17_ES/md17_es.tar.gz).
+- **QM9_EC**: Electron densities stored as `*.CHGCAR.lz4` under the configured `./data/data_qm9` path (train 123,835 / val 50 / test 10,000).
+- **MP_EC (cubic)**: Materials Project-style crystals serialized as `.json.xz` under the configured `./data/data_cubic` path (train 14,421 / val 1,000 / test 1,000).
+- **OMol25_EC**: Metal-complex cubes stored under `data/dataset_OMol25_MC_5k` (full release: train 3,943 / val 493 / test 493). The InfGCN config uses the filtered split (train 3,933 / val 491 / test 491).
+- **MD17_EC**: Small molecules (for example, ethanol, benzene, phenol, resorcinol) from the MD17 electron-density release under `./data/data_md`; each config points directly to its molecule/split directory. The default config trains on ethanol, and its validation split uses the published test samples.
+
+The training configs download their published dataset and metadata when the
+configured local path is absent. Existing local data is used directly. The
+archives are large (QM9 1.14 TB, MP 53.5 GB, OMol25 21.7 GB, and MD17
+11.3 GB), so confirm network and disk capacity before starting training in a
+fresh environment. The dataset cache keeps both the archive and extracted
+files under `~/.paddlemat/datasets`, so allow roughly twice the archive size.
+Before distributed training, extract the dataset with one process and set
+the dataset `path` to a location visible to every rank.
 
 ---
 
@@ -192,8 +204,6 @@ $$
     </tbody>
 </table>
 
-**Note**: Benchmarks are being regenerated in Paddle; metrics and downloadable checkpoints will be published once validation completes. Pretrained packages store weights under `checkpoints/`.
-
 ---
 
 ## Command
@@ -224,11 +234,10 @@ python electronic_structure/train.py -c electronic_structure/configs/infgcn/infg
 python electronic_structure/predict.py \
   --model_name infgcn_qm9 \
   --weights_name best.pdparams \
-  --mol_input electronic_structure/configs/infgcn/example/methane.mol \
-  --atom_file electronic_structure/configs/qm9.json \
-  --mol_grid_shape 8 \
+  --mol_file_path electronic_structure/configs/infgcn/example/methane.mol \
+  --grid_shape 8 \
   --grid_batch_size 128 \
-  --skip_vis
+  --save_path output/infgcn_qm9/methane
 
 # 2) Dataset-sample inference with a custom config and checkpoint.
 python electronic_structure/predict.py \
@@ -241,29 +250,43 @@ python electronic_structure/predict.py \
 python electronic_structure/predict.py \
   --config_path electronic_structure/configs/infgcn/infgcn_omol25_MC_5k_trimmed.yaml \
   --checkpoint_path path/to/infgcn_omol25.pdparams \
-  --mol_input path/to/mols_or_mol_file
+  --mol_file_path path/to/mols_or_mol_file \
+  --save_path output/infgcn_mol \
+  --save_html
 
 # 4) MOL-file inference with reference (true) cube files.
-# If --mol_true_cube_dir provides matching files (<name>.cube or <name>_true.cube),
-# the script additionally writes true cube and true/diff html.
+# If --reference_cube_dir provides matching files, the script can additionally
+# write the reference CUBE and true/difference visualizations.
 python electronic_structure/predict.py \
   --config_path electronic_structure/configs/infgcn/infgcn_omol25_MC_5k_trimmed.yaml \
   --checkpoint_path path/to/infgcn_omol25.pdparams \
-  --mol_input path/to/mols_or_mol_file \
-  --mol_true_cube_dir path/to/true_cubes \
-  --save_true_cube
+  --mol_file_path path/to/mols_or_mol_file \
+  --reference_cube_dir path/to/true_cubes \
+  --save_path output/infgcn_reference \
+  --save_true_cube \
+  --save_html
 ```
 
 Notes:
 - Replace `path/to/*.pdparams` with a downloaded pretrained checkpoint or a checkpoint produced by training.
-- Prediction defaults such as `split`, `index`, `output_dir`, `grid_batch_size`,
-  cube export, html export, and MOL grid settings are configured under `Predict`
-  in each YAML and can still be overridden from the command line.
-- `--mol_input` supports either one `.mol` file or a directory of `.mol` files.
-- Optional grid controls for MOL mode: `--mol_grid_shape` (default `80,80,80`) and `--mol_grid_padding` (default `6.0` Angstrom).
+- Model configs keep the recommended `grid_batch_size` and share the configured
+  field builder between Dataset and Predict. Input selection, output
+  paths, cube/html export, visualization, and MOL grid settings are runtime
+  command-line options.
+- `--mol_file_path` supports either one `.mol` file or a directory of `.mol`
+  files. The atom vocabulary declared by `Vocabulary` is downloaded and used
+  automatically.
+- `--save_path` is an output directory and always receives the predicted CUBE.
+- Optional MOL grid controls are `--grid_shape` (default `80,80,80`) and
+  `--grid_padding` (default `6.0` Angstrom).
+- MOL input coordinates and `--grid_padding` are interpreted in Angstrom and
+  converted to the model's configured coordinate unit before inference.
+  Generated CUBE files mark that unit explicitly. A reference CUBE must declare
+  the same unit as the model; its atom order is validated before its grid and
+  atom coordinates are used.
 - If true/reference cube is not provided, only predicted outputs are available (`*_pred.cube`, `*_pred_density.html`).
 - If kaleido/Chrome is unavailable, the script writes interactive `.html` instead of `.png`.
-- If your datasets live elsewhere, create a symlink to the data root (for example, `ln -s /path/to/dataset_ES dataset_ES`).
+- If a dataset already exists elsewhere, override its configured dataset path.
 
 ---
 

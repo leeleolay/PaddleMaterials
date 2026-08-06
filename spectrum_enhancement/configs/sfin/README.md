@@ -205,7 +205,7 @@ python spectrum_enhancement/predict.py \
   --checkpoint_path https://paddle-org.bj.bcebos.com/paddlematerials/checkpoints/spectrum_enhancement/sfin/sfin_bf_detect.zip \
   --input_path ./sfin_bf/test/noisy \
   --split val \
-  --output_dir ./output/sfin_predictions
+  --save_path ./output/sfin_predictions
 ```
 
 When `--input_path` is provided, prediction only reads noisy input images and

@@ -12,140 +12,160 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import gzip
-import lzma
-import time
-from pathlib import Path
-
 import numpy as np
 import paddle
 
+from ppmat.datasets.build_field import BuildField
+from ppmat.utils.crystal import atomic_number_from_symbol
+from ppmat.utils.crystal import normalize_coordinate_unit
+from ppmat.utils.io import write_cube
 
-def write_cube(fileobj, atom_type, atom_coord, density, info, idx2atom_num=None):
-    """Write a Gaussian CUBE file for an electron-density prediction."""
 
-    fileobj.write("Cube file written on " + time.strftime("%c"))
-    fileobj.write("\nOUTER LOOP: X, MIDDLE LOOP: Y, INNER LOOP: Z\n")
-    cell = info["cell"]
-    shape = info["shape"]
-    origin = info.get("origin", np.zeros(3, dtype=np.float32))
-    fileobj.write("{0:5}{1:12.6f}{2:12.6f}{3:12.6f}\n".format(len(atom_type), *origin))
-    for size, vector in zip(shape, cell):
-        step = vector / size
-        fileobj.write("{0:5}{1:12.6f}{2:12.6f}{3:12.6f}\n".format(size, *step))
-    for atom, (x_coord, y_coord, z_coord) in zip(atom_type, atom_coord):
-        atomic_num = (
-            int(idx2atom_num[int(atom)]) if idx2atom_num is not None else int(atom)
+def to_numpy(value):
+    """Return ``value`` as a NumPy array, detaching Paddle tensors first."""
+
+    if isinstance(value, paddle.Tensor):
+        return value.detach().cpu().numpy()
+    return np.asarray(value)
+
+
+def read_cube_density(
+    path,
+    field_converter: BuildField,
+):
+    """Read a CUBE file through the configured field builder."""
+
+    cube_field_converter = BuildField(
+        format="cube",
+        name=field_converter.name,
+        value_unit=field_converter.value_unit,
+        coordinate_unit=field_converter.coordinate_unit,
+    )
+    field = cube_field_converter(path, validate_coordinate_unit=False)
+    if field.grid.length_unit != field_converter.coordinate_unit:
+        field = field.to_length_unit(
+            field_converter.coordinate_unit,
+            value_scaling="none",
         )
-        fileobj.write(
-            "{0:5}{1:12.6f}{2:12.6f}{3:12.6f}{4:12.6f}\n".format(
-                atomic_num,
-                float(atomic_num),
-                x_coord,
-                y_coord,
-                z_coord,
-            )
-        )
-    density.tofile(fileobj, sep="\n", format="%e")
-
-
-def unavailable_cube_writer(*args, **kwargs):
-    raise AttributeError("Cube writer not available for this dataset")
-
-
-def open_text_maybe_compressed(path):
-    path = Path(path)
-    suffixes = "".join(path.suffixes).lower()
-    if suffixes.endswith(".lz4"):
-        import lz4.frame
-
-        return lz4.frame.open(path, mode="rt")
-    if suffixes.endswith(".xz"):
-        return lzma.open(path, mode="rt")
-    if suffixes.endswith(".gz"):
-        return gzip.open(path, mode="rt")
-    return path.open(mode="rt")
-
-
-def read_cube_density(path):
-    """Read density values, grid coordinates, and metadata from a CUBE file."""
-
-    with open_text_maybe_compressed(path) as file_obj:
-        file_obj.readline()
-        file_obj.readline()
-        line = file_obj.readline().split()
-        if len(line) < 4:
-            raise ValueError(f"Invalid CUBE header (line 3) in {path}")
-        num_atoms = int(line[0])
-        origin = np.array([float(value) for value in line[1:4]], dtype=np.float32)
-
-        shape = []
-        cell = np.zeros((3, 3), dtype=np.float32)
-        for index in range(3):
-            row = file_obj.readline().split()
-            if len(row) < 4:
-                raise ValueError(f"Invalid CUBE axis line in {path}")
-            size, x_coord, y_coord, z_coord = [float(value) for value in row[:4]]
-            shape.append(int(size))
-            cell[index] = np.array([x_coord, y_coord, z_coord], dtype=np.float32)
-
-        x_coords = np.arange(shape[0], dtype=np.float32)[:, None] * cell[0][None, :]
-        y_coords = np.arange(shape[1], dtype=np.float32)[:, None] * cell[1][None, :]
-        z_coords = np.arange(shape[2], dtype=np.float32)[:, None] * cell[2][None, :]
-        grid_coord = (
-            x_coords.reshape(-1, 1, 1, 3)
-            + y_coords.reshape(1, -1, 1, 3)
-            + z_coords.reshape(1, 1, -1, 3)
-        ).reshape(-1, 3)
-        grid_coord += origin
-
-        atom_coord_ref = []
-        for _ in range(num_atoms):
-            row = file_obj.readline().split()
-            if len(row) < 5:
-                raise ValueError(f"Invalid CUBE atom line in {path}")
-            atom_coord_ref.append([float(row[2]), float(row[3]), float(row[4])])
-
-        num_grid_points = shape[0] * shape[1] * shape[2]
-        values = [value for line in file_obj for value in line.split()]
-        if len(values) < num_grid_points:
-            raise ValueError(
-                f"CUBE data too short in {path}: expected {num_grid_points}, "
-                f"got {len(values)}"
-            )
-        density = np.asarray(values[:num_grid_points], dtype=np.float32)
+    grid = field.grid
+    if field.structure is None:
+        raise ValueError("Reference CUBE does not contain atomic structure data.")
 
     return (
-        paddle.to_tensor(density, dtype="float32"),
-        paddle.to_tensor(grid_coord, dtype="float32"),
+        np.asarray(field.flat, dtype=np.float32),
+        np.asarray(grid.cartesian_coordinates(), dtype=np.float32),
         {
-            "shape": shape,
-            "cell": paddle.to_tensor(cell, dtype="float32"),
-            "origin": paddle.to_tensor(origin, dtype="float32"),
-            "atom_coord_ref": np.asarray(atom_coord_ref, dtype=np.float32),
+            "shape": list(grid.shape),
+            "cell": np.asarray(grid.cell_vectors, dtype=np.float32),
+            "origin": np.asarray(grid.origin, dtype=np.float32),
+            "atom_numbers": np.asarray(
+                [
+                    atomic_number_from_symbol(symbol)
+                    for symbol in field.structure.symbols
+                ],
+                dtype=np.int64,
+            ),
+            "atom_coord_ref": np.asarray(
+                field.structure.cartesian_positions(),
+                dtype=np.float32,
+            ),
+            "coordinate_unit": grid.length_unit,
+            "density_unit": grid.value_unit,
         },
     )
 
 
-def prepare_cube_info(info, grid_coord):
-    """Build CUBE metadata from dataset information and an explicit grid."""
+def write_cube_from_atom_types(
+    destination,
+    atom_type,
+    atom_coord,
+    density,
+    info,
+    idx2atom_num,
+):
+    """Map internal atom types to atomic numbers and write a CUBE file."""
+
+    if hasattr(atom_type, "detach"):
+        atom_type = atom_type.detach().cpu().numpy()
+    atom_numbers = np.asarray(
+        [idx2atom_num[int(atom)] for atom in np.asarray(atom_type).reshape(-1)],
+        dtype=np.int64,
+    )
+    write_cube(
+        destination,
+        atom_numbers,
+        to_numpy(atom_coord),
+        to_numpy(density),
+        info,
+    )
+
+
+def prepare_cube_info(
+    info,
+    grid_coord,
+    field_converter: BuildField,
+):
+    """Return the CUBE geometry metadata for an explicit grid.
+
+    Args:
+        info: Sample metadata carrying ``shape``, ``cell``, ``origin`` and the
+            coordinate and density units.
+        grid_coord: Explicit grid coordinates to validate against the metadata.
+        field_converter: Converter whose units the metadata must match.
+    """
 
     shape = info.get("shape")
     if shape is None or len(shape) != 3:
         raise ValueError("CUBE output requires a three-dimensional grid shape.")
+    if "cell" not in info:
+        raise KeyError("CUBE output metadata must define 'cell'.")
+    if "origin" not in info:
+        raise KeyError("CUBE output metadata must define 'origin'.")
+    if "coordinate_unit" not in info:
+        raise KeyError("CUBE output metadata must define 'coordinate_unit'.")
 
-    shape = [int(size) for size in shape]
-    grid = grid_coord.detach().cpu().numpy().reshape(*shape, 3)
-    origin = grid[0, 0, 0]
-    steps = np.stack(
-        [
-            grid[1, 0, 0] - origin if shape[0] > 1 else np.zeros(3, dtype=np.float32),
-            grid[0, 1, 0] - origin if shape[1] > 1 else np.zeros(3, dtype=np.float32),
-            grid[0, 0, 1] - origin if shape[2] > 1 else np.zeros(3, dtype=np.float32),
-        ]
+    shape = tuple(int(size) for size in shape)
+    cell = to_numpy(info["cell"]).astype(np.float32, copy=False)
+    origin = to_numpy(info["origin"]).astype(np.float32, copy=False)
+    coordinate_unit = normalize_coordinate_unit(info["coordinate_unit"])
+    if coordinate_unit != field_converter.coordinate_unit:
+        raise ValueError(
+            f"CUBE output uses {coordinate_unit} coordinates, but "
+            "Predict.field_converter expects "
+            f"{field_converter.coordinate_unit}."
+        )
+    density_unit = info.get("density_unit")
+    if not isinstance(density_unit, str) or not density_unit.strip():
+        raise ValueError("CUBE output metadata must define a non-empty 'density_unit'.")
+    density_unit = density_unit.strip()
+    if density_unit != field_converter.value_unit:
+        raise ValueError(
+            f"CUBE output uses density unit {density_unit!r}, but "
+            "Predict.field_converter expects "
+            f"{field_converter.value_unit!r}."
+        )
+    grid = field_converter.build_grid(
+        {
+            "shape": shape,
+            "voxel_vectors": cell / np.asarray(shape, dtype=np.float32)[:, None],
+            "origin": origin,
+        }
     )
+    actual_points = to_numpy(grid_coord).reshape(-1, 3)
+    expected_points = grid.cartesian_coordinates()
+    if actual_points.shape != expected_points.shape or not np.allclose(
+        actual_points,
+        expected_points,
+        rtol=1.0e-5,
+        atol=1.0e-6,
+    ):
+        raise ValueError(
+            "CUBE output grid coordinates do not match shape, cell, and origin."
+        )
     return {
-        "shape": shape,
-        "cell": steps * np.asarray(shape, dtype=np.float32)[:, None],
-        "origin": origin,
+        "shape": list(grid.shape),
+        "cell": grid.cell_vectors,
+        "origin": grid.origin,
+        "coordinate_unit": grid.length_unit,
+        "density_unit": field_converter.value_unit,
     }

@@ -76,6 +76,11 @@ def _scatter_sum(
     # FIXME: Paddle's put_along_axis backward (PutAlongAxisGradNode) crashes
     # for dim=0; use one-hot + matmul as drop-in replacement.
     if dim == 0:
+        if src.shape[0] == 0:
+            # Paddle cannot infer the ``-1`` dimension when reshaping an empty
+            # tensor. Keep a zero-valued dependency so backward still produces
+            # the expected empty source gradient.
+            return out + src.sum() * 0
         # ``index`` is constant across all non-scatter dimensions after
         # broadcasting. Collapse it back to one group id per source row.
         idx_1d = index.reshape([index.shape[0], -1])[:, 0]

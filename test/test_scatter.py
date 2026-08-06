@@ -59,3 +59,16 @@ def test_scatter_sum_dim_zero_supports_matrix_values():
         ]
     )
     np.testing.assert_allclose(result.numpy(), expected)
+
+
+def test_scatter_sum_dim_zero_supports_empty_matrix_values():
+    values = paddle.empty([0, 4], dtype="float32")
+    values.stop_gradient = False
+    groups = paddle.empty([0], dtype="int64")
+
+    result = scatter_sum(values, groups, dim=0, dim_size=2)
+
+    assert result.shape == [2, 4]
+    np.testing.assert_array_equal(result.numpy(), np.zeros([2, 4]))
+    result.sum().backward()
+    assert values.grad.shape == [0, 4]

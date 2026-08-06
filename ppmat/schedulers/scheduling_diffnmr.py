@@ -17,8 +17,6 @@ import math
 import numpy as np
 import paddle
 import paddle.nn.functional as F
-import rdkit
-from rdkit import Chem
 
 from ppmat.models.diffnmr.utils import diffgraphformer_utils
 
@@ -580,12 +578,15 @@ def step(
             model, conditionVec
         )
         if model.connector_flag is True:
-            if spectrum_encoding is None:
-                raise NotImplementedError(
-                    "Connector sampling requires the joint H1/C13 spectrum encoder."
-                )
+            # DiffPrior treats a missing token sequence as an empty optional
+            # conditioning branch, which is the declared behavior for H-only
+            # encoders.  Keep the connector batch aligned with the graph batch:
+            # its public default generates multiple candidates, while a
+            # reverse-diffusion step needs exactly one embedding per spectrum.
             embeddings_spectrum = model.connector.sample(
-                embeddings_spectrum, spectrum_encoding
+                embeddings_spectrum,
+                spectrum_encodings=spectrum_encoding,
+                num_samples_per_batch=1,
             )
         input_y = paddle.concat([input_y, embeddings_spectrum], axis=1).astype(
             "float32"
@@ -677,7 +678,7 @@ def step(
     X_s = F.one_hot(sampled_s.X, num_classes=model.Xdim_output)
     E_s = F.one_hot(sampled_s.E, num_classes=model.Edim_output)
 
-    assert (E_s == paddle.transpose(E_s, [0, 1, 2])).all()
+    assert paddle.all(E_s == paddle.transpose(E_s, perm=[0, 2, 1, 3]))
     assert (X_t.shape == X_s.shape) and (E_t.shape == E_s.shape)
 
     out_one_hot = diffgraphformer_utils.PlaceHolder(
@@ -1087,44 +1088,6 @@ def reconstruction_logp(model, t, X, E, node_mask, condition_Spectrum):
 # -----------------------
 # molecule visualization/comparision
 # -----------------------
-def mol_from_graphs(atom_decoder, node_list, adjacency_matrix):
-    """
-    Convert discrete graph (atom indices, adjacency) to rdkit Mol
-    """
-    mol = Chem.RWMol()
-
-    node_to_idx = {}
-    for i, nd in enumerate(node_list):
-        if nd == -1:
-            continue
-        a = Chem.Atom(atom_decoder[int(nd)])
-        molIdx = mol.AddAtom(a)
-        node_to_idx[i] = molIdx
-
-    for ix, row in enumerate(adjacency_matrix):
-        for iy, bond in enumerate(row):
-            if iy <= ix:
-                continue
-            if bond == 1:
-                bond_type = Chem.rdchem.BondType.SINGLE
-            elif bond == 2:
-                bond_type = Chem.rdchem.BondType.DOUBLE
-            elif bond == 3:
-                bond_type = Chem.rdchem.BondType.TRIPLE
-            elif bond == 4:
-                bond_type = Chem.rdchem.BondType.AROMATIC
-            else:
-                continue
-            mol.AddBond(node_to_idx[ix], node_to_idx[iy], bond_type)
-
-    try:
-        mol = mol.GetMol()
-    except rdkit.Chem.KekulizeException:
-        print("Can't kekulize molecule")
-        mol = None
-    return mol
-
-
 def _safe_log(p: paddle.Tensor, eps: float = 1e-10) -> paddle.Tensor:
     # Avoid log(0)
     return paddle.log(paddle.clip(p, eps, 1.0))

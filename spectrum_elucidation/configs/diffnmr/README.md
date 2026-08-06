@@ -63,10 +63,9 @@ columns:
 
 ### Data Preparation
 
-Download the dataset and support files:
+Download the dataset and optional retrieval databases:
 
 - [MSD-NMR dataset](https://paddle-org.bj.bcebos.com/paddlematerial/datasets/msd/msd_nmr.zip)
-- [Vocabulary files](https://paddle-org.bj.bcebos.com/paddlematerials/assets/vocabs/msd_nmr_vocab.zip)
 - [MSD-NMR n<15 retrieval database](https://paddle-org.bj.bcebos.com/paddlematerials/assets/databases/msd_nmr_nless15_retrieval_molecular_representations.zip)
 - [MSD-NMR n<20 retrieval database](https://paddle-org.bj.bcebos.com/paddlematerials/assets/databases/msd_nmr_nless20_retrieval_molecular_representations.zip)
 
@@ -75,7 +74,6 @@ Place the files under the repository root and extract them:
 ```bash
 mkdir -p data spectrum_elucidation
 unzip msd_nmr.zip -d data
-unzip msd_nmr_vocab.zip -d spectrum_elucidation
 unzip msd_nmr_nless15_retrieval_molecular_representations.zip -d spectrum_elucidation
 ```
 
@@ -85,9 +83,10 @@ The default configs expect:
 data/MSD_nmr/train.csv
 data/MSD_nmr/val.csv
 data/MSD_nmr/test.csv
-spectrum_elucidation/vocab/nless15/
 spectrum_elucidation/retrieval_database/
 ```
+
+The vocabulary declared by `Vocabulary` is downloaded and used automatically.
 
 For a quick sampling smoke test, a bundled one-row sample from the MSD-NMR n<15
 validation split is provided at `example/sample.csv`.
@@ -138,8 +137,8 @@ python spectrum_elucidation/train.py -c spectrum_elucidation/configs/diffnmr/Dif
 
 ```bash
 # This command is used to sample molecular structures conditioned on NMR spectra.
-# Mode 1: Use a self-contained pre-trained model package.
-# Mode 2: Use a custom configuration file with local checkpoints and vocabulary.
+# Mode 1: Download a registered model package and vocabulary automatically.
+# Mode 2: Use a custom configuration file with local checkpoints.
 # Results are saved to the folder specified by --output_dir (default: results).
 
 python spectrum_elucidation/sample.py --model_name='diffnmr_msdnmr_nless15' --weights_name='best.pdparams' --output_dir='result_diffnmr_sample/'
