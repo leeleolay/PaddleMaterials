@@ -3,17 +3,15 @@ Global:
   do_eval: True
   do_test: False
   use_voxel: False
-  graph_cutoff: 6.0
   build_graph_cfg:
     __class_name__: RadiusGraphConverter
     __init_params__:
-      cutoff: ${Global.graph_cutoff}
+      cutoff: 6.0
       inclusive_cutoff: true
       include_distance: false
   build_field_cfg:
     format: cube
     name: density
-    value_unit: unknown
     num_cpus: 1
 
 Trainer:

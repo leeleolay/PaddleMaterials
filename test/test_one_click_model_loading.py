@@ -26,11 +26,10 @@ INFGCN_MODEL_NAMES = [
 QM9_ATOM_NAME2IDX = {"H": 0, "C": 1, "N": 2, "O": 3, "F": 4}
 
 
-def _build_field_cfg(format, value_unit, name="density"):
+def _build_field_cfg(format, name="density"):
     return {
         "format": format,
         "name": name,
-        "value_unit": value_unit,
         "num_cpus": 1,
     }
 
@@ -335,10 +334,7 @@ def test_infgcn_predict_config_uses_standard_field_builders():
     assert cfg["Predict"] == {
         "grid_batch_size": 20000,
         "build_graph_cfg": _build_graph_cfg(3.0),
-        "build_field_cfg": _build_field_cfg(
-            "chgcar",
-            "electron/angstrom^3",
-        ),
+        "build_field_cfg": _build_field_cfg("chgcar"),
     }
 
 
@@ -573,19 +569,6 @@ def test_field_predictor_from_data_uses_standard_batch_contract():
                 "density_unit": "electron/angstrom^3",
             },
         )
-    with pytest.raises(ValueError, match="density unit"):
-        predictor.from_data(
-            graph,
-            grid_coord,
-            {
-                "cell": np.eye(3),
-                "shape": [2, 2, 1],
-                "coordinate_unit": "angstrom",
-                "density_unit": "unknown",
-            },
-        )
-
-
 def test_field_cube_io_round_trip(tmp_path):
     import numpy as np
     from ase.units import Bohr
@@ -894,15 +877,8 @@ def test_all_infgcn_configs_are_parseable_and_complete():
         assert cfg["Vocabulary"] == expected_vocab_names.get(
             config_path.stem, "infgcn_md17"
         ), config_path.name
-        uses_angstrom = config_path.name in {
-            "infgcn_qm9.yaml",
-            "infgcn_mp.yaml",
-        }
         dataset_format = expected_dataset_formats.get(config_path.stem, "fft")
-        expected_field_cfg = _build_field_cfg(
-            dataset_format,
-            "electron/angstrom^3" if uses_angstrom else "unknown",
-        )
+        expected_field_cfg = _build_field_cfg(dataset_format)
         assert cfg["Global"]["build_field_cfg"] == expected_field_cfg
         graph_cutoff = 6.0 if config_path.stem == "infgcn_omol25_MC_5k_trimmed" else 3.0
         expected_graph_cfg = _build_graph_cfg(graph_cutoff)
@@ -941,8 +917,8 @@ def test_all_infgcn_configs_are_parseable_and_complete():
                 assert "build_field_cfg" not in init_params
                 assert "validation_ratio" not in init_params
                 assert "split_seed" not in init_params
-                assert init_params["n_grid"] == 50
-                assert init_params["grid_size"] == 20.0
+                assert "n_grid" not in init_params
+                assert "grid_size" not in init_params
             else:
                 assert init_params["build_field_cfg"] == expected_field_cfg
                 assert (

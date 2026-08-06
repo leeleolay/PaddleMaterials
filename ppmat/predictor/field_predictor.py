@@ -250,7 +250,7 @@ def build_mol_sample(
         "origin": np.asarray(grid.origin, dtype=np.float32),
         "file_name": mol_path.name,
         "coordinate_unit": grid.length_unit,
-        "density_unit": field_converter.value_unit,
+        "density_unit": field_converter.value_unit or "unknown",
     }
 
     return (
@@ -334,10 +334,7 @@ class FieldPredictor(BasePredictor):
                 f"Predict.build_field_cfg.name is {self.field_converter.name!r}, "
                 f"but the model target_name is {self.target_name!r}."
             )
-        logger.info(
-            f"Model loaded successfully on {self.device}; "
-            f"field unit: {self.field_converter.value_unit}."
-        )
+        logger.info(f"Model loaded successfully on {self.device}.")
 
     def _get_build_config(self, name):
         build_config = self.predict_config.get(name)
@@ -480,11 +477,6 @@ class FieldPredictor(BasePredictor):
         if not isinstance(density_unit, str) or not density_unit.strip():
             raise ValueError("info['density_unit'] must be a non-empty string.")
         density_unit = density_unit.strip()
-        if density_unit != self.field_converter.value_unit:
-            raise ValueError(
-                f"Field sample density unit is {density_unit!r}, but the model "
-                f"expects {self.field_converter.value_unit!r}."
-            )
         info["density_unit"] = density_unit
         if "cell" not in info:
             raise KeyError("Field prediction requires info['cell'].")

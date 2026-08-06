@@ -42,8 +42,8 @@ class BuildField:
 
     Args:
         name: Semantic field name, such as ``"density"`` or ``"potential"``.
-        value_unit: Physical unit of the values. Use ``"unknown"`` only when
-            the source format does not define a unit.
+        value_unit: Optional expected unit for field values. File formats keep
+            the parsed unit when this is omitted.
         coordinate_unit: Optional expected coordinate unit. File formats use
             the unit parsed from the source. Array grids default to angstrom
             when no unit is supplied by a dataset-specific workflow.
@@ -58,8 +58,8 @@ class BuildField:
     """
 
     name: str
-    value_unit: str
     format: str
+    value_unit: str | None = None
     coordinate_unit: str | None = None
     num_cpus: int = 1
 
@@ -159,7 +159,7 @@ class BuildField:
         field_data: Any,
         format: str,
         name: str,
-        value_unit: str,
+        value_unit: str | None,
         coordinate_unit: str | None,
         grid: GridSpec | None = None,
         validate_coordinate_unit: bool = True,
@@ -203,6 +203,7 @@ class BuildField:
             if not isinstance(grid, GridSpec):
                 raise TypeError("grid must be a cvve.GridSpec instance.")
             coordinate_unit = configured_coordinate_unit or grid.length_unit
+            value_unit = value_unit or grid.value_unit or "unknown"
             if (
                 validate_coordinate_unit
                 and configured_coordinate_unit is not None
@@ -282,7 +283,7 @@ class BuildField:
                     "field source."
                 )
             parsed_value_unit = parsed_grid.value_unit
-            if parsed_value_unit != value_unit:
+            if value_unit is not None and parsed_value_unit != value_unit:
                 raise ValueError(
                     f"json field uses {parsed_value_unit!r}, but value_unit is "
                     f"{value_unit!r}."
@@ -323,6 +324,7 @@ class BuildField:
                 periodic=(True, True, True),
             )
             output_grid = parsed_grid if grid is None else grid
+            value_unit = value_unit or parsed_value_unit
             return GridField(
                 data=values,
                 grid=replace(output_grid, value_unit=value_unit),
@@ -353,12 +355,17 @@ class BuildField:
             )
 
         parsed_value_unit = field.grid.value_unit
-        if parsed_value_unit != "unknown" and parsed_value_unit != value_unit:
+        if (
+            value_unit is not None
+            and parsed_value_unit != "unknown"
+            and parsed_value_unit != value_unit
+        ):
             raise ValueError(
                 f"{format} field uses {parsed_value_unit!r}, but value_unit is "
                 f"{value_unit!r}."
             )
         output_grid = field.grid if grid is None else grid
+        value_unit = value_unit or parsed_value_unit or "unknown"
         return replace(
             field,
             grid=replace(output_grid, value_unit=value_unit),

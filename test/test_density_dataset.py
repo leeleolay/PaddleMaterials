@@ -322,17 +322,6 @@ def test_density_dataset_accepts_configured_field_name(tmp_path):
         (
             "build_field_cfg",
             {
-                "format": "cube",
-                "name": "density",
-                "coordinate_unit": "bohr",
-                "num_cpus": 1,
-            },
-            TypeError,
-            "value_unit",
-        ),
-        (
-            "build_field_cfg",
-            {
                 "name": "density",
                 "value_unit": "unknown",
                 "coordinate_unit": "bohr",

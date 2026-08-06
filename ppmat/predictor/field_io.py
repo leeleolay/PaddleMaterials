@@ -126,12 +126,6 @@ def prepare_cube_info(
     if not isinstance(density_unit, str) or not density_unit.strip():
         raise ValueError("CUBE output metadata must define a non-empty 'density_unit'.")
     density_unit = density_unit.strip()
-    if density_unit != field_converter.value_unit:
-        raise ValueError(
-            f"CUBE output uses density unit {density_unit!r}, but "
-            "Predict.field_converter expects "
-            f"{field_converter.value_unit!r}."
-        )
     grid = BuildField.build_grid_one(
         {
             "shape": shape,
@@ -156,5 +150,5 @@ def prepare_cube_info(
         "cell": grid.cell_vectors,
         "origin": grid.origin,
         "coordinate_unit": grid.length_unit,
-        "density_unit": field_converter.value_unit,
+        "density_unit": density_unit,
     }
