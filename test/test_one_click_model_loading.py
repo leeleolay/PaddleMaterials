@@ -570,6 +570,8 @@ def test_field_predictor_from_data_uses_standard_batch_contract():
                 "density_unit": "electron/angstrom^3",
             },
         )
+
+
 def test_field_cube_io_round_trip(tmp_path):
     import numpy as np
     from ase.units import Bohr
@@ -892,6 +894,9 @@ def test_all_infgcn_configs_are_parseable_and_complete():
         assert cfg["Global"]["build_graph_cfg"] == expected_graph_cfg
         model_params = cfg["Model"]["__init_params__"]
         assert model_params["atom_graph_cutoff"] == graph_cutoff
+        assert model_params["inference_grid_point_budget"] == 65536
+        assert model_params["max_inference_grid_chunk_size"] == 20000
+        assert "inference_grid_batch_size" not in model_params
         if model_params["residual"]:
             assert model_params["atom_grid_cutoff"] == graph_cutoff
             assert model_params["periodic_mode"] == "none"
@@ -944,9 +949,15 @@ def test_all_infgcn_configs_are_parseable_and_complete():
                     "split",
                     "build_field_cfg",
                     "build_graph_cfg",
+                    "cache_num_workers",
                     "grid_sampler_cfg",
                     "overwrite",
                 }
+                assert init_params["cache_num_workers"] == 8
+                assert (
+                    unresolved_init_params["cache_num_workers"]
+                    == "${Global.cache_num_workers}"
+                )
                 assert init_params["overwrite"] is False
             if split == "test" and config_path.stem != "infgcn_omol25_MC_5k_trimmed":
                 # Paper metrics are computed over every grid point. The model
@@ -975,8 +986,7 @@ def test_all_infgcn_configs_are_parseable_and_complete():
         )
         assert cfg["Predict"]["build_field_cfg"] == expected_field_cfg
         assert (
-            unresolved_cfg["Predict"]["build_field_cfg"]
-            == "${Global.build_field_cfg}"
+            unresolved_cfg["Predict"]["build_field_cfg"] == "${Global.build_field_cfg}"
         )
 
 

@@ -14,13 +14,13 @@
 
 import paddle
 
-from ppmat.datasets.graph_utils.infgcn_graph_utils import radius
 from ppmat.models.common.activation import NormActivation
 from ppmat.models.common.activation import ScalarActivation
 from ppmat.models.common.e3nn import o3
 from ppmat.models.common.e3nn.math import soft_one_hot_linspace
 from ppmat.models.common.e3nn.nn import FullyConnectedNet
 from ppmat.models.common.orbital import GaussianOrbital
+from ppmat.models.infgcn.graph_converter import AtomGridRadiusGraphConverter
 
 
 def _scatter_sum(src, index, dim_size):
@@ -168,6 +168,8 @@ class InfGCN(paddle.nn.Layer):
         residual=True,
         periodic_mode="none",
         inference_grid_batch_size=None,
+        inference_grid_point_budget=None,
+        max_inference_grid_chunk_size=None,
         target_name="density",
         loss_eps=1e-8,
         **kwargs,
@@ -197,8 +199,12 @@ class InfGCN(paddle.nn.Layer):
         :param periodic_mode: ``"none"`` for molecular data or ``"official"``
             for the original periodic InfGCN orbital minimum-image convention
         :param inference_grid_batch_size: optional number of grid points evaluated
-            per chunk in evaluation mode; predictions are concatenated before
-            computing metrics so full-grid NMAE keeps the paper's definition
+            per chunk in evaluation mode. This is retained as a legacy fixed-size
+            fallback when ``inference_grid_point_budget`` is not set
+        :param inference_grid_point_budget: optional maximum total number of grid
+            points decoded by one evaluation chunk across the whole batch
+        :param max_inference_grid_chunk_size: optional per-sample cap applied to
+            the chunk size derived from ``inference_grid_point_budget``
         """
         super(InfGCN, self).__init__()
         self.vocab = vocab
@@ -235,7 +241,15 @@ class InfGCN(paddle.nn.Layer):
                 "The official periodic InfGCN configuration requires residual=False."
             )
         self.periodic_mode = periodic_mode
-        self.inference_grid_batch_size = inference_grid_batch_size
+        self.inference_grid_batch_size = self._validate_optional_positive_int(
+            inference_grid_batch_size, "inference_grid_batch_size"
+        )
+        self.inference_grid_point_budget = self._validate_optional_positive_int(
+            inference_grid_point_budget, "inference_grid_point_budget"
+        )
+        self.max_inference_grid_chunk_size = self._validate_optional_positive_int(
+            max_inference_grid_chunk_size, "max_inference_grid_chunk_size"
+        )
         self.target_name = target_name
         self.loss_eps = loss_eps
         assert activation in ["scalar", "norm"]
@@ -269,7 +283,12 @@ class InfGCN(paddle.nn.Layer):
         else:
             self.act = NormActivation(self.irreps_feat)
         self.residue = None
+        self.atom_grid_graph_converter = None
         if self.residual:
+            self.atom_grid_graph_converter = AtomGridRadiusGraphConverter(
+                cutoff=self.atom_grid_cutoff,
+                max_num_neighbors=32,
+            )
             self.residue = GCNLayer(
                 self.irreps_feat,
                 "0e",
@@ -316,14 +335,18 @@ class InfGCN(paddle.nn.Layer):
         cell = self._prepare_cell(info)
 
         # Predict the field independently of target availability.
-        chunk_size = self.inference_grid_batch_size
+        atom_features = self._encode_atoms(
+            atom_types,
+            atom_coord,
+            atom_edges,
+        )
+        chunk_size = self._inference_chunk_size(grid.shape[0], grid.shape[1])
         if not self.training and chunk_size and grid.shape[1] > chunk_size:
             pred = paddle.concat(
                 [
-                    self._forward_density(
-                        atom_types,
+                    self._decode_grid_chunk(
+                        atom_features,
                         atom_coord,
-                        atom_edges,
                         grid[:, start : start + chunk_size],
                         graph_batch,
                         cell,
@@ -333,10 +356,9 @@ class InfGCN(paddle.nn.Layer):
                 axis=1,
             )
         else:
-            pred = self._forward_density(
-                atom_types,
+            pred = self._decode_grid_chunk(
+                atom_features,
                 atom_coord,
-                atom_edges,
                 grid,
                 graph_batch,
                 cell,
@@ -395,16 +417,34 @@ class InfGCN(paddle.nn.Layer):
             )
         return cell
 
-    def _forward_density(self, atom_types, atom_coord, atom_edges, grid, batch, cell):
-        """
-        Network forward with memory optimization
+    @staticmethod
+    def _validate_optional_positive_int(value, name):
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer or None.")
+        return value
+
+    def _inference_chunk_size(self, batch_size, num_grid_points):
+        if self.training:
+            return None
+        if self.inference_grid_point_budget is not None:
+            chunk_size = max(1, self.inference_grid_point_budget // int(batch_size))
+            if self.max_inference_grid_chunk_size is not None:
+                chunk_size = min(chunk_size, self.max_inference_grid_chunk_size)
+        else:
+            chunk_size = self.inference_grid_batch_size
+        if chunk_size is None:
+            return None
+        return min(chunk_size, int(num_grid_points))
+
+    def _encode_atoms(self, atom_types, atom_coord, atom_edges):
+        """Encode the atom graph once for reuse by every grid chunk.
+
         :param atom_types: atom types of (N,)
         :param atom_coord: atom coordinates of (N, 3)
         :param atom_edges: candidate atom edges of (2, E)
-        :param grid: coordinates at grid points of (G, K, 3)
-        :param batch: batch index for each node of (N,)
-        :param cell: optional batched cell vectors of (G, 3, 3)
-        :return: predicted value at each grid point of (G, K)
+        :return: encoded atom features of (N, irreps_feat.dim)
         """
         feat = self.embedding(atom_types)
 
@@ -441,6 +481,19 @@ class InfGCN(paddle.nn.Layer):
             if i != self.num_gcn_layer - 1:
                 feat = self.act(feat)
 
+        return feat
+
+    def _decode_grid_chunk(self, feat, atom_coord, grid, batch, cell):
+        """Decode one grid chunk from atom features shared across chunks.
+
+        :param feat: encoded atom features of (N, irreps_feat.dim)
+        :param atom_coord: atom coordinates of (N, 3)
+        :param grid: coordinates at grid points of (G, K, 3)
+        :param batch: batch index for each node of (N,)
+        :param cell: optional batched cell vectors of (G, 3, 3)
+        :return: predicted value at each grid point of (G, K)
+        """
+
         n_graph, n_sample = grid.shape[0], grid.shape[1]
         if self.residual:
             # Grid chunks are sliced along the point axis and may be
@@ -448,11 +501,15 @@ class InfGCN(paddle.nn.Layer):
             # and these evaluation-only slices.
             grid_flat = grid.reshape([-1, 3])
             grid_batch = paddle.arange(end=n_graph).repeat_interleave(repeats=n_sample)
-            grid_dst, node_src = radius(
-                atom_coord, grid_flat, self.atom_grid_cutoff, batch, grid_batch
+            atom_grid_edges = self.atom_grid_graph_converter(
+                atom_coord,
+                grid_flat,
+                batch,
+                grid_batch,
             )
-            grid_edge = grid_flat[grid_dst] - atom_coord[node_src]
-            if grid_edge.shape[0] != 0:
+            if atom_grid_edges.shape[1] != 0:
+                node_src, grid_dst = atom_grid_edges
+                grid_edge = grid_flat[grid_dst] - atom_coord[node_src]
                 grid_len = paddle.linalg.norm(x=grid_edge, axis=-1) + 1e-08
                 grid_edge_feat = o3.spherical_harmonics(
                     list(range(self.num_spherical + 1)),

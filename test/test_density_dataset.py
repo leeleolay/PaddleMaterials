@@ -231,6 +231,49 @@ def test_density_dataset_reads_compressed_cube_through_converters(tmp_path):
     assert sample["id"] == 0
 
 
+def test_density_dataset_parallel_cache_matches_serial_cache(tmp_path):
+    root = tmp_path / "density"
+    _write_cube_fixture(root, {"test": [0, 1]})
+
+    serial = _cube_dataset(
+        root,
+        cache_path=tmp_path / "serial_cache",
+        cache_num_workers=1,
+    )
+    parallel = _cube_dataset(
+        root,
+        cache_path=tmp_path / "parallel_cache",
+        cache_num_workers=2,
+    )
+
+    assert len(serial) == len(parallel) == 2
+    for index in range(2):
+        serial_sample = serial[index]
+        parallel_sample = parallel[index]
+        assert serial_sample["id"] == parallel_sample["id"]
+        np.testing.assert_array_equal(
+            np.asarray(serial_sample["graph"].edges),
+            np.asarray(parallel_sample["graph"].edges),
+        )
+        np.testing.assert_array_equal(
+            _graph_x(serial_sample["graph"]),
+            _graph_x(parallel_sample["graph"]),
+        )
+        np.testing.assert_allclose(serial_sample["density"], parallel_sample["density"])
+        np.testing.assert_allclose(
+            serial_sample["grid_coord"], parallel_sample["grid_coord"]
+        )
+
+
+@pytest.mark.parametrize("cache_num_workers", [0, -1, True, 1.5])
+def test_density_dataset_rejects_invalid_cache_num_workers(tmp_path, cache_num_workers):
+    root = tmp_path / "density"
+    _write_cube_fixture(root, {"test": [0]})
+
+    with pytest.raises(ValueError, match="cache_num_workers"):
+        _cube_dataset(root, cache_num_workers=cache_num_workers)
+
+
 def test_density_dataset_passes_atom_vocabulary_to_graph_converter(tmp_path):
     root = tmp_path / "density"
     _write_cube_fixture(root, {"test": [0]})

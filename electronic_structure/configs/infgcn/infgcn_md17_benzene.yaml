@@ -87,7 +87,8 @@ Model:
     gauss_end: 5.0
     residual: true
     periodic_mode: none
-    inference_grid_batch_size: 4096
+    inference_grid_point_budget: 65536
+    max_inference_grid_chunk_size: 20000
 
 Vocabulary: infgcn_md17
 

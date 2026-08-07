@@ -14,11 +14,13 @@
 
 
 import json
+import multiprocessing as mp
 import os
 import os.path as osp
 import pickle
 import shutil
 from collections.abc import Callable
+from concurrent.futures import ProcessPoolExecutor
 from typing import Any
 from typing import Dict
 from typing import List
@@ -36,6 +38,48 @@ from ppmat.utils import download
 from ppmat.utils import logger
 from ppmat.utils import misc
 from ppmat.utils.misc import is_equal
+
+_DENSITY_CACHE_FIELD_BUILDER = None
+_DENSITY_CACHE_GRAPH_CONVERTER = None
+_DENSITY_CACHE_FIELDS_PATH = None
+_DENSITY_CACHE_GRAPHS_PATH = None
+
+
+def _init_density_cache_worker(
+    build_field_cfg,
+    build_graph_cfg,
+    vocab,
+    fields_cache_path,
+    graph_cache_path,
+):
+    """Initialize CPU-only converters once in each spawned cache worker."""
+    global _DENSITY_CACHE_FIELD_BUILDER
+    global _DENSITY_CACHE_GRAPH_CONVERTER
+    global _DENSITY_CACHE_FIELDS_PATH
+    global _DENSITY_CACHE_GRAPHS_PATH
+
+    _DENSITY_CACHE_FIELD_BUILDER = BuildField(**build_field_cfg)
+    _DENSITY_CACHE_GRAPH_CONVERTER = (
+        build_graph_converter(build_graph_cfg, vocab=vocab)
+        if build_graph_cfg is not None
+        else None
+    )
+    _DENSITY_CACHE_FIELDS_PATH = fields_cache_path
+    _DENSITY_CACHE_GRAPHS_PATH = graph_cache_path
+
+
+def _build_density_cache_sample(index_and_source):
+    """Build and serialize one field and its graph in a cache worker."""
+    index, field_source = index_and_source
+    field = _DENSITY_CACHE_FIELD_BUILDER(field_source)
+    with open(osp.join(_DENSITY_CACHE_FIELDS_PATH, f"{index:010d}.pkl"), "wb") as f:
+        pickle.dump(field, f)
+
+    if _DENSITY_CACHE_GRAPH_CONVERTER is not None:
+        graph = _DENSITY_CACHE_GRAPH_CONVERTER.from_structures([field.structure])[0]
+        with open(osp.join(_DENSITY_CACHE_GRAPHS_PATH, f"{index:010d}.pkl"), "wb") as f:
+            pickle.dump(graph, f)
+    return index
 
 
 class DensityDataset(paddle.io.Dataset):
@@ -58,6 +102,7 @@ class DensityDataset(paddle.io.Dataset):
         transforms: Callable | None = None,
         grid_sampler_cfg: Dict[str, Any] | None = None,
         cache_path: str | os.PathLike[str] | None = None,
+        cache_num_workers: int = 1,
         overwrite: bool = False,
     ) -> None:
         super().__init__()
@@ -85,6 +130,13 @@ class DensityDataset(paddle.io.Dataset):
         self.build_graph_cfg = build_graph_cfg
         self.build_field_cfg = build_field_cfg
         self.transforms = transforms
+        if (
+            isinstance(cache_num_workers, bool)
+            or not isinstance(cache_num_workers, int)
+            or cache_num_workers <= 0
+        ):
+            raise ValueError("cache_num_workers must be a positive integer.")
+        self.cache_num_workers = cache_num_workers
         self.grid_sampler = (
             DensityGridSampler(**grid_sampler_cfg)
             if grid_sampler_cfg is not None
@@ -198,29 +250,50 @@ class DensityDataset(paddle.io.Dataset):
                     osp.join(self.cache_path, "graph_vocab.pkl"),
                     graph_vocab,
                 )
-                # save fields to cache file
+                # Save fields and graphs to cache. Spawned workers avoid
+                # inheriting any CUDA state initialized before Dataset setup.
                 os.makedirs(fields_cache_path, exist_ok=True)
-                structures = []
-                for i in range(self.num_samples):
-                    field = BuildField(**build_field_cfg)(
-                        self.row_data["field_source"][i]
-                    )
-                    structures.append(field.structure)
-                    self.save_to_cache(
-                        osp.join(fields_cache_path, f"{i:010d}.pkl"),
-                        field,
-                    )
-                logger.info(f"Save {self.num_samples} fields to {fields_cache_path}")
-
                 if build_graph_cfg is not None:
-                    converter = build_graph_converter(build_graph_cfg, vocab=vocab)
-                    graphs = converter.from_structures(structures)
-                    # save graphs to cache file
                     os.makedirs(graph_cache_path, exist_ok=True)
-                    for i in range(self.num_samples):
+                if self.cache_num_workers == 1:
+                    field_builder = BuildField(**build_field_cfg)
+                    converter = (
+                        build_graph_converter(build_graph_cfg, vocab=vocab)
+                        if build_graph_cfg is not None
+                        else None
+                    )
+                    for i, field_source in enumerate(self.row_data["field_source"]):
+                        field = field_builder(field_source)
                         self.save_to_cache(
-                            osp.join(graph_cache_path, f"{i:010d}.pkl"), graphs[i]
+                            osp.join(fields_cache_path, f"{i:010d}.pkl"), field
                         )
+                        if converter is not None:
+                            graph = converter.from_structures([field.structure])[0]
+                            self.save_to_cache(
+                                osp.join(graph_cache_path, f"{i:010d}.pkl"), graph
+                            )
+                else:
+                    worker_context = mp.get_context("spawn")
+                    with ProcessPoolExecutor(
+                        max_workers=self.cache_num_workers,
+                        mp_context=worker_context,
+                        initializer=_init_density_cache_worker,
+                        initargs=(
+                            build_field_cfg,
+                            build_graph_cfg,
+                            vocab,
+                            fields_cache_path,
+                            graph_cache_path,
+                        ),
+                    ) as executor:
+                        for _ in executor.map(
+                            _build_density_cache_sample,
+                            enumerate(self.row_data["field_source"]),
+                            chunksize=1,
+                        ):
+                            pass
+                logger.info(f"Save {self.num_samples} fields to {fields_cache_path}")
+                if build_graph_cfg is not None:
                     logger.info(f"Save {self.num_samples} graphs to {graph_cache_path}")
 
             # sync all processes

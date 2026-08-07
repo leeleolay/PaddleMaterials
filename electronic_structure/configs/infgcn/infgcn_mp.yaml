@@ -14,6 +14,7 @@ Global:
     format: json
     name: density
     num_cpus: 1
+  cache_num_workers: 8
 
 Trainer:
   # Max epochs to train
@@ -86,7 +87,8 @@ Model:
     gauss_end: 5.0
     residual: false
     periodic_mode: official
-    inference_grid_batch_size: 4096
+    inference_grid_point_budget: 65536
+    max_inference_grid_chunk_size: 20000
 
 Vocabulary: infgcn_mp
 
@@ -117,6 +119,7 @@ Dataset:
         split: "train"
         build_field_cfg: ${Global.build_field_cfg}
         build_graph_cfg: ${Global.build_graph_cfg}
+        cache_num_workers: ${Global.cache_num_workers}
         overwrite: false
         grid_sampler_cfg:
           n_samples: 1024
@@ -139,6 +142,7 @@ Dataset:
         split: "validation"
         build_field_cfg: ${Global.build_field_cfg}
         build_graph_cfg: ${Global.build_graph_cfg}
+        cache_num_workers: ${Global.cache_num_workers}
         overwrite: false
         grid_sampler_cfg:
           n_samples: 2048
@@ -161,6 +165,7 @@ Dataset:
         split: "test"
         build_field_cfg: ${Global.build_field_cfg}
         build_graph_cfg: ${Global.build_graph_cfg}
+        cache_num_workers: ${Global.cache_num_workers}
         overwrite: false
     sampler:
       __class_name__: BatchSampler

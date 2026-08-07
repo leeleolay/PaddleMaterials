@@ -64,7 +64,7 @@ def _as_model_batch(batch):
     return batch
 
 
-def _infgcn(target_name="density", pbc=False):
+def _infgcn(target_name="density", pbc=False, **kwargs):
     from ppmat.models.infgcn.infgcn import InfGCN
 
     return InfGCN(
@@ -80,6 +80,7 @@ def _infgcn(target_name="density", pbc=False):
         residual=not pbc,
         periodic_mode=("official" if pbc else "none"),
         target_name=target_name,
+        **kwargs,
     )
 
 
@@ -341,7 +342,12 @@ def test_infgcn_forward_uses_target_name_and_output_flags(monkeypatch):
     prediction = paddle.to_tensor([[0.2, 0.3]], dtype="float32")
     monkeypatch.setattr(
         model,
-        "_forward_density",
+        "_encode_atoms",
+        lambda *args: paddle.zeros([1, model.irreps_feat.dim]),
+    )
+    monkeypatch.setattr(
+        model,
+        "_decode_grid_chunk",
         lambda *args: prediction,
     )
 
@@ -385,12 +391,12 @@ def test_infgcn_uses_batched_cell_for_periodic_inputs(monkeypatch):
         )
     )
 
-    def fake_forward(*args):
+    def fake_decode(*args):
         cell = args[-1]
         assert list(cell.shape) == [2, 3, 3]
         return paddle.zeros([2, 1], dtype="float32")
 
-    monkeypatch.setattr(model, "_forward_density", fake_forward)
+    monkeypatch.setattr(model, "_decode_grid_chunk", fake_decode)
     output = model(batch)
 
     assert list(output["pred_dict"]["density"].shape) == [2, 1]
@@ -398,21 +404,86 @@ def test_infgcn_uses_batched_cell_for_periodic_inputs(monkeypatch):
 
 def test_infgcn_chunks_full_grid_only_during_evaluation(monkeypatch):
     model = _infgcn()
-    model.inference_grid_batch_size = 1
+    model.inference_grid_point_budget = 1
+    model.max_inference_grid_chunk_size = 10
     batch = _as_model_batch(DensityCollator()([_sample([0.1, 0.2])]))
     chunk_sizes = []
+    encode_calls = 0
 
-    def fake_forward(*args):
-        grid = args[3]
+    def fake_encode(*args):
+        nonlocal encode_calls
+        encode_calls += 1
+        return paddle.zeros([1, model.irreps_feat.dim])
+
+    def fake_decode(*args):
+        grid = args[2]
         chunk_sizes.append(grid.shape[1])
         return paddle.zeros(grid.shape[:2], dtype="float32")
 
-    monkeypatch.setattr(model, "_forward_density", fake_forward)
+    monkeypatch.setattr(model, "_encode_atoms", fake_encode)
+    monkeypatch.setattr(model, "_decode_grid_chunk", fake_decode)
     model.eval()
     output = model(batch)
 
+    assert encode_calls == 1
     assert chunk_sizes == [1, 1]
     assert list(output["pred_dict"]["density"].shape) == [1, 2]
+
+
+def test_infgcn_dynamic_grid_budget_scales_with_batch_size():
+    model = _infgcn()
+    model.inference_grid_point_budget = 8
+    model.max_inference_grid_chunk_size = 6
+    model.eval()
+
+    assert model._inference_chunk_size(batch_size=1, num_grid_points=20) == 6
+    assert model._inference_chunk_size(batch_size=2, num_grid_points=20) == 4
+    assert model._inference_chunk_size(batch_size=8, num_grid_points=20) == 1
+
+
+def test_infgcn_chunked_decode_matches_full_grid_decode():
+    paddle.seed(42)
+    model = _infgcn()
+    batch = _as_model_batch(DensityCollator()([_sample([0.1, 0.2, 0.3, 0.4])]))
+    model.eval()
+
+    full = model(batch)["pred_dict"]["density"]
+    model.inference_grid_point_budget = 2
+    model.max_inference_grid_chunk_size = 2
+    chunked = model(batch)["pred_dict"]["density"]
+
+    np.testing.assert_allclose(chunked.numpy(), full.numpy(), atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("inference_grid_batch_size", 0),
+        ("inference_grid_point_budget", -1),
+        ("max_inference_grid_chunk_size", True),
+    ],
+)
+def test_infgcn_rejects_invalid_grid_chunk_settings(name, value):
+    with pytest.raises(ValueError, match=name):
+        _infgcn(**{name: value})
+
+
+def test_atom_grid_radius_converter_uses_atom_to_grid_edge_order():
+    from ppmat.models.infgcn.graph_converter import AtomGridRadiusGraphConverter
+
+    atom_coord = paddle.to_tensor([[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]], dtype="float32")
+    grid_coord = paddle.to_tensor(
+        [[0.5, 0.0, 0.0], [1.5, 0.0, 0.0], [5.0, 0.0, 0.0]],
+        dtype="float32",
+    )
+    atom_batch = paddle.zeros([2], dtype="int64")
+    grid_batch = paddle.zeros([3], dtype="int64")
+
+    edge_index = AtomGridRadiusGraphConverter(cutoff=1.0)(
+        atom_coord, grid_coord, atom_batch, grid_batch
+    )
+
+    np.testing.assert_array_equal(edge_index.numpy(), [[0, 1], [0, 1]])
 
 
 def test_radius_converter_deterministically_keeps_nearest_32_neighbors():
