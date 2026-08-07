@@ -69,7 +69,7 @@ def _graph_converter_cfg(coordinate_unit, cutoff=3.0, num_cpus=1):
             "inclusive_cutoff": True,
             "atom_vocab": {},
             "include_distance": False,
-            "include_direction": False,
+            "include_bond_vec": False,
             "return_triplet_indices": False,
             "num_cpus": num_cpus,
         },
@@ -210,7 +210,7 @@ def _graph_x(graph):
 
 
 def _graph_pos(graph):
-    return np.asarray(graph.node_feat["pos"])
+    return np.asarray(graph.node_feat["cart_coords"])
 
 
 def test_density_dataset_reads_compressed_cube_through_converters(tmp_path):
@@ -221,7 +221,7 @@ def test_density_dataset_reads_compressed_cube_through_converters(tmp_path):
 
     np.testing.assert_array_equal(_graph_x(graph), [0])
     np.testing.assert_allclose(_graph_pos(graph), np.zeros([1, 3]))
-    np.testing.assert_array_equal(graph.node_feat["atomic_number"], [[6]])
+    np.testing.assert_array_equal(graph.node_feat["atom_types"], [6])
     assert np.asarray(graph.edges).shape == (0, 2)
     np.testing.assert_allclose(density, np.arange(8))
     np.testing.assert_allclose(grid_coord[0], [0.25, 0.5, 0.75])
@@ -1303,7 +1303,7 @@ def test_md17_density_dataset_matches_reference_split_protocol(tmp_path):
     assert _graph_x(sample["graph"]).dtype == np.int64
     assert _graph_pos(sample["graph"]).dtype == np.float32
     np.testing.assert_array_equal(
-        sample["graph"].node_feat["atomic_number"].reshape(-1),
+        sample["graph"].node_feat["atom_types"].reshape(-1),
         MD17_ATOMIC_NUMBERS["ethane"],
     )
     np.testing.assert_array_equal(

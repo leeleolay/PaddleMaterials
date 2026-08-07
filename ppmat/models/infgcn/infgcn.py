@@ -15,7 +15,6 @@
 import paddle
 
 from ppmat.datasets.graph_utils.infgcn_graph_utils import radius
-from ppmat.datasets.graph_utils.infgcn_graph_utils import randomly_truncate_neighbors
 from ppmat.models.common.activation import NormActivation
 from ppmat.models.common.activation import ScalarActivation
 from ppmat.models.common.e3nn import o3
@@ -157,14 +156,14 @@ class InfGCN(paddle.nn.Layer):
         radial_hidden_size,
         num_radial_layer=2,
         num_gcn_layer=3,
-        cutoff=3.0,
-        grid_cutoff=3.0,
+        atom_graph_cutoff=3.0,
+        atom_grid_cutoff=None,
         is_fc=True,
         gauss_start=0.5,
         gauss_end=5.0,
         activation="norm",
         residual=True,
-        pbc=False,
+        periodic_mode="none",
         target_name="density",
         loss_eps=1e-8,
         **kwargs,
@@ -180,8 +179,10 @@ class InfGCN(paddle.nn.Layer):
         :param radial_hidden_size: hidden size of the radial network
         :param num_radial_layer: number of hidden layers in the radial network
         :param num_gcn_layer: number of InfGCN layers
-        :param cutoff: cutoff distance for building the molecular graph
-        :param grid_cutoff: cutoff distance for building the grid-atom graph
+        :param atom_graph_cutoff: cutoff used by the prebuilt atom graph and its
+            radial basis expansion
+        :param atom_grid_cutoff: cutoff for the residual atom-grid bipartite graph;
+            required only when ``residual`` is enabled
         :param is_fc: whether the InfGCN layer should use fully connected
             tensor product
         :param gauss_start: start coefficient of the Gaussian radial basis
@@ -189,7 +190,8 @@ class InfGCN(paddle.nn.Layer):
         :param activation: activation type for the InfGCN layer, can be
             ['scalar', 'norm']
         :param residual: whether to use the residue prediction layer
-        :param pbc: whether the data satisfy the periodic boundary condition
+        :param periodic_mode: ``"none"`` for molecular data or ``"official"``
+            for the original periodic InfGCN orbital minimum-image convention
         """
         super(InfGCN, self).__init__()
         self.vocab = vocab
@@ -201,14 +203,31 @@ class InfGCN(paddle.nn.Layer):
         self.radial_hidden_size = radial_hidden_size
         self.num_radial_layer = num_radial_layer
         self.num_gcn_layer = num_gcn_layer
-        self.cutoff = cutoff
-        self.grid_cutoff = grid_cutoff
+        self.atom_graph_cutoff = float(atom_graph_cutoff)
+        if residual and atom_grid_cutoff is None:
+            raise ValueError("atom_grid_cutoff is required when residual=True.")
+        self.atom_grid_cutoff = (
+            None if atom_grid_cutoff is None else float(atom_grid_cutoff)
+        )
         self.is_fc = is_fc
         self.gauss_start = gauss_start
         self.gauss_end = gauss_end
         self.activation = activation
         self.residual = residual
-        self.pbc = pbc
+        if periodic_mode not in {"none", "official", "periodic_graph"}:
+            raise ValueError(
+                "periodic_mode must be 'none', 'official', or 'periodic_graph'."
+            )
+        if periodic_mode == "periodic_graph":
+            raise NotImplementedError(
+                "periodic_graph requires periodic bond vectors and is not part of "
+                "the original InfGCN reproduction contract."
+            )
+        if periodic_mode == "official" and residual:
+            raise ValueError(
+                "The official periodic InfGCN configuration requires residual=False."
+            )
+        self.periodic_mode = periodic_mode
         self.target_name = target_name
         self.loss_eps = loss_eps
         assert activation in ["scalar", "norm"]
@@ -283,7 +302,7 @@ class InfGCN(paddle.nn.Layer):
         # when the graph already holds tensors.
         graph = data["graph"].tensor()
         atom_types = graph.node_feat["x"]
-        atom_coord = graph.node_feat["pos"]
+        atom_coord = graph.node_feat["cart_coords"]
         atom_edges = graph.edges.transpose([1, 0])
         graph_batch = graph.graph_node_id.astype("int64")
         cell = self._prepare_cell(info)
@@ -337,7 +356,7 @@ class InfGCN(paddle.nn.Layer):
         return {"loss_dict": loss_dict, "pred_dict": pred_dict}
 
     def _prepare_cell(self, info):
-        if not self.pbc:
+        if self.periodic_mode == "none":
             return None
         if info is None or "cell" not in info:
             raise KeyError("Periodic InfGCN input requires info['cell'].")
@@ -364,8 +383,8 @@ class InfGCN(paddle.nn.Layer):
         """
         feat = self.embedding(atom_types)
 
-        # Preserve original random max-32 atom-neighbor truncation on every forward.
-        edge_index = randomly_truncate_neighbors(atom_edges, sort_by_source=True)
+        # Graph topology, including max_num_neighbors, belongs to the converter.
+        edge_index = atom_edges
         src, dst = edge_index
         edge_vec = atom_coord[src] - atom_coord[dst]  # coord vector
         edge_len = edge_vec.norm(axis=-1) + 1e-08  # L2 norm, equal to distance
@@ -382,7 +401,7 @@ class InfGCN(paddle.nn.Layer):
             soft_one_hot_linspace(  # radial features, [D_edge_index, radial_embed_size]
                 edge_len,
                 start=0.0,
-                end=self.cutoff,
+                end=self.atom_graph_cutoff,
                 number=self.radial_embed_size,  # The number of radial basis functions.
                 basis="gaussian",  # Uses Gaussian functions as the radial basis.
                 cutoff=False,  # Disables the cutoff/smoothing function at the boundary.
@@ -402,7 +421,7 @@ class InfGCN(paddle.nn.Layer):
             grid_flat = grid.view(-1, 3)
             grid_batch = paddle.arange(end=n_graph).repeat_interleave(repeats=n_sample)
             grid_dst, node_src = radius(
-                atom_coord, grid_flat, self.grid_cutoff, batch, grid_batch
+                atom_coord, grid_flat, self.atom_grid_cutoff, batch, grid_batch
             )
             grid_edge = grid_flat[grid_dst] - atom_coord[node_src]
             if grid_edge.shape[0] != 0:
@@ -416,7 +435,7 @@ class InfGCN(paddle.nn.Layer):
                 grid_edge_embed = soft_one_hot_linspace(
                     grid_len,
                     start=0.0,
-                    end=self.grid_cutoff,
+                    end=self.atom_grid_cutoff,
                     number=self.radial_embed_size,
                     basis="gaussian",
                     cutoff=False,

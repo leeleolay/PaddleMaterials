@@ -26,7 +26,7 @@ from ppmat.utils.io import write_cube
 
 class _FieldModel:
     target_name = "density"
-    cutoff = 3.0
+    atom_graph_cutoff = 3.0
 
     def __call__(self, batch, return_loss=True, return_prediction=True):
         self.forward_flags = (return_loss, return_prediction)
@@ -219,7 +219,7 @@ def test_field_predictor_requires_graph_cutoff_to_match_model(monkeypatch):
         ),
     )
 
-    with pytest.raises(ValueError, match="model cutoff"):
+    with pytest.raises(ValueError, match="atom_graph_cutoff"):
         FieldPredictor(config_path="unused", checkpoint_path="unused")
 
 

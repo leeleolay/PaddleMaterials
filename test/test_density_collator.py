@@ -29,7 +29,7 @@ def _sample(density, grid_coord=None, sample_id="sample"):
         num_nodes=2,
         node_feat={
             "x": np.asarray([0, 0], dtype=np.int64),
-            "pos": np.asarray(
+            "cart_coords": np.asarray(
                 [[0.0, 0.0, 0.0], [0.8, 0.0, 0.0]],
                 dtype=np.float32,
             ),
@@ -75,10 +75,10 @@ def _infgcn(target_name="density", pbc=False):
         radial_hidden_size=4,
         num_radial_layer=1,
         num_gcn_layer=1,
-        cutoff=2.0,
-        grid_cutoff=2.0,
-        residual=True,
-        pbc=pbc,
+        atom_graph_cutoff=2.0,
+        atom_grid_cutoff=2.0,
+        residual=not pbc,
+        periodic_mode=("official" if pbc else "none"),
         target_name=target_name,
     )
 
@@ -197,7 +197,7 @@ def test_density_collator_mask_uses_lengths_not_density_values():
     assert isinstance(batch["density_mask"], np.ndarray)
     assert isinstance(batch["grid_coord"], np.ndarray)
     assert isinstance(batch["graph"].node_feat["x"], np.ndarray)
-    assert isinstance(batch["graph"].node_feat["pos"], np.ndarray)
+    assert isinstance(batch["graph"].node_feat["cart_coords"], np.ndarray)
     np.testing.assert_array_equal(batch["graph"].graph_node_id, [0, 0, 1, 1])
     assert batch["graph"].edges.shape == (4, 2)
     np.testing.assert_array_equal(batch["density_mask"], [[1, 1], [1, 0]])
@@ -212,7 +212,7 @@ def test_pgl_batches_graphs_without_edges():
             num_nodes=num_nodes,
             node_feat={
                 "x": np.zeros([num_nodes], dtype=np.int64),
-                "pos": np.zeros([num_nodes, 3], dtype=np.float32),
+                "cart_coords": np.zeros([num_nodes, 3], dtype=np.float32),
             },
         )
         for num_nodes in [1, 2]
@@ -260,7 +260,7 @@ def test_density_collator_batch_runs_infgcn_forward_and_backward(through_dataloa
             num_nodes=2,
             node_feat={
                 "x": np.asarray([0, 0], dtype=np.int64),
-                "pos": np.asarray(
+                "cart_coords": np.asarray(
                     [[0.0, 0.0, 0.0], [0.8, 0.0, 0.0]],
                     dtype=np.float32,
                 ),
@@ -316,8 +316,8 @@ def test_density_collator_batch_runs_infgcn_forward_and_backward(through_dataloa
             radial_hidden_size=4,
             num_radial_layer=1,
             num_gcn_layer=1,
-            cutoff=2.0,
-            grid_cutoff=2.0,
+            atom_graph_cutoff=2.0,
+            atom_grid_cutoff=2.0,
             residual=True,
         )
 
@@ -396,26 +396,7 @@ def test_infgcn_uses_batched_cell_for_periodic_inputs(monkeypatch):
     assert list(output["pred_dict"]["density"].shape) == [2, 1]
 
 
-def test_infgcn_truncates_cached_edges_in_forward(monkeypatch):
-    from ppmat.models.infgcn import infgcn as infgcn_module
-
-    calls = []
-    original = infgcn_module.randomly_truncate_neighbors
-
-    def record_call(edge_index, max_num_neighbors=32, sort_by_source=False):
-        calls.append((edge_index.shape[1], max_num_neighbors, sort_by_source))
-        return original(edge_index, max_num_neighbors, sort_by_source)
-
-    monkeypatch.setattr(infgcn_module, "randomly_truncate_neighbors", record_call)
-    batch = _as_model_batch(DensityCollator()([_sample([0.1])]))
-
-    _infgcn()(batch, return_loss=False)
-
-    assert calls == [(2, 32, True)]
-
-
-def test_infgcn_preserves_random_max_32_atom_neighbor_truncation(monkeypatch):
-    from ppmat.datasets.graph_utils import infgcn_graph_utils
+def test_radius_converter_deterministically_keeps_nearest_32_neighbors():
     from ppmat.models.common.graph_converter import RadiusGraphConverter
 
     positions = np.zeros([41, 3], dtype=np.float32)
@@ -426,24 +407,21 @@ def test_infgcn_preserves_random_max_32_atom_neighbor_truncation(monkeypatch):
         inclusive_cutoff=True,
         atom_vocab={},
         include_distance=False,
+        max_num_neighbors=32,
     ).from_arrays(
         np.ones([41], dtype=np.int64),
         positions,
     )
 
-    def deterministic_randperm(count):
-        return paddle.arange(count - 1, -1, -1, dtype="int64")
-
-    monkeypatch.setattr(paddle, "randperm", deterministic_randperm)
-    candidate_edges = paddle.to_tensor(graph.edges).transpose([1, 0])
-    actual = infgcn_graph_utils.randomly_truncate_neighbors(
-        candidate_edges, sort_by_source=True
-    )
-    expected = []
-    for source in range(41):
-        targets = [target for target in range(41) if target != source]
-        expected.extend((source, target) for target in targets[8:])
-    expected = np.asarray(expected, dtype=np.int64).T
-
-    assert actual.shape == [2, 41 * 32]
-    np.testing.assert_array_equal(actual.numpy(), expected)
+    edges = np.asarray(graph.edges, dtype=np.int64)
+    assert edges.shape == (41 * 32, 2)
+    for target in range(41):
+        sources = edges[edges[:, 1] == target, 0]
+        expected = sorted(
+            (source for source in range(41) if source != target),
+            key=lambda source: (
+                abs(positions[source, 0] - positions[target, 0]),
+                source,
+            ),
+        )[:32]
+        np.testing.assert_array_equal(sources, expected)

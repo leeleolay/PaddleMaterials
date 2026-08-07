@@ -504,8 +504,12 @@ class RadiusGraphConverter:
         add_self_loops: Whether to add self-loop edges.
         edge_mode: ``"directed"``, ``"undirected"``, or ``"bidirectional"``.
         include_distance: Whether to include distance in PGL edge features.
-        include_direction: Whether to include unit direction in PGL edge features.
+        include_bond_vec: Whether to include Cartesian bond vectors in PGL edge
+            features.
         return_triplet_indices: Whether to cache SphereNet triplet indices.
+        max_num_neighbors: Maximum incoming neighbors retained per atom. Neighbors
+            are selected deterministically by distance and source index. ``None``
+            keeps every neighbor inside ``cutoff``.
         num_cpus: Number of CPUs for parallel graph construction.
         coordinate_unit: Optional expected unit for input positions. When
             omitted, processed coordinates are consumed without unit checks.
@@ -522,8 +526,9 @@ class RadiusGraphConverter:
         add_self_loops: bool = False,
         edge_mode: str = "bidirectional",
         include_distance: bool = True,
-        include_direction: bool = False,
+        include_bond_vec: bool = False,
         return_triplet_indices: bool = False,
+        max_num_neighbors: Optional[int] = None,
         num_cpus: Optional[int] = None,
         coordinate_unit: Optional[str] = None,
         inclusive_cutoff: bool = False,
@@ -541,14 +546,19 @@ class RadiusGraphConverter:
             raise ValueError(f"Unknown edge_mode: {edge_mode}")
         if not isinstance(inclusive_cutoff, bool):
             raise TypeError("inclusive_cutoff must be a boolean.")
+        if max_num_neighbors is not None and int(max_num_neighbors) <= 0:
+            raise ValueError("max_num_neighbors must be positive or None.")
 
         self.cutoff = float(cutoff)
         self.atom_vocab = dict(atom_vocab)
         self.add_self_loops = add_self_loops
         self.edge_mode = edge_mode
         self.include_distance = include_distance
-        self.include_direction = include_direction
+        self.include_bond_vec = include_bond_vec
         self.return_triplet_indices = return_triplet_indices
+        self.max_num_neighbors = (
+            None if max_num_neighbors is None else int(max_num_neighbors)
+        )
         self.num_cpus = 1 if num_cpus is None else int(num_cpus)
         self.coordinate_unit = (
             normalize_coordinate_unit(coordinate_unit)
@@ -770,12 +780,23 @@ class RadiusGraphConverter:
         directions = displacement[targets, sources]
         directions = directions / np.maximum(distances, 1e-8)
 
-        order = np.argsort(
-            edge_index[1] * max(1, num_nodes) + edge_index[0], kind="mergesort"
-        )
+        # Sort by (target, distance, source), then retain the nearest neighbors.
+        # The deterministic tie-break keeps cached graphs reproducible.
+        order = np.lexsort((edge_index[0], distances.reshape(-1), edge_index[1]))
         edge_index = edge_index[:, order]
         distances = distances[order].astype(np.float32)
         directions = directions[order].astype(np.float32)
+        if self.max_num_neighbors is not None:
+            target_counts = np.zeros(num_nodes, dtype=np.int64)
+            keep = np.zeros(edge_index.shape[1], dtype=bool)
+            for edge_id, target in enumerate(edge_index[1]):
+                target = int(target)
+                if target_counts[target] < self.max_num_neighbors:
+                    keep[edge_id] = True
+                    target_counts[target] += 1
+            edge_index = edge_index[:, keep]
+            distances = distances[keep]
+            directions = directions[keep]
         return edge_index, distances, directions
 
     def get_node_feat(
@@ -783,8 +804,8 @@ class RadiusGraphConverter:
     ) -> Dict[str, np.ndarray]:
         atomic_numbers = np.asarray(atomic_numbers, dtype=np.int64)
         node_feat = {
-            "pos": positions.astype(np.float32),
-            "atomic_number": atomic_numbers.reshape(-1, 1),
+            "cart_coords": positions.astype(np.float32),
+            "atom_types": atomic_numbers,
         }
 
         idxs = []
@@ -813,11 +834,13 @@ class RadiusGraphConverter:
         edge_feat = {}
         edge_feats = []
         if self.include_distance:
-            edge_feat["distance"] = distances
+            edge_feat["bond_dist"] = distances.reshape(-1)
             edge_feats.append(distances)
-        if self.include_direction:
-            edge_feat["direction"] = directions
-            edge_feats.append(directions)
+        if self.include_bond_vec:
+            bond_vec = directions * distances
+            edge_feat["bond_vec"] = bond_vec
+            edge_feats.append(bond_vec)
+        edge_feat["num_edges"] = np.asarray([edge_index.shape[1]], dtype=np.int64)
         if edge_feats:
             edge_feat["feat"] = np.concatenate(edge_feats, axis=-1).astype(np.float32)
         if triplet_indices is not None:

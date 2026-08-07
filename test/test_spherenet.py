@@ -82,7 +82,7 @@ def test_radius_graph_from_arrays_matches_rdkit_and_merges_node_features():
             "positions": positions,
         }
     )
-    converter = RadiusGraphConverter(cutoff=2.0)
+    converter = RadiusGraphConverter(cutoff=2.0, include_bond_vec=True)
 
     molecule_graph = converter(molecule)
     array_graph = converter.from_arrays(
@@ -94,14 +94,20 @@ def test_radius_graph_from_arrays_matches_rdkit_and_merges_node_features():
 
     np.testing.assert_array_equal(array_graph.edges, molecule_graph.edges)
     np.testing.assert_allclose(
-        array_graph.node_feat["pos"],
-        molecule_graph.node_feat["pos"],
+        array_graph.node_feat["cart_coords"],
+        molecule_graph.node_feat["cart_coords"],
     )
     np.testing.assert_array_equal(
-        array_graph.node_feat["atomic_number"],
-        molecule_graph.node_feat["atomic_number"],
+        array_graph.node_feat["atom_types"],
+        molecule_graph.node_feat["atom_types"],
     )
     np.testing.assert_array_equal(array_graph.node_feat["x"], [1, 2, 3])
+    assert set(array_graph.node_feat) >= {"atom_types", "cart_coords", "x"}
+    assert set(array_graph.edge_feat) >= {"bond_dist", "bond_vec", "num_edges"}
+    np.testing.assert_allclose(
+        np.linalg.norm(array_graph.edge_feat["bond_vec"], axis=1),
+        array_graph.edge_feat["bond_dist"],
+    )
 
 
 def test_radius_graph_from_cvve_and_pymatgen_structures():
@@ -120,7 +126,7 @@ def test_radius_graph_from_cvve_and_pymatgen_structures():
     )
 
     np.testing.assert_array_equal(cvve_graph.edges, [[1, 0], [0, 1]])
-    np.testing.assert_array_equal(cvve_graph.node_feat["atomic_number"], [[6], [8]])
+    np.testing.assert_array_equal(cvve_graph.node_feat["atom_types"], [6, 8])
     np.testing.assert_array_equal(cvve_graph.node_feat["x"], [0, 1])
 
     pymatgen_structure = PymatgenStructure(
@@ -135,7 +141,7 @@ def test_radius_graph_from_cvve_and_pymatgen_structures():
 
     np.testing.assert_array_equal(pymatgen_graph.edges, [[1, 0], [0, 1]])
     np.testing.assert_allclose(
-        pymatgen_graph.node_feat["pos"],
+        pymatgen_graph.node_feat["cart_coords"],
         [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
     )
 
@@ -182,11 +188,11 @@ def test_radius_graph_from_structures_preserves_order_and_empty_input():
 
     assert len(graphs) == 2
     np.testing.assert_array_equal(
-        graphs[0].node_feat["atomic_number"].reshape(-1),
+        graphs[0].node_feat["atom_types"].reshape(-1),
         [6, 8],
     )
     np.testing.assert_array_equal(
-        graphs[1].node_feat["atomic_number"].reshape(-1),
+        graphs[1].node_feat["atom_types"].reshape(-1),
         [1, 8],
     )
     assert converter.from_structures(()) == []
@@ -456,7 +462,7 @@ def test_radius_graph_uses_edges_as_endpoint_indices():
         "idx_kj": graph.edge_feat["ti_idx_kj"].astype("int64"),
         "idx_ji": graph.edge_feat["ti_idx_ji"].astype("int64"),
     }
-    result = compute_geometry(graph.node_feat["pos"], edge_index, triplet_indices)
+    result = compute_geometry(graph.node_feat["cart_coords"], edge_index, triplet_indices)
     np.testing.assert_array_equal(result[3].numpy(), edge_index[1].numpy())
     np.testing.assert_array_equal(result[4].numpy(), edge_index[0].numpy())
 
@@ -530,7 +536,7 @@ def test_geometry_components_match_angle_and_torsion_definitions():
     graph = RadiusGraphConverter(cutoff=5.0, return_triplet_indices=True)(
         molecule
     ).tensor()
-    pos = graph.node_feat["pos"]
+    pos = graph.node_feat["cart_coords"]
     edge_index = paddle.transpose(graph.edges.astype("int64"), [1, 0])
     triplet_indices = {
         key: graph.edge_feat[f"ti_{key}"].astype("int64")

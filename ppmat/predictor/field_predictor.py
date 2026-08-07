@@ -321,13 +321,18 @@ class FieldPredictor(BasePredictor):
                 "Predict.build_graph_cfg must build an array-compatible graph "
                 "converter."
             )
-        model_cutoff = getattr(self.model, "cutoff", model_config.get("cutoff"))
+        model_cutoff = getattr(
+            self.model,
+            "atom_graph_cutoff",
+            model_config.get("atom_graph_cutoff"),
+        )
         if model_cutoff is not None and not np.isclose(
             self.graph_converter_fn.cutoff,
             float(model_cutoff),
         ):
             raise ValueError(
-                "Predict build_graph_cfg cutoff must match the model cutoff."
+                "Predict build_graph_cfg cutoff must match the model "
+                "atom_graph_cutoff."
             )
         if self.field_converter.name != self.target_name:
             raise ValueError(
@@ -500,7 +505,7 @@ class FieldPredictor(BasePredictor):
             raise ValueError("The last dimension of grid_coord must be 3.")
 
         atom_types = to_numpy(_graph_node_feature(graph, "x")).reshape(-1)
-        atom_coord = to_numpy(_graph_node_feature(graph, "pos"))
+        atom_coord = to_numpy(_graph_node_feature(graph, "cart_coords"))
         if atom_types.shape[0] != atom_coord.shape[0] or atom_coord.ndim != 2:
             raise ValueError("Graph atom types and positions are inconsistent.")
         if atom_coord.shape[1] != 3:
@@ -846,7 +851,7 @@ class FieldPredictor(BasePredictor):
         save_true_cube,
     ):
         atom_type = to_numpy(_graph_node_feature(graph, "x")).reshape(-1)
-        atom_coord = to_numpy(_graph_node_feature(graph, "pos"))
+        atom_coord = to_numpy(_graph_node_feature(graph, "cart_coords"))
         cube_info = prepare_cube_info(
             info,
             grid_coord,
@@ -900,7 +905,7 @@ class FieldPredictor(BasePredictor):
         prediction = to_numpy(prediction)
         shape = info.get("shape")
         atom_type = to_numpy(_graph_node_feature(graph, "x")).reshape(-1)
-        atom_coord = to_numpy(_graph_node_feature(graph, "pos"))
+        atom_coord = to_numpy(_graph_node_feature(graph, "cart_coords"))
         shape = shape if shape is None else [int(size) for size in shape]
         saved_paths = []
 

@@ -39,6 +39,7 @@ def _build_graph_cfg(cutoff):
         "__class_name__": "RadiusGraphConverter",
         "__init_params__": {
             "cutoff": cutoff,
+            "max_num_neighbors": 32,
             "inclusive_cutoff": True,
             "include_distance": False,
         },
@@ -523,7 +524,7 @@ def test_field_predictor_from_data_uses_standard_batch_contract():
         edges=np.asarray([[0, 1], [1, 0]], dtype=np.int64),
         node_feat={
             "x": np.asarray([0, 1], dtype=np.int64),
-            "pos": np.zeros([2, 3], dtype=np.float32),
+            "cart_coords": np.zeros([2, 3], dtype=np.float32),
         },
     )
     grid_coord = np.asarray(
@@ -553,7 +554,7 @@ def test_field_predictor_from_data_uses_standard_batch_contract():
     np.testing.assert_allclose(with_reference["density"].numpy(), [0, 1, 2, 3])
     np.testing.assert_allclose(with_reference["grid_coord"].numpy(), grid_coord)
     assert isinstance(graph.node_feat["x"], np.ndarray)
-    assert isinstance(graph.node_feat["pos"], np.ndarray)
+    assert isinstance(graph.node_feat["cart_coords"], np.ndarray)
     np.testing.assert_array_equal(graph.graph_node_id, [0, 0])
     assert with_reference["info"]["shape"] == [2, 2, 1]
     assert with_reference["loss"] == pytest.approx(0.375)
@@ -715,7 +716,7 @@ def test_reference_cube_coordinates_require_matching_atom_order():
         edges=np.asarray([[0, 1], [1, 0]], dtype=np.int64),
         node_feat={
             "x": np.asarray([0, 1], dtype=np.int64),
-            "pos": np.zeros([2, 3], dtype=np.float32),
+            "cart_coords": np.zeros([2, 3], dtype=np.float32),
         },
     )
     graph_converter = RadiusGraphConverter(
@@ -737,8 +738,8 @@ def test_reference_cube_coordinates_require_matching_atom_order():
         "sample.mol",
         graph_converter,
     )
-    assert isinstance(graph.node_feat["pos"], np.ndarray)
-    np.testing.assert_allclose(graph.node_feat["pos"], reference_coord)
+    assert isinstance(graph.node_feat["cart_coords"], np.ndarray)
+    np.testing.assert_allclose(graph.node_feat["cart_coords"], reference_coord)
 
     reference_info["atom_numbers"] = np.asarray([1, 6])
     with pytest.raises(ValueError, match="Atom order"):
@@ -846,8 +847,7 @@ def test_all_infgcn_configs_are_parseable_and_complete():
         "num_spherical",
         "radial_embed_size",
         "radial_hidden_size",
-        "cutoff",
-        "grid_cutoff",
+        "atom_graph_cutoff",
     }
     expected_dataset_classes = {
         "infgcn_qm9": "QM9DensityDataset",
@@ -880,10 +880,22 @@ def test_all_infgcn_configs_are_parseable_and_complete():
         dataset_format = expected_dataset_formats.get(config_path.stem, "fft")
         expected_field_cfg = _build_field_cfg(dataset_format)
         assert cfg["Global"]["build_field_cfg"] == expected_field_cfg
-        graph_cutoff = 6.0 if config_path.stem == "infgcn_omol25_MC_5k_trimmed" else 3.0
+        if config_path.stem == "infgcn_omol25_MC_5k_trimmed":
+            graph_cutoff = 6.0
+        elif config_path.stem == "infgcn_mp":
+            graph_cutoff = 5.0
+        else:
+            graph_cutoff = 3.0
         expected_graph_cfg = _build_graph_cfg(graph_cutoff)
         assert cfg["Global"]["build_graph_cfg"] == expected_graph_cfg
-        assert cfg["Model"]["__init_params__"]["cutoff"] == graph_cutoff
+        model_params = cfg["Model"]["__init_params__"]
+        assert model_params["atom_graph_cutoff"] == graph_cutoff
+        if model_params["residual"]:
+            assert model_params["atom_grid_cutoff"] == graph_cutoff
+            assert model_params["periodic_mode"] == "none"
+        else:
+            assert "atom_grid_cutoff" not in model_params
+            assert model_params["periodic_mode"] == "official"
 
         dataset_cfg = cfg["Dataset"]
         for split in ["train", "val", "test"]:
@@ -1021,12 +1033,12 @@ def test_infgcn_bundled_molecule_builds_inference_grid():
     )
 
     assert isinstance(graph.node_feat["x"], np.ndarray)
-    assert isinstance(graph.node_feat["pos"], np.ndarray)
+    assert isinstance(graph.node_feat["cart_coords"], np.ndarray)
     assert isinstance(grid_coord, np.ndarray)
     assert isinstance(info["cell"], np.ndarray)
     assert isinstance(info["origin"], np.ndarray)
     assert graph.node_feat["x"].shape == (5,)
-    assert graph.node_feat["pos"].shape == (5, 3)
+    assert graph.node_feat["cart_coords"].shape == (5, 3)
     assert density is None
     assert grid_coord.shape == (512, 3)
     assert info["shape"] == [8, 8, 8]
@@ -1079,8 +1091,8 @@ def test_infgcn_molecule_grid_always_uses_angstrom():
     )
 
     np.testing.assert_allclose(
-        graph_bohr.node_feat["pos"],
-        graph_ang.node_feat["pos"],
+        graph_bohr.node_feat["cart_coords"],
+        graph_ang.node_feat["cart_coords"],
     )
     np.testing.assert_allclose(grid_bohr, grid_ang, rtol=1e-6, atol=1e-6)
     np.testing.assert_allclose(info_bohr["cell"], info_ang["cell"])

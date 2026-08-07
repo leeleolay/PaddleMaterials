@@ -335,7 +335,7 @@ def test_density_dataset_reads_shared_cube_from_lz4(tmp_path):
     info = sample["info"]
 
     assert isinstance(graph.node_feat["x"], np.ndarray)
-    assert isinstance(graph.node_feat["pos"], np.ndarray)
+    assert isinstance(graph.node_feat["cart_coords"], np.ndarray)
     assert isinstance(density, np.ndarray)
     assert isinstance(grid_coord, np.ndarray)
     np.testing.assert_array_equal(graph.node_feat["x"], [0])
