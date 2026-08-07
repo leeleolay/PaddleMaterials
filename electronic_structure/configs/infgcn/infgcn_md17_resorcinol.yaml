@@ -59,8 +59,8 @@ Trainer:
 
   # best metric indicator, you can choose from "train_loss", "eval_loss", "train_metric", "eval_metric"
   best_metric_indicator: 'eval_loss' # "train_loss", "eval_loss", "train_metric", "eval_metric"
-  # The name of the best metric, since you may have multiple metrics, such as "mae", "rmse", "mape"
-  name_for_best_metric: "loss"
+  # Select the best checkpoint by InfGCN normalized MAE from loss_dict.
+  name_for_best_metric: "mae"
   # The metric whether is better when it is greater
   greater_is_better: False
 
