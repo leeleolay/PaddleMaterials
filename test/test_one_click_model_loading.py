@@ -819,13 +819,15 @@ def test_prepare_cube_info_preserves_explicit_geometry_with_singleton_axis():
 
 
 def test_electronic_structure_models_use_builtin_scatter():
-    for relative_path in [
-        "ppmat/models/infgcn/infgcn.py",
-        "ppmat/models/mateno/mateno.py",
-    ]:
-        source = (ROOT / relative_path).read_text()
-        assert "from paddle_scatter import scatter" not in source
-        assert "from ppmat.utils.scatter import scatter" in source
+    infgcn_source = (ROOT / "ppmat/models/infgcn/infgcn.py").read_text()
+    mateno_source = (ROOT / "ppmat/models/mateno/mateno.py").read_text()
+
+    assert "from paddle_scatter import scatter" not in infgcn_source
+    assert "paddle.scatter_nd_add" in infgcn_source
+    assert "from ppmat.utils.scatter import scatter" not in infgcn_source
+
+    assert "from paddle_scatter import scatter" not in mateno_source
+    assert "from ppmat.utils.scatter import scatter" in mateno_source
 
 
 def test_all_infgcn_configs_are_parseable_and_complete():
@@ -946,7 +948,16 @@ def test_all_infgcn_configs_are_parseable_and_complete():
                     "overwrite",
                 }
                 assert init_params["overwrite"] is False
-            assert init_params["grid_sampler_cfg"]["n_samples"] > 0, config_path.name
+            if split == "test" and config_path.stem != "infgcn_omol25_MC_5k_trimmed":
+                # Paper metrics are computed over every grid point. The model
+                # chunks the full grid at inference time to bound memory use.
+                assert "grid_sampler_cfg" not in init_params, config_path.name
+            else:
+                assert init_params["grid_sampler_cfg"]["n_samples"] > 0
+            if split in {"train", "val"} and config_path.stem != (
+                "infgcn_omol25_MC_5k_trimmed"
+            ):
+                assert init_params["grid_sampler_cfg"]["sampling_mode"] == "random"
             if config_path.stem == "infgcn_omol25_MC_5k_trimmed" and split in {
                 "val",
                 "test",

@@ -95,7 +95,8 @@ class DensityDataset(paddle.io.Dataset):
             self.cache_path = cache_path
         else:
             self.cache_path = osp.join(
-                osp.split(path)[0] + "_cache", osp.splitext(osp.basename(path))[0]
+                osp.split(path)[0] + "_cache",
+                f"{osp.splitext(osp.basename(path))[0]}_{split}",
             )
         logger.info(f"Cache path: {self.cache_path}")
 

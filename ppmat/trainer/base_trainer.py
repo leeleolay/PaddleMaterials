@@ -100,6 +100,8 @@ class BaseTrainer:
         self.log_freq = config["log_freq"]
         self.start_eval_epoch = config["start_eval_epoch"]
         self.eval_freq = config["eval_freq"]
+        self.eval_freq_steps = config.get("eval_freq_steps")
+        self.save_freq_steps = config.get("save_freq_steps")
         self.seed = config["seed"]
         self.pretrained_model_path = config.get("pretrained_model_path", None)
         self.pretrained_weight_name = config.get("pretrained_weight_name", None)
@@ -491,7 +493,11 @@ class BaseTrainer:
 
         return batch_size
 
-    def train_epoch(self, dataloader: paddle.io.DataLoader):
+    def train_epoch(
+        self,
+        dataloader: paddle.io.DataLoader,
+        val_dataloader: Optional[paddle.io.DataLoader] = None,
+    ):
         """Train program for one epoch.
         Args:
             dataloader (paddle.io.DataLoader): The dataloader used for training.
@@ -649,6 +655,80 @@ class BaseTrainer:
             if self.lr_scheduler is not None and not self.lr_scheduler.by_epoch:
                 self.lr_scheduler.step()
 
+            if (
+                val_dataloader is not None
+                and self.eval_freq_steps
+                and self.state.global_step % self.eval_freq_steps == 0
+            ):
+                eval_time_info, eval_loss_info, eval_metric_info = self.eval_epoch(
+                    val_dataloader
+                )
+                eval_logs = OrderedDict()
+                for name, meter in eval_time_info.items():
+                    eval_logs[name] = meter.avg
+                for name, meter in eval_loss_info.items():
+                    eval_logs[name + "(loss)"] = meter.avg
+                for name, meter in eval_metric_info.items():
+                    eval_logs[name + "(metric)"] = meter.avg
+                logger.info(
+                    "Eval: Step [%d] | %s",
+                    self.state.global_step,
+                    " | ".join(
+                        f"{key}: {value:.6f}" for key, value in eval_logs.items()
+                    ),
+                )
+                if self._determine_best_metric(
+                    loss_info, metric_info, eval_loss_info, eval_metric_info
+                ):
+                    save_load.save_checkpoint(
+                        self.model,
+                        self.optimizer,
+                        self.state.to_dict(),
+                        self.scaler,
+                        output_dir=self.output_dir,
+                        prefix="best",
+                    )
+                if self.lr_scheduler is not None and self.lr_scheduler.by_epoch:
+                    if isinstance(self.lr_scheduler, ReduceOnPlateau):
+                        indicator_groups = {
+                            "train_loss": loss_info,
+                            "train_metric": metric_info,
+                            "eval_loss": eval_loss_info,
+                            "eval_metric": eval_metric_info,
+                        }
+                        if self.lr_scheduler.indicator not in indicator_groups:
+                            raise ValueError(
+                                "Unsupported lr scheduler indicator: "
+                                f"{self.lr_scheduler.indicator}"
+                            )
+                        indicator_value = indicator_groups[
+                            self.lr_scheduler.indicator
+                        ][self.lr_scheduler.indicator_name].avg
+                        self.lr_scheduler.step(metrics=indicator_value)
+                    else:
+                        self.lr_scheduler.step()
+                save_load.save_checkpoint(
+                    self.model,
+                    self.optimizer,
+                    self.state.to_dict(),
+                    self.scaler,
+                    output_dir=self.output_dir,
+                    prefix="latest",
+                )
+                if (
+                    self.save_freq_steps
+                    and self.state.global_step % self.save_freq_steps == 0
+                ):
+                    save_load.save_checkpoint(
+                        self.model,
+                        self.optimizer,
+                        self.state.to_dict(),
+                        self.scaler,
+                        output_dir=self.output_dir,
+                        prefix=f"step_{self.state.global_step}",
+                    )
+                self.model.train()
+
             batch_tic = time.perf_counter()
             reader_tic = time.perf_counter()
         return time_info, loss_info, metric_info
@@ -722,7 +802,7 @@ class BaseTrainer:
             self.state.epoch += 1
             # train one epoch
             train_time_info, train_loss_info, train_metric_info = self.train_epoch(
-                train_dataloader
+                train_dataloader, val_dataloader
             )
 
             # stream metric lightweight hook
@@ -787,9 +867,12 @@ class BaseTrainer:
 
             # evaluate model when epoch is divisible by eval_freq
             if (
-                self.state.epoch % self.config["eval_freq"] == 0
-                or self.state.epoch == self.config["max_epochs"]
-                or self.state.epoch == 1
+                self.eval_freq_steps is None
+                and (
+                    self.state.epoch % self.config["eval_freq"] == 0
+                    or self.state.epoch == self.config["max_epochs"]
+                    or self.state.epoch == 1
+                )
             ) and val_dataloader is not None:
 
                 eval_time_info, eval_loss_info, eval_metric_info = self.eval_epoch(
@@ -832,8 +915,14 @@ class BaseTrainer:
             else:
                 eval_loss_info, eval_metric_info = None, None
             # save best model when best_metric is better than previous best_metric
-            save_best_flag = self._determine_best_metric(
-                train_loss_info, train_metric_info, eval_loss_info, eval_metric_info
+            save_best_flag = (
+                self.eval_freq_steps is None
+                and self._determine_best_metric(
+                    train_loss_info,
+                    train_metric_info,
+                    eval_loss_info,
+                    eval_metric_info,
+                )
             )
             if save_best_flag:
                 save_load.save_checkpoint(
@@ -845,7 +934,11 @@ class BaseTrainer:
                     prefix="best",
                 )
             # update learning rate by epoch
-            if self.lr_scheduler is not None and self.lr_scheduler.by_epoch:
+            if (
+                self.eval_freq_steps is None
+                and self.lr_scheduler is not None
+                and self.lr_scheduler.by_epoch
+            ):
                 if isinstance(self.lr_scheduler, ReduceOnPlateau):
                     if self.lr_scheduler.indicator == "train_loss":
                         indicator_value = train_loss_info[

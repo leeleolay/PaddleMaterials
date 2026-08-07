@@ -396,6 +396,25 @@ def test_infgcn_uses_batched_cell_for_periodic_inputs(monkeypatch):
     assert list(output["pred_dict"]["density"].shape) == [2, 1]
 
 
+def test_infgcn_chunks_full_grid_only_during_evaluation(monkeypatch):
+    model = _infgcn()
+    model.inference_grid_batch_size = 1
+    batch = _as_model_batch(DensityCollator()([_sample([0.1, 0.2])]))
+    chunk_sizes = []
+
+    def fake_forward(*args):
+        grid = args[3]
+        chunk_sizes.append(grid.shape[1])
+        return paddle.zeros(grid.shape[:2], dtype="float32")
+
+    monkeypatch.setattr(model, "_forward_density", fake_forward)
+    model.eval()
+    output = model(batch)
+
+    assert chunk_sizes == [1, 1]
+    assert list(output["pred_dict"]["density"].shape) == [1, 2]
+
+
 def test_radius_converter_deterministically_keeps_nearest_32_neighbors():
     from ppmat.models.common.graph_converter import RadiusGraphConverter
 

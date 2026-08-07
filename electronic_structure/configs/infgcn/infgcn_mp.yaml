@@ -17,9 +17,9 @@ Global:
 
 Trainer:
   # Max epochs to train
-  max_epochs: 2
+  max_epochs: 1000
   # Max iteration which equals to steps * epoches, to early stop
-  max_iter: 100000
+  max_iter: 10000
   # Random seed
   seed: 42
   # Save path for checkpoints and logs
@@ -27,7 +27,9 @@ Trainer:
   # Save frequency [epoch], for example, save_freq=10 means save checkpoints every 10 epochs
   save_freq: 2000
   # Logging frequency [step], for example, log_freq=10 means log every 10 steps
-  log_freq: 1
+  log_freq: 10
+  eval_freq_steps: 100
+  save_freq_steps: 500
 
   # Start evaluation epoch, for example, start_eval_epoch=10 means start evaluation from epoch 10
   start_eval_epoch: 0
@@ -56,7 +58,7 @@ Trainer:
   # best metric indicator, you can choose from "train_loss", "eval_loss", "train_metric", "eval_metric"
   best_metric_indicator: 'eval_loss' # "train_loss", "eval_loss", "train_metric", "eval_metric"
   # The name of the best metric, since you may have multiple metrics, such as "mae", "rmse", "mape"
-  name_for_best_metric: "mae"
+  name_for_best_metric: "loss"
   # The metric whether is better when it is greater
   greater_is_better: False
 
@@ -84,18 +86,20 @@ Model:
     gauss_end: 5.0
     residual: false
     periodic_mode: official
+    inference_grid_batch_size: 4096
 
 Vocabulary: infgcn_mp
 
 Optimizer:
   __class_name__: Adam
+  clip_norm_global: 100.0
   __init_params__:
     lr:
       __class_name__: ReduceOnPlateau
       __init_params__:
-        learning_rate: 0.001
+        learning_rate: 0.005
         factor: 0.5
-        patience: 10
+        patience: 5
         min_lr: 0.00001
         by_epoch: True
         indicator: "eval_loss"
@@ -116,12 +120,13 @@ Dataset:
         overwrite: false
         grid_sampler_cfg:
           n_samples: 1024
+          sampling_mode: random
     sampler:
       __class_name__: BatchSampler
       __init_params__:
         shuffle: True
         drop_last: True
-        batch_size: 16
+        batch_size: 32
     loader:
       num_workers: 0
       use_shared_memory: False
@@ -136,13 +141,14 @@ Dataset:
         build_graph_cfg: ${Global.build_graph_cfg}
         overwrite: false
         grid_sampler_cfg:
-          n_samples: 4096
+          n_samples: 2048
+          sampling_mode: random
     sampler:
       __class_name__: BatchSampler
       __init_params__:
         shuffle: False
         drop_last: False
-        batch_size: 6 # recommend >2 <=6, on V100 16G GPU
+        batch_size: 32
     loader:
       num_workers: 0
       use_shared_memory: False
@@ -156,8 +162,6 @@ Dataset:
         build_field_cfg: ${Global.build_field_cfg}
         build_graph_cfg: ${Global.build_graph_cfg}
         overwrite: false
-        grid_sampler_cfg:
-          n_samples: 2048 # recommend removing grid_sampler_cfg if have enough gpu memory
     sampler:
       __class_name__: BatchSampler
       __init_params__:

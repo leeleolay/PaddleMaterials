@@ -106,6 +106,27 @@ the dataset `path` to a location visible to every rank.
 
 ## Results
 
+### Paper reproduction target
+
+The QM9, MP cubic, and MD17 configs now follow the optimization and evaluation
+protocol in the [original InfGCN implementation](https://github.com/ccr-cheng/InfGCN-pytorch):
+random grid sampling for training and validation, validation and
+`ReduceLROnPlateau` updates by optimizer step, global gradient clipping at 100,
+and full-grid test NMAE with 4096-point inference chunks. The model has 1,200,464
+parameters, matching the 1.20M InfGCN(s7) model reported in the paper.
+
+The paper targets are 0.93% NMAE on unrotated QM9, 4.73% on rotated QM9, and
+8.98% on the cubic crystal dataset. MD17 results reported in the paper range
+from 5.11% to 10.34% across the six molecules. These are reproduction targets,
+not claimed Paddle results; a fresh end-to-end training run is required before
+recording aligned Paddle metrics.
+
+### Published Paddle checkpoints
+
+The checkpoint measurements below were produced before the paper-protocol
+alignment above. They remain useful for compatibility checks, but should not be
+compared directly with the paper until the checkpoints are retrained.
+
 <table>
     <thead>
         <tr>

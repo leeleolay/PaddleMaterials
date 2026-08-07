@@ -111,7 +111,7 @@ def _write_published_cache(
     if manifest_path is None:
         manifest_path = Path(root) / dataset_class.split_filename
     manifest_path = Path(manifest_path)
-    cache_path = Path(f"{manifest_path.parent}_cache") / manifest_path.stem
+    cache_path = Path(f"{manifest_path.parent}_cache") / f"{manifest_path.stem}_{split}"
     field_path = cache_path / "fields" / "0000000000.pkl"
     graph_path = cache_path / "graphs" / "0000000000.pkl"
     field_path.parent.mkdir(parents=True)

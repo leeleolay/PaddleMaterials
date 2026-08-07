@@ -21,7 +21,12 @@ from ppmat.models.common.e3nn import o3
 from ppmat.models.common.e3nn.math import soft_one_hot_linspace
 from ppmat.models.common.e3nn.nn import FullyConnectedNet
 from ppmat.models.common.orbital import GaussianOrbital
-from ppmat.utils.scatter import scatter
+
+
+def _scatter_sum(src, index, dim_size):
+    """Aggregate InfGCN messages with memory linear in the edge count."""
+    out = paddle.zeros([dim_size, *src.shape[1:]], dtype=src.dtype)
+    return paddle.scatter_nd_add(out, index.reshape([-1, 1]), src)
 
 
 class GCNLayer(paddle.nn.Layer):
@@ -124,9 +129,7 @@ class GCNLayer(paddle.nn.Layer):
             node_feat[src], edge_feat, weight=weight
         )  # Tensor Product [num_edges, tp.irreps_out.dim]
 
-        out = scatter(
-            out, dst, dim=0, dim_size=dim_size, reduce="sum"
-        )  # message aggregation
+        out = _scatter_sum(out, dst, dim_size)  # message aggregation
 
         if self.use_sc:
             out = out + self.sc(node_feat)
@@ -164,6 +167,7 @@ class InfGCN(paddle.nn.Layer):
         activation="norm",
         residual=True,
         periodic_mode="none",
+        inference_grid_batch_size=None,
         target_name="density",
         loss_eps=1e-8,
         **kwargs,
@@ -192,6 +196,9 @@ class InfGCN(paddle.nn.Layer):
         :param residual: whether to use the residue prediction layer
         :param periodic_mode: ``"none"`` for molecular data or ``"official"``
             for the original periodic InfGCN orbital minimum-image convention
+        :param inference_grid_batch_size: optional number of grid points evaluated
+            per chunk in evaluation mode; predictions are concatenated before
+            computing metrics so full-grid NMAE keeps the paper's definition
         """
         super(InfGCN, self).__init__()
         self.vocab = vocab
@@ -228,6 +235,7 @@ class InfGCN(paddle.nn.Layer):
                 "The official periodic InfGCN configuration requires residual=False."
             )
         self.periodic_mode = periodic_mode
+        self.inference_grid_batch_size = inference_grid_batch_size
         self.target_name = target_name
         self.loss_eps = loss_eps
         assert activation in ["scalar", "norm"]
@@ -308,14 +316,31 @@ class InfGCN(paddle.nn.Layer):
         cell = self._prepare_cell(info)
 
         # Predict the field independently of target availability.
-        pred = self._forward_density(
-            atom_types,
-            atom_coord,
-            atom_edges,
-            grid,
-            graph_batch,
-            cell,
-        )
+        chunk_size = self.inference_grid_batch_size
+        if not self.training and chunk_size and grid.shape[1] > chunk_size:
+            pred = paddle.concat(
+                [
+                    self._forward_density(
+                        atom_types,
+                        atom_coord,
+                        atom_edges,
+                        grid[:, start : start + chunk_size],
+                        graph_batch,
+                        cell,
+                    )
+                    for start in range(0, grid.shape[1], chunk_size)
+                ],
+                axis=1,
+            )
+        else:
+            pred = self._forward_density(
+                atom_types,
+                atom_coord,
+                atom_edges,
+                grid,
+                graph_batch,
+                cell,
+            )
 
         # Mask padded grid positions consistently for loss and prediction.
         masked_pred = pred
@@ -418,7 +443,10 @@ class InfGCN(paddle.nn.Layer):
 
         n_graph, n_sample = grid.shape[0], grid.shape[1]
         if self.residual:
-            grid_flat = grid.view(-1, 3)
+            # Grid chunks are sliced along the point axis and may be
+            # non-contiguous. ``reshape`` supports both contiguous full grids
+            # and these evaluation-only slices.
+            grid_flat = grid.reshape([-1, 3])
             grid_batch = paddle.arange(end=n_graph).repeat_interleave(repeats=n_sample)
             grid_dst, node_src = radius(
                 atom_coord, grid_flat, self.atom_grid_cutoff, batch, grid_batch
@@ -465,7 +493,9 @@ class InfGCN(paddle.nn.Layer):
         density = (orbital * feat.unsqueeze(axis=1)).sum(
             axis=-1
         )  # linear combination [n_atom, n_grid]
-        density = scatter(density, batch, dim=0, reduce="sum")  # molecular/cell density
+        density = _scatter_sum(
+            density, batch, int(batch.max()) + 1
+        )  # molecular/cell density
 
         if self.residual:
             density = density + residue.view(*tuple(density.shape))
