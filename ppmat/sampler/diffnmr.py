@@ -133,10 +133,12 @@ class DiffNMRSampler:
         set_signal_handlers()
         sample_loader = build_dataloader(config["Sampler"]["data"], vocab=self.vocab)
 
-        # Build dataset infos without constructing full train/val/test dataloaders.
+        # Dataset statistics are computed from the configured training split on
+        # first use and reused from its cache afterwards.
+        train_loader = build_dataloader(config["Dataset"]["train"], vocab=self.vocab)
         dataset_info_config = copy.deepcopy(config)
         dataset_infos = build_dataset_infos(
-            dataloaders=None,
+            dataloaders={"train": train_loader},
             cfg=dataset_info_config,
             vocab=self.vocab,
             recompute_statistics=False,

@@ -90,14 +90,13 @@ def test_identity_fixes_the_draw_when_not_resampling_each_epoch():
     assert not np.array_equal(first, other_index)
 
 
-@pytest.mark.parametrize("importance_sampling", [False, True])
-def test_fixed_draw_is_reproducible_for_every_mode(importance_sampling):
+@pytest.mark.parametrize("sampling_mode", ["random", "importance"])
+def test_fixed_draw_is_reproducible_for_every_mode(sampling_mode):
     params = {
         "n_samples": 8,
-        "sampling_mode": "random",
+        "sampling_mode": sampling_mode,
         "sampling_seed": 2026,
         "resample_each_epoch": False,
-        "importance_sampling": importance_sampling,
     }
     density = np.linspace(0.0, 1.0, 20, dtype=np.float32)
 
@@ -188,7 +187,7 @@ def test_extreme_ratio_above_importance_ratio_stays_within_high_quota():
     )
     sampler = DensityGridSampler(
         n_samples=10,
-        importance_sampling=True,
+        sampling_mode="importance",
         importance_threshold=1e-5,
         extreme_threshold=0.5,
         importance_ratio=0.2,
@@ -206,7 +205,7 @@ def test_importance_sampling_ranks_multi_channel_density_by_max_channel():
     density[5, 0] = 20.0
     sampler = DensityGridSampler(
         n_samples=2,
-        importance_sampling=True,
+        sampling_mode="importance",
         importance_threshold=1.0,
         importance_ratio=1.0,
         sampling_seed=1,
@@ -233,7 +232,7 @@ def test_importance_sampling_prefers_points_above_threshold():
     )
     sampler = DensityGridSampler(
         n_samples=10,
-        importance_sampling=True,
+        sampling_mode="importance",
         importance_threshold=1.0,
         importance_ratio=1.0,
         sampling_seed=5,
@@ -284,7 +283,7 @@ def test_importance_sampling_fills_high_quota_when_extreme_points_dominate():
     )
     sampler = DensityGridSampler(
         n_samples=20,
-        importance_sampling=True,
+        sampling_mode="importance",
         importance_threshold=0.5,
         importance_ratio=0.8,
         extreme_threshold=0.5,

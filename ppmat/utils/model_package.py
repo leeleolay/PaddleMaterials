@@ -16,20 +16,7 @@ from pathlib import Path
 
 
 def resolve_model_package_dir(model_name: str, extracted_path: str) -> str:
-    """Resolve a downloaded model package without recursively guessing its layout.
-
-    A package must use one of the two layouts produced by the shared downloader:
-
-    .. code-block:: text
-
-        <extracted_path>/<model_name>.yaml
-
-    or:
-
-    .. code-block:: text
-
-        <extracted_path>/<model_name>/<model_name>.yaml
-    """
+    """Resolve either a flat or one-directory-deep model package."""
 
     root = Path(extracted_path)
     candidates = (root, root / model_name)
@@ -57,7 +44,7 @@ def resolve_model_package_dir(model_name: str, extracted_path: str) -> str:
 
 
 def get_model_config_path(model_name: str, package_dir: str) -> str:
-    """Return the required model-specific YAML path from a validated package."""
+    """Return the model YAML from a validated package."""
 
     package_path = Path(package_dir)
     matches = [

@@ -20,7 +20,7 @@ from ase.units import Bohr
 from ppmat.datasets.build_field import BuildField
 from ppmat.models.common.graph_converter import RadiusGraphConverter
 from ppmat.predictor import FieldPredictor
-from ppmat.predictor.field_io import read_cube_density
+from ppmat.predictor.field_predictor import read_cube_density
 from ppmat.utils.io import write_cube
 
 
@@ -85,12 +85,11 @@ def _build_field_cfg(
     }
 
 
-def _build_graph_cfg(coordinate_unit="angstrom"):
+def _build_graph_cfg():
     return {
         "__class_name__": "RadiusGraphConverter",
         "__init_params__": {
             "cutoff": 3.0,
-            "coordinate_unit": coordinate_unit,
             "inclusive_cutoff": True,
             "atom_vocab": {},
             "include_distance": False,
@@ -118,7 +117,7 @@ def test_field_predictor_builds_configured_fields(monkeypatch):
         coordinate_unit="angstrom",
     )
     assert isinstance(predictor.graph_converter_fn, RadiusGraphConverter)
-    assert predictor.graph_converter_fn.coordinate_unit == "angstrom"
+    assert not hasattr(predictor.graph_converter_fn, "coordinate_unit")
     assert not hasattr(predictor, "grid_converter")
 
 

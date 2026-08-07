@@ -20,9 +20,9 @@ import types
 from types import SimpleNamespace
 
 import numpy as np
-import paddle
 import pandas as pd
 import pgl
+import pytest
 
 _threebody = types.ModuleType("ppmat.models.mattersim.threebody_indices")
 _threebody.compute_threebody = lambda *args, **kwargs: None
@@ -162,7 +162,7 @@ def test_infos_cache_training_statistics(tmp_path):
     assert second.n_nodes[2].item() == 1
 
 
-def test_release_statistics_support_loader_free_sampling():
+def test_loader_free_sampling_requires_cached_statistics():
     atom_tokens = ["C", "N", "O", "F", "P", "S", "Cl", "Br", "I"]
     release_vocab = vocab()
     release_vocab["atom"] = {
@@ -171,15 +171,12 @@ def test_release_statistics_support_loader_free_sampling():
         "id_to_token": dict(enumerate(atom_tokens)),
     }
 
-    infos = MSDnmrinfos(
-        SimpleNamespace(train_dataloader=None),
-        infos_config(),
-        release_vocab,
-    )
-
-    assert infos.atom_decoder == atom_tokens
-    assert infos.max_n_nodes == 15
-    assert paddle.isclose(infos.n_nodes.sum(), paddle.to_tensor(1.0))
+    with pytest.raises(FileNotFoundError, match="provide the training loader"):
+        MSDnmrinfos(
+            SimpleNamespace(train_dataloader=None),
+            infos_config(),
+            release_vocab,
+        )
 
 
 def test_nless25_uses_matching_download_directory():

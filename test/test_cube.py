@@ -224,7 +224,7 @@ def test_cube_builder_parses_lz4_path(tmp_path):
 
 
 def test_cube_builder_preserves_atomic_numbers_beyond_cvve_symbol_table(tmp_path):
-    from ppmat.predictor.field_io import read_cube_density
+    from ppmat.predictor.field_predictor import read_cube_density
 
     path = tmp_path / "metal.cube"
     values = _cube_values("angstrom")
@@ -321,7 +321,6 @@ def test_density_dataset_reads_shared_cube_from_lz4(tmp_path):
             "__class_name__": "RadiusGraphConverter",
             "__init_params__": {
                 "cutoff": 3.0,
-                "coordinate_unit": "bohr",
                 "inclusive_cutoff": True,
                 "atom_vocab": {},
                 "include_distance": False,

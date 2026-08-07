@@ -167,7 +167,6 @@ class InfGCN(paddle.nn.Layer):
         activation="norm",
         residual=True,
         periodic_mode="none",
-        inference_grid_batch_size=None,
         inference_grid_point_budget=None,
         max_inference_grid_chunk_size=None,
         target_name="density",
@@ -196,11 +195,8 @@ class InfGCN(paddle.nn.Layer):
         :param activation: activation type for the InfGCN layer, can be
             ['scalar', 'norm']
         :param residual: whether to use the residue prediction layer
-        :param periodic_mode: ``"none"`` for molecular data or ``"official"``
-            for the original periodic InfGCN orbital minimum-image convention
-        :param inference_grid_batch_size: optional number of grid points evaluated
-            per chunk in evaluation mode. This is retained as a legacy fixed-size
-            fallback when ``inference_grid_point_budget`` is not set
+        :param periodic_mode: ``"none"`` for molecular data or
+            ``"minimum_image"`` for periodic orbital minimum-image vectors
         :param inference_grid_point_budget: optional maximum total number of grid
             points decoded by one evaluation chunk across the whole batch
         :param max_inference_grid_chunk_size: optional per-sample cap applied to
@@ -227,23 +223,13 @@ class InfGCN(paddle.nn.Layer):
         self.gauss_end = gauss_end
         self.activation = activation
         self.residual = residual
-        if periodic_mode not in {"none", "official", "periodic_graph"}:
+        if periodic_mode not in {"none", "minimum_image"}:
+            raise ValueError("periodic_mode must be 'none' or 'minimum_image'.")
+        if periodic_mode == "minimum_image" and residual:
             raise ValueError(
-                "periodic_mode must be 'none', 'official', or 'periodic_graph'."
-            )
-        if periodic_mode == "periodic_graph":
-            raise NotImplementedError(
-                "periodic_graph requires periodic bond vectors and is not part of "
-                "the original InfGCN reproduction contract."
-            )
-        if periodic_mode == "official" and residual:
-            raise ValueError(
-                "The official periodic InfGCN configuration requires residual=False."
+                "The minimum-image periodic configuration requires residual=False."
             )
         self.periodic_mode = periodic_mode
-        self.inference_grid_batch_size = self._validate_optional_positive_int(
-            inference_grid_batch_size, "inference_grid_batch_size"
-        )
         self.inference_grid_point_budget = self._validate_optional_positive_int(
             inference_grid_point_budget, "inference_grid_point_budget"
         )
@@ -433,8 +419,6 @@ class InfGCN(paddle.nn.Layer):
             if self.max_inference_grid_chunk_size is not None:
                 chunk_size = min(chunk_size, self.max_inference_grid_chunk_size)
         else:
-            chunk_size = self.inference_grid_batch_size
-        if chunk_size is None:
             return None
         return min(chunk_size, int(num_grid_points))
 
@@ -484,15 +468,7 @@ class InfGCN(paddle.nn.Layer):
         return feat
 
     def _decode_grid_chunk(self, feat, atom_coord, grid, batch, cell):
-        """Decode one grid chunk from atom features shared across chunks.
-
-        :param feat: encoded atom features of (N, irreps_feat.dim)
-        :param atom_coord: atom coordinates of (N, 3)
-        :param grid: coordinates at grid points of (G, K, 3)
-        :param batch: batch index for each node of (N,)
-        :param cell: optional batched cell vectors of (G, 3, 3)
-        :return: predicted value at each grid point of (G, K)
-        """
+        """Decode one grid chunk from shared atom features."""
 
         n_graph, n_sample = grid.shape[0], grid.shape[1]
         if self.residual:
@@ -507,8 +483,8 @@ class InfGCN(paddle.nn.Layer):
                 batch,
                 grid_batch,
             )
-            if atom_grid_edges.shape[1] != 0:
-                node_src, grid_dst = atom_grid_edges
+            if atom_grid_edges.shape[0] != 0:
+                node_src, grid_dst = atom_grid_edges.transpose([1, 0])
                 grid_edge = grid_flat[grid_dst] - atom_coord[node_src]
                 grid_len = paddle.linalg.norm(x=grid_edge, axis=-1) + 1e-08
                 grid_edge_feat = o3.spherical_harmonics(

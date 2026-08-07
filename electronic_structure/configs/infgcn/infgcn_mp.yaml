@@ -13,7 +13,7 @@ Global:
   build_field_cfg:
     format: json
     name: density
-    num_cpus: 1
+    num_cpus: 10
   cache_num_workers: 8
 
 Trainer:
@@ -86,7 +86,9 @@ Model:
     gauss_start: 0.5
     gauss_end: 5.0
     residual: false
-    periodic_mode: official
+    # Reproduce the paper's periodic orbital minimum-image convention.
+    periodic_mode: minimum_image
+    # Evaluation decoder memory limits: total points per batch and per-sample cap.
     inference_grid_point_budget: 65536
     max_inference_grid_chunk_size: 20000
 
@@ -94,7 +96,6 @@ Vocabulary: infgcn_mp
 
 Optimizer:
   __class_name__: Adam
-  clip_norm_global: 100.0
   __init_params__:
     lr:
       __class_name__: ReduceOnPlateau
@@ -109,6 +110,7 @@ Optimizer:
     weight_decay: 0.0
     beta1: 0.9
     beta2: 0.999
+  clip_norm_global: 100.0
 
 Dataset:
   train:

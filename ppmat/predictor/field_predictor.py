@@ -31,15 +31,60 @@ from ppmat.datasets.build_field import BuildField
 from ppmat.datasets.build_molecule import BuildMolecule
 from ppmat.models import build_graph_converter
 from ppmat.predictor.base import BasePredictor
-from ppmat.predictor.field_io import prepare_cube_info
-from ppmat.predictor.field_io import read_cube_density
-from ppmat.predictor.field_io import to_numpy
-from ppmat.predictor.field_io import write_cube_from_atom_types
 from ppmat.utils import logger
+from ppmat.utils.crystal import atomic_number_from_symbol
+from ppmat.utils.io import write_cube
 from ppmat.utils.misc import set_random_seed
 from ppmat.utils.visualization import draw_volume
 from ppmat.utils.visualization import maybe_downsample_volume
 from ppmat.utils.visualization import safe_write_image
+
+
+def to_numpy(value):
+    return (
+        value.detach().cpu().numpy()
+        if isinstance(value, paddle.Tensor)
+        else np.asarray(value)
+    )
+
+
+def read_cube_density(path, field_converter):
+    field = BuildField(
+        format="cube",
+        name=field_converter.name,
+        value_unit=field_converter.value_unit,
+    )(path, validate_coordinate_unit=False)
+    grid = field.grid
+    structure = field.structure
+    return (
+        np.asarray(field.flat, dtype=np.float32),
+        np.asarray(grid.cartesian_coordinates(), dtype=np.float32),
+        {
+            "shape": list(grid.shape),
+            "cell": np.asarray(grid.cell_vectors, dtype=np.float32),
+            "origin": np.asarray(grid.origin, dtype=np.float32),
+            "atom_numbers": np.asarray(
+                [atomic_number_from_symbol(symbol) for symbol in structure.symbols],
+                dtype=np.int64,
+            ),
+            "atom_coord_ref": np.asarray(
+                structure.cartesian_positions(), dtype=np.float32
+            ),
+            "coordinate_unit": grid.length_unit,
+            "density_unit": grid.value_unit,
+        },
+    )
+
+
+def write_cube_from_atom_types(
+    destination, atom_type, atom_coord, density, info, idx2atom_num
+):
+    atom_numbers = np.asarray(
+        [idx2atom_num[int(atom)] for atom in to_numpy(atom_type).reshape(-1)],
+        dtype=np.int64,
+    )
+    write_cube(destination, atom_numbers, to_numpy(atom_coord), to_numpy(density), info)
+
 
 def _as_paddle_tensor(value, dtype):
     if isinstance(value, paddle.Tensor):
@@ -130,7 +175,6 @@ def use_reference_atom_coordinates(
     return graph_converter.from_arrays(
         expected_atom_numbers,
         reference_atom_coord,
-        coordinate_unit=reference_info["coordinate_unit"],
         node_features={
             "x": to_numpy(_graph_node_feature(graph, "x")).reshape(-1),
         },
@@ -220,7 +264,6 @@ def build_mol_sample(
     g = graph_converter.from_arrays(
         atom_numbers,
         atom_coord_np,
-        coordinate_unit=coordinate_unit,
         node_features={"x": np.asarray(atom_type_idx, dtype=np.int64)},
     )
     if g is None:
@@ -852,11 +895,7 @@ class FieldPredictor(BasePredictor):
     ):
         atom_type = to_numpy(_graph_node_feature(graph, "x")).reshape(-1)
         atom_coord = to_numpy(_graph_node_feature(graph, "cart_coords"))
-        cube_info = prepare_cube_info(
-            info,
-            grid_coord,
-            self.field_converter,
-        )
+        cube_info = info
         saved_paths = {}
 
         prediction_path = output_dir / f"{sample_tag}_pred.cube"

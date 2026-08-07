@@ -35,7 +35,6 @@ from rdkit import Chem
 from ppmat.utils import logger
 from ppmat.utils.crystal import atomic_number_from_symbol
 from ppmat.utils.crystal import lattice_params_to_matrix
-from ppmat.utils.crystal import normalize_coordinate_unit
 
 
 def _build_crystal_pgl_graph(
@@ -498,7 +497,7 @@ class RadiusGraphConverter:
     atomic arrays and cvve/pymatgen structures.
 
     Args:
-        cutoff: Neighbor cutoff distance in ``coordinate_unit``.
+        cutoff: Neighbor cutoff distance in the processed coordinates.
         atom_vocab: Mapping from atomic number to feature index for optional PGL
             node features.
         add_self_loops: Whether to add self-loop edges.
@@ -511,8 +510,6 @@ class RadiusGraphConverter:
             are selected deterministically by distance and source index. ``None``
             keeps every neighbor inside ``cutoff``.
         num_cpus: Number of CPUs for parallel graph construction.
-        coordinate_unit: Optional expected unit for input positions. When
-            omitted, processed coordinates are consumed without unit checks.
         inclusive_cutoff: Whether atom pairs exactly at ``cutoff`` are connected.
         vocab: Optional Dataset vocabulary. Its
             ``atom.atomic_number_to_id`` mapping overrides ``atom_vocab`` and
@@ -530,7 +527,6 @@ class RadiusGraphConverter:
         return_triplet_indices: bool = False,
         max_num_neighbors: Optional[int] = None,
         num_cpus: Optional[int] = None,
-        coordinate_unit: Optional[str] = None,
         inclusive_cutoff: bool = False,
         vocab: Optional[Dict] = None,
     ) -> None:
@@ -546,9 +542,6 @@ class RadiusGraphConverter:
             raise ValueError(f"Unknown edge_mode: {edge_mode}")
         if not isinstance(inclusive_cutoff, bool):
             raise TypeError("inclusive_cutoff must be a boolean.")
-        if max_num_neighbors is not None and int(max_num_neighbors) <= 0:
-            raise ValueError("max_num_neighbors must be positive or None.")
-
         self.cutoff = float(cutoff)
         self.atom_vocab = dict(atom_vocab)
         self.add_self_loops = add_self_loops
@@ -560,11 +553,6 @@ class RadiusGraphConverter:
             None if max_num_neighbors is None else int(max_num_neighbors)
         )
         self.num_cpus = 1 if num_cpus is None else int(num_cpus)
-        self.coordinate_unit = (
-            normalize_coordinate_unit(coordinate_unit)
-            if coordinate_unit is not None
-            else None
-        )
         self.inclusive_cutoff = inclusive_cutoff
 
     def __call__(
@@ -596,14 +584,12 @@ class RadiusGraphConverter:
         return self.from_arrays(
             atomic_numbers,
             positions,
-            coordinate_unit="angstrom",
         )
 
     def from_arrays(
         self,
         atomic_numbers: np.ndarray,
         positions: np.ndarray,
-        coordinate_unit: Optional[str] = None,
         node_features: Optional[Dict[str, np.ndarray]] = None,
     ) -> Optional[pgl.Graph]:
         """Build a radius graph from atomic numbers and Cartesian positions.
@@ -611,37 +597,12 @@ class RadiusGraphConverter:
         Args:
             atomic_numbers: Atomic numbers with shape ``[num_nodes]``.
             positions: Cartesian positions with shape ``[num_nodes, 3]``.
-            coordinate_unit: Unit of ``positions``. When omitted, the converter's
-                configured unit is assumed.
             node_features: Additional per-node arrays merged into
                 ``graph.node_feat``.
         """
 
-        if coordinate_unit is not None and self.coordinate_unit is not None:
-            coordinate_unit = normalize_coordinate_unit(coordinate_unit)
-            if coordinate_unit != self.coordinate_unit:
-                raise ValueError(
-                    f"Atomic positions use {coordinate_unit!r}, but the graph "
-                    f"converter expects {self.coordinate_unit!r}."
-                )
-
         atomic_numbers = np.asarray(atomic_numbers, dtype=np.int64)
         positions = np.asarray(positions, dtype=np.float32)
-        if positions.ndim != 2 or positions.shape[1] != 3:
-            raise ValueError(
-                "positions must have shape [num_nodes, 3], but got "
-                f"{positions.shape}."
-            )
-        if atomic_numbers.shape[0] != positions.shape[0]:
-            raise ValueError(
-                "atomic_numbers and positions must contain the same number of "
-                f"nodes, but got {atomic_numbers.shape[0]} and "
-                f"{positions.shape[0]}."
-            )
-
-        num_nodes = positions.shape[0]
-        if num_nodes == 0:
-            return None
 
         edge_index, distances, directions = self.get_radius_edges(positions)
         triplet_indices = None
@@ -656,14 +617,9 @@ class RadiusGraphConverter:
             triplet_indices,
         )
         if node_features is not None:
-            for name, feature in node_features.items():
-                feature = np.asarray(feature)
-                if feature.ndim == 0 or feature.shape[0] != num_nodes:
-                    raise ValueError(
-                        f"Node feature {name!r} must have leading dimension "
-                        f"{num_nodes}, but got {feature.shape}."
-                    )
-                graph.node_feat[name] = feature
+            graph.node_feat.update(
+                {name: np.asarray(feature) for name, feature in node_features.items()}
+            )
         return graph
 
     def from_structure(
@@ -681,14 +637,12 @@ class RadiusGraphConverter:
             return self.from_arrays(
                 atomic_numbers,
                 structure.cartesian_positions(),
-                coordinate_unit=structure.position_unit,
                 node_features=node_features,
             )
         if isinstance(structure, Structure):
             return self.from_arrays(
                 np.asarray(structure.atomic_numbers, dtype=np.int64),
                 structure.cart_coords,
-                coordinate_unit="angstrom",
                 node_features=node_features,
             )
         raise TypeError(

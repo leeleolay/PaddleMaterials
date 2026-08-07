@@ -30,7 +30,7 @@ def _build_field_cfg(format, name="density"):
     return {
         "format": format,
         "name": name,
-        "num_cpus": 1,
+        "num_cpus": 10,
     }
 
 
@@ -229,7 +229,7 @@ def test_diffnmr_train_smiles_downloads_registered_asset(monkeypatch, tmp_path):
     np.testing.assert_array_equal(train_smiles, expected_smiles)
 
 
-def test_diffnmr_dataset_infos_can_skip_train_smiles_without_local_dataset():
+def test_diffnmr_dataset_infos_require_statistics_or_training_loader():
     import pytest
 
     from ppmat.datasets.msd_nmr_dataset import MSDnmrinfos
@@ -261,20 +261,12 @@ def test_diffnmr_dataset_infos_can_skip_train_smiles_without_local_dataset():
         "load_train_smiles": False,
     }
 
-    dataset_infos = MSDnmrinfos(
-        dataloaders=SimpleNamespace(train_dataloader=None),
-        cfg=cfg,
-        vocab=vocab,
-    )
-
-    assert not hasattr(dataset_infos, "train_smiles")
-    assert callable(dataset_infos.load_train_smiles)
-    assert dataset_infos.atom_decoder == atom_tokens
-    assert dataset_infos.seq_len_H1 == 20
-    assert dataset_infos.seq_len_C13 == 75
-    assert dataset_infos.max_n_nodes == 15
-    assert float(dataset_infos.n_nodes.sum()) == pytest.approx(1.0)
-    assert float(dataset_infos.valency_distribution.sum()) == pytest.approx(1.0)
+    with pytest.raises(FileNotFoundError, match="provide the training loader"):
+        MSDnmrinfos(
+            dataloaders=SimpleNamespace(train_dataloader=None),
+            cfg=cfg,
+            vocab=vocab,
+        )
 
 
 def test_diffnmr_sampling_loads_train_smiles_only_for_novelty(monkeypatch):
@@ -389,12 +381,11 @@ def test_field_predictor_is_shared_predictor_entrypoint():
     assert "from ppmat.datasets import DensityDataset" not in entry_source
 
 
-def test_field_predictor_reuses_base_and_keeps_helpers_outside_predictor():
+def test_field_predictor_reuses_base_and_core_io():
     field_source = (ROOT / "ppmat/predictor/field_predictor.py").read_text()
     io_source = (ROOT / "ppmat/utils/io.py").read_text()
     build_field_source = (ROOT / "ppmat/datasets/build_field.py").read_text()
     dataset_source = (ROOT / "ppmat/datasets/density_dataset.py").read_text()
-    field_io_source = (ROOT / "ppmat/predictor/field_io.py").read_text()
     visualization_source = (ROOT / "ppmat/utils/visualization.py").read_text()
 
     assert "from ppmat.predictor.base import BasePredictor" in field_source
@@ -406,29 +397,24 @@ def test_field_predictor_reuses_base_and_keeps_helpers_outside_predictor():
     assert not (ROOT / "ppmat/utils/field.py").exists()
     assert not (ROOT / "ppmat/utils/cube.py").exists()
     assert not (ROOT / "ppmat/datasets/_field_source.py").exists()
-    assert (ROOT / "ppmat/predictor/field_io.py").exists()
+    assert not (ROOT / "ppmat/predictor/field_io.py").exists()
     assert not (ROOT / "ppmat/utils/field_visualization.py").exists()
 
     for helper_name in [
         "draw_volume",
         "safe_write_image",
         "maybe_downsample_volume",
-        "read_cube_density",
-        "write_cube_from_atom_types",
-        "prepare_cube_info",
     ]:
-        assert f"def {helper_name}" not in field_source
+        assert f"def {helper_name}" in visualization_source
 
     for helper_name in [
         "read_cube_density",
         "write_cube_from_atom_types",
-        "prepare_cube_info",
     ]:
-        assert f"def {helper_name}" in field_io_source
+        assert f"def {helper_name}" in field_source
         assert f"def {helper_name}" not in io_source
 
     assert "def write_cube(" in io_source
-    assert "def write_cube(" not in field_io_source
     assert "def read_cube(" not in io_source
     assert "ase_write(" in io_source
     assert (
@@ -441,7 +427,6 @@ def test_field_predictor_reuses_base_and_keeps_helpers_outside_predictor():
     assert "from cvve import GridField" in build_field_source
 
     assert "OUTER LOOP" not in io_source
-    assert "OUTER LOOP" not in field_io_source
     assert "OUTER LOOP" not in dataset_source
     assert "cvve.read_grid_field" in build_field_source
     assert "from cvve" not in dataset_source
@@ -577,7 +562,7 @@ def test_field_cube_io_round_trip(tmp_path):
     from ase.units import Bohr
 
     from ppmat.datasets.build_field import BuildField
-    from ppmat.predictor.field_io import read_cube_density
+    from ppmat.predictor.field_predictor import read_cube_density
     from ppmat.utils.io import write_cube
 
     cube_path = tmp_path / "density.cube"
@@ -623,7 +608,7 @@ def test_field_cube_io_preserves_bohr_axis_sign(tmp_path):
     import numpy as np
 
     from ppmat.datasets.build_field import BuildField
-    from ppmat.predictor.field_io import read_cube_density
+    from ppmat.predictor.field_predictor import read_cube_density
     from ppmat.utils.io import write_cube
 
     cube_path = tmp_path / "density_bohr.cube"
@@ -723,7 +708,6 @@ def test_reference_cube_coordinates_require_matching_atom_order():
     )
     graph_converter = RadiusGraphConverter(
         cutoff=10.0,
-        coordinate_unit="angstrom",
         atom_vocab={},
     )
     reference_coord = np.asarray([[1, 2, 3], [4, 5, 6]], dtype=np.float32)
@@ -754,82 +738,12 @@ def test_reference_cube_coordinates_require_matching_atom_order():
         )
 
 
-def test_prepare_cube_info_preserves_explicit_geometry_with_singleton_axis():
-    import numpy as np
-    import paddle
-    import pytest
-
-    from ppmat.datasets.build_field import BuildField
-    from ppmat.predictor.field_io import prepare_cube_info
-
-    origin = np.asarray([0.5, 1.0, 1.5], dtype=np.float32)
-    shape = (2, 3, 1)
-    cell = np.asarray(
-        [[2.0, 0.0, 0.0], [0.6, 3.0, 0.0], [0.2, 0.4, 1.0]],
-        dtype=np.float32,
-    )
-    steps = cell / np.asarray(shape, dtype=np.float32)[:, None]
-    expected_grid = np.empty((*shape, 3), dtype=np.float32)
-    for i in range(shape[0]):
-        for j in range(shape[1]):
-            for k in range(shape[2]):
-                expected_grid[i, j, k] = (
-                    origin + i * steps[0] + j * steps[1] + k * steps[2]
-                )
-    grid = paddle.to_tensor(expected_grid.reshape(1, -1, 3))
-
-    info = prepare_cube_info(
-        {
-            "shape": list(shape),
-            "cell": cell,
-            "origin": origin,
-            "coordinate_unit": "angstrom",
-            "density_unit": "electron/angstrom^3",
-        },
-        grid,
-        BuildField(
-            format="array",
-            name="density",
-            value_unit="electron/angstrom^3",
-            coordinate_unit="angstrom",
-        ),
-    )
-
-    np.testing.assert_allclose(info["origin"], origin)
-    np.testing.assert_allclose(info["cell"], cell)
-    assert info["coordinate_unit"] == "angstrom"
-
-    mismatched_grid = grid.clone()
-    mismatched_grid[..., 0] += 0.25
-    with pytest.raises(ValueError, match="grid coordinates do not match"):
-        prepare_cube_info(
-            {
-                "shape": list(shape),
-                "cell": cell,
-                "origin": origin,
-                "coordinate_unit": "angstrom",
-                "density_unit": "electron/angstrom^3",
-            },
-            mismatched_grid,
-            BuildField(
-                format="array",
-                name="density",
-                value_unit="electron/angstrom^3",
-                coordinate_unit="angstrom",
-            ),
-        )
-
-
 def test_electronic_structure_models_use_builtin_scatter():
     infgcn_source = (ROOT / "ppmat/models/infgcn/infgcn.py").read_text()
-    mateno_source = (ROOT / "ppmat/models/mateno/mateno.py").read_text()
 
     assert "from paddle_scatter import scatter" not in infgcn_source
     assert "paddle.scatter_nd_add" in infgcn_source
     assert "from ppmat.utils.scatter import scatter" not in infgcn_source
-
-    assert "from paddle_scatter import scatter" not in mateno_source
-    assert "from ppmat.utils.scatter import scatter" in mateno_source
 
 
 def test_all_infgcn_configs_are_parseable_and_complete():
@@ -902,7 +816,7 @@ def test_all_infgcn_configs_are_parseable_and_complete():
             assert model_params["periodic_mode"] == "none"
         else:
             assert "atom_grid_cutoff" not in model_params
-            assert model_params["periodic_mode"] == "official"
+            assert model_params["periodic_mode"] == "minimum_image"
 
         dataset_cfg = cfg["Dataset"]
         for split in ["train", "val", "test"]:
@@ -921,8 +835,10 @@ def test_all_infgcn_configs_are_parseable_and_complete():
             assert (
                 split_cfg["loader"]["collate_fn"] == "DensityCollator"
             ), config_path.name
-            if split in {"val", "test"}:
+            if split == "test":
                 assert split_cfg["sampler"]["__init_params__"]["shuffle"] is False
+            elif split == "val" and config_path.stem.startswith("infgcn_md17_"):
+                assert split_cfg["sampler"]["__init_params__"]["shuffle"] is True
             init_params = dataset["__init_params__"]
             unresolved_init_params = unresolved_cfg["Dataset"][split]["dataset"][
                 "__init_params__"
@@ -1048,7 +964,6 @@ def test_infgcn_bundled_molecule_builds_inference_grid():
         ),
         graph_converter=RadiusGraphConverter(
             cutoff=3.0,
-            coordinate_unit="angstrom",
             atom_vocab={},
         ),
     )
@@ -1163,19 +1078,12 @@ def test_cube_field_builder_preserves_geometry(tmp_path):
     assert field.grid.length_unit == "angstrom"
 
 
-def test_diffnmr_sample_readme_documents_one_click_sample_command():
+def test_diffnmr_sample_readme_keeps_original_command_format():
     readme = (ROOT / "spectrum_elucidation/configs/diffnmr/README.md").read_text()
     sample_csv = ROOT / "spectrum_elucidation/configs/diffnmr/example/sample.csv"
 
-    assert "--model_name='diffnmr_msdnmr_nless15'" in readme
-    assert "--weights_name='best.pdparams'" in readme
-    assert "bundled one-row validation example" in readme
-    assert "Sampler.data.dataset.__init_params__.path" in readme
-    assert (
-        "Sampler.data.dataset.__init_params__.path='./data/MSD_nmr/test.csv'" in readme
-    )
-    assert "### Sampling Sample" not in readme
-    assert "--checkpoint_path='./checkpoints'" in readme
+    assert "--config_path='spectrum_elucidation/configs/diffnmr/DiffNMR.yaml'" in readme
+    assert '--checkpoint_path="pretrained"' in readme
     assert sample_csv.exists()
     assert sample_csv.read_text().splitlines()[0] == "smiles,tokenized_input,atom_count"
     assert (
@@ -1198,10 +1106,10 @@ def test_diffnmr_package_sample_defaults_to_bundled_example():
     assert sampler_params["path"] == "./example/sample.csv"
     assert sampler_params["cache_path"] == "./output/diffnmr_example_cache"
     assert sampler_params["overwrite"] is True
-    assert config["Sampler"]["data"]["sampler"]["__init_params__"]["batch_size"] == 1
-    assert config["Sampler"]["sample_batch_iters"] == 1
-    assert config["Sampler"]["visual_num"] == 1
-    assert config["Sampler"]["chains_to_save"] == 0
+    assert config["Sampler"]["data"]["sampler"]["__init_params__"]["batch_size"] == 256
+    assert config["Sampler"]["sample_batch_iters"] == 100
+    assert config["Sampler"]["visual_num"] == 10
+    assert config["Sampler"]["chains_to_save"] == 5
 
 
 def test_molecular_sampler_entrypoint_keeps_diffnmr_imports_lazy():

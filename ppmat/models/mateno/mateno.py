@@ -13,15 +13,15 @@
 # limitations under the License.
 
 import paddle
+from paddle_scatter import scatter
 
-from ppmat.datasets.graph_utils.infgcn_graph_utils import radius
-from ppmat.datasets.graph_utils.infgcn_graph_utils import radius_graph
-from ppmat.models.common.activation import NormActivation
-from ppmat.models.common.activation import ScalarActivation
+from ppmat.datasets.graph_utils.infgcn_graph_utils import radius, radius_graph
+
 from ppmat.models.common.e3nn import o3
 from ppmat.models.common.e3nn.math import soft_one_hot_linspace
 from ppmat.models.common.orbital import BroadcastGTOTensor
-from ppmat.utils.scatter import scatter
+from ppmat.models.common.activation import ScalarActivation
+from ppmat.models.common.activation import NormActivation
 
 
 class LogGaussianOrbital(paddle.nn.Layer):
@@ -29,9 +29,7 @@ class LogGaussianOrbital(paddle.nn.Layer):
     Gaussian orbital with log-spaced bases for better multi-scale coverage.
     """
 
-    def __init__(
-        self, gauss_start: float, gauss_end: float, num_gauss: int, lmax: int = 7
-    ):
+    def __init__(self, gauss_start: float, gauss_end: float, num_gauss: int, lmax: int = 7):
         super().__init__()
         self.gauss_start = gauss_start
         self.gauss_end = gauss_end
@@ -140,10 +138,7 @@ class EnhancedGCNLayer(paddle.nn.Layer):
             paddle.nn.Silu(),
             *sum(
                 [
-                    [
-                        paddle.nn.Linear(radial_hidden_size, radial_hidden_size),
-                        paddle.nn.Silu(),
-                    ]
+                    [paddle.nn.Linear(radial_hidden_size, radial_hidden_size), paddle.nn.Silu()]
                     for _ in range(num_radial_layer - 1)
                 ],
                 [],
@@ -162,9 +157,7 @@ class EnhancedGCNLayer(paddle.nn.Layer):
             paddle.nn.Linear(radial_hidden_size, radial_hidden_size),
         )
         self.atom_edge_influence = paddle.nn.Sequential(
-            paddle.nn.Linear(
-                radial_hidden_size + radial_embed_size, radial_hidden_size
-            ),
+            paddle.nn.Linear(radial_hidden_size + radial_embed_size, radial_hidden_size),
             paddle.nn.Silu(),
             paddle.nn.Linear(radial_hidden_size, radial_hidden_size),
         )
@@ -189,9 +182,7 @@ class EnhancedGCNLayer(paddle.nn.Layer):
 
         if node_attrs is not None:
             atom_features = self.atom_attr_embedding(node_attrs)
-            atom_edge_features = paddle.concat(
-                x=[atom_features[src], edge_embed], axis=-1
-            )
+            atom_edge_features = paddle.concat(x=[atom_features[src], edge_embed], axis=-1)
             edge_modulation = self.atom_edge_influence(atom_edge_features)
             weight_scaling = self.weight_modulator(edge_modulation)
             adjusted_weights = base_weights * (1.0 + weight_scaling)
@@ -213,7 +204,7 @@ class MatENO(paddle.nn.Layer):
 
     def __init__(
         self,
-        vocab,
+        n_atom_type: int,
         num_radial: int,
         num_spherical: int,
         radial_embed_size: int,
@@ -231,14 +222,14 @@ class MatENO(paddle.nn.Layer):
         embedding_dim: int = 512,
         max_num_neighbors: int = 32,
         target_name: str = "density",
+        label_key: str = "density",
+        mask_key: str = "density_mask",
         loss_eps: float = 1e-8,
         **kwargs,
     ):
         super().__init__()
         assert activation in ["scalar", "norm"]
 
-        self.vocab = vocab
-        n_atom_type = vocab["atom"]["num_embeddings"]
         self.n_atom_type = n_atom_type
         self.num_radial = num_radial
         self.num_spherical = num_spherical
@@ -253,12 +244,12 @@ class MatENO(paddle.nn.Layer):
         self.pbc = pbc
         self.max_num_neighbors = max_num_neighbors
         self.target_name = target_name
+        self.label_key = label_key
+        self.mask_key = mask_key
         self.loss_eps = loss_eps
         self._criterion = paddle.nn.MSELoss(reduction="mean")
 
-        self.embedding = paddle.nn.Embedding(
-            num_embeddings=n_atom_type, embedding_dim=embedding_dim
-        )
+        self.embedding = paddle.nn.Embedding(num_embeddings=n_atom_type, embedding_dim=embedding_dim)
         self._init_embeddings()
 
         self.irreps_sh = o3.Irreps.spherical_harmonics(num_spherical, p=1)
@@ -282,11 +273,7 @@ class MatENO(paddle.nn.Layer):
         )
 
         self.act = (
-            ScalarActivation(
-                self.irreps_feat,
-                paddle.nn.functional.silu,
-                paddle.nn.functional.sigmoid,
-            )
+            ScalarActivation(self.irreps_feat, paddle.nn.functional.silu, paddle.nn.functional.sigmoid)
             if activation == "scalar"
             else NormActivation(self.irreps_feat)
         )
@@ -305,49 +292,33 @@ class MatENO(paddle.nn.Layer):
                 use_sc=False,
             )
 
-        self.orbital = LogGaussianOrbital(
-            gauss_start, gauss_end, num_radial, num_spherical
-        )
+        self.orbital = LogGaussianOrbital(gauss_start, gauss_end, num_radial, num_spherical)
 
     def _init_embeddings(self):
         paddle.nn.initializer.XavierUniform()(self.embedding.weight)
 
     def forward(self, *args, **kwargs):
-        return_loss = kwargs.pop("return_loss", True)
-        return_prediction = kwargs.pop("return_prediction", True)
         if len(args) == 1 and isinstance(args[0], dict):
-            return self._forward_with_batch(
-                args[0],
-                return_loss=return_loss,
-                return_prediction=return_prediction,
-            )
+            return self._forward_with_batch(args[0])
         return self._forward_density(*args, **kwargs)
 
-    def _forward_with_batch(
-        self,
-        batch,
-        return_loss=True,
-        return_prediction=True,
-    ):
-        assert (
-            return_loss or return_prediction
-        ), "At least one of return_loss or return_prediction must be True."
-
-        density = batch.get(self.target_name, None)
+    def _forward_with_batch(self, batch):
+        graph = batch["graph"]
+        density = batch.get(self.label_key, None)
         grid = batch["grid_coord"]
-        info = batch.get("info")
-        mask = batch.get("density_mask", None)
+        infos = batch.get("infos", None)
+        mask = batch.get(self.mask_key, None)
 
-        # PGL graphs travel through the DataLoader untouched, so the graph
-        # fields are converted here. ``tensor()`` is in-place and short-circuits
-        # when the graph already holds tensors.
-        graph = batch["graph"].tensor()
-        atom_types = graph.node_feat["x"]
-        atom_coord = graph.node_feat["pos"]
-        graph_batch = graph.graph_node_id.astype("int64")
-        cell = self._prepare_cell(info)
+        device = paddle.get_device()
+        graph = graph.to(device)
+        grid = grid.astype("float32").to(device)
+        if density is not None:
+            density = density.astype("float32").to(device)
+        if mask is not None:
+            mask = mask.astype("float32").to(device)
+        prepared_infos = self._prepare_infos(infos, device)
 
-        pred = self._forward_density(atom_types, atom_coord, grid, graph_batch, cell)
+        pred = self._forward_density(graph.x, graph.pos, grid, graph.batch, prepared_infos)
 
         loss_dict = {}
         masked_pred = pred
@@ -355,12 +326,7 @@ class MatENO(paddle.nn.Layer):
             mask = mask.astype(pred.dtype)
             masked_pred = pred * mask
 
-        if return_loss:
-            if density is None:
-                raise ValueError(
-                    f"data[{self.target_name!r}] must not be None when "
-                    "return_loss is True."
-                )
+        if density is not None:
             if mask is not None:
                 label_masked = density * mask
                 denom = paddle.sum(mask) + self.loss_eps
@@ -373,31 +339,29 @@ class MatENO(paddle.nn.Layer):
             loss_dict["loss"] = loss
             loss_dict["mae"] = mae
 
-        pred_dict = {}
-        if return_prediction:
-            pred_dict[self.target_name] = masked_pred
+        pred_dict = {self.target_name: masked_pred}
         return {"loss_dict": loss_dict, "pred_dict": pred_dict}
 
-    def _prepare_cell(self, info):
-        if not self.pbc:
+    def _prepare_infos(self, infos, device):
+        if infos is None:
             return None
-        if info is None or "cell" not in info:
-            raise KeyError("Periodic MatENO input requires info['cell'].")
-        cell = info["cell"]
-        if len(cell.shape) == 2:
-            cell = cell.unsqueeze(0)
-        if len(cell.shape) != 3 or list(cell.shape[-2:]) != [3, 3]:
-            raise ValueError(
-                "info['cell'] must have shape [batch_size, 3, 3], but got "
-                f"{list(cell.shape)}."
-            )
-        return cell
+        prepared_infos = []
+        for info in infos:
+            cur = dict(info) if isinstance(info, dict) else info
+            if isinstance(cur, dict) and "cell" in cur and hasattr(cur["cell"], "to"):
+                cur["cell"] = cur["cell"].to(device)
+            prepared_infos.append(cur)
+        return prepared_infos
 
-    def _forward_density(self, atom_types, atom_coord, grid, batch, cell):
+    def _forward_density(self, atom_types, atom_coord, grid, batch, infos):
+        cell = None
+        if infos is not None and len(infos) > 0:
+            first_info = infos[0]
+            if isinstance(first_info, dict) and "cell" in first_info:
+                cell = paddle.stack(x=[info["cell"] for info in infos], axis=0).astype(atom_coord.dtype)
+
         feat = self.embedding(atom_types)
-        node_attrs = paddle.nn.functional.one_hot(atom_types, self.n_atom_type).astype(
-            "float32"
-        )
+        node_attrs = paddle.nn.functional.one_hot(atom_types, self.n_atom_type).astype("float32")
 
         edge_index = radius_graph(
             atom_coord,
@@ -425,23 +389,14 @@ class MatENO(paddle.nn.Layer):
         ) * (self.radial_embed_size**0.5)
 
         for i, gcn in enumerate(self.gcns):
-            feat = gcn(
-                edge_index,
-                feat,
-                edge_feat,
-                edge_embed,
-                node_attrs,
-                dim_size=atom_types.shape[0],
-            )
+            feat = gcn(edge_index, feat, edge_feat, edge_embed, node_attrs, dim_size=atom_types.shape[0])
             if i != self.num_gcn_layer - 1:
                 feat = self.act(feat)
 
         n_graph, n_sample = grid.shape[0], grid.shape[1]
         if self.residual:
             grid_flat = grid.reshape([-1, 3])
-            grid_batch = paddle.arange(n_graph, dtype="int64").repeat_interleave(
-                repeats=n_sample
-            )
+            grid_batch = paddle.arange(n_graph, dtype="int64").repeat_interleave(repeats=n_sample)
             grid_dst, node_src = radius(
                 atom_coord,
                 grid_flat,

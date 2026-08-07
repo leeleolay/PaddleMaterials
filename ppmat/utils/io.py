@@ -55,18 +55,7 @@ def open_text(path: str | os.PathLike[str], mode: str = "rt") -> TextIO:
 def materialize_text_path(
     source: str | os.PathLike[str] | TextIO,
 ) -> Iterator[Path]:
-    """Yield a plain-text path for a path or text stream.
-
-    Plain files are yielded directly. Compressed files and text streams are
-    copied to a temporary file so path-only third-party parsers can consume
-    them. Temporary files are removed when the context exits.
-
-    Args:
-        source: Plain or compressed path, or an open text stream.
-
-    Yields:
-        A path suitable for path-only text parsers.
-    """
+    """Materialize compressed input or a text stream for path-only parsers."""
 
     if isinstance(source, (str, os.PathLike)):
         path = Path(source).expanduser()
@@ -74,13 +63,8 @@ def materialize_text_path(
             yield path
             return
         file_context = open_text(path)
-        restore_position = None
     else:
         file_context = nullcontext(source)
-        restore_position = None
-        if source.seekable():
-            restore_position = source.tell()
-            source.seek(0)
 
     temporary_path: Path | None = None
     try:
@@ -94,8 +78,6 @@ def materialize_text_path(
                 shutil.copyfileobj(file_obj, temporary_file)
         yield temporary_path
     finally:
-        if restore_position is not None:
-            source.seek(restore_position)
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
 

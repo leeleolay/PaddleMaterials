@@ -78,7 +78,7 @@ def _infgcn(target_name="density", pbc=False, **kwargs):
         atom_graph_cutoff=2.0,
         atom_grid_cutoff=2.0,
         residual=not pbc,
-        periodic_mode=("official" if pbc else "none"),
+        periodic_mode=("minimum_image" if pbc else "none"),
         target_name=target_name,
         **kwargs,
     )
@@ -458,7 +458,6 @@ def test_infgcn_chunked_decode_matches_full_grid_decode():
 @pytest.mark.parametrize(
     "name,value",
     [
-        ("inference_grid_batch_size", 0),
         ("inference_grid_point_budget", -1),
         ("max_inference_grid_chunk_size", True),
     ],
@@ -479,11 +478,11 @@ def test_atom_grid_radius_converter_uses_atom_to_grid_edge_order():
     atom_batch = paddle.zeros([2], dtype="int64")
     grid_batch = paddle.zeros([3], dtype="int64")
 
-    edge_index = AtomGridRadiusGraphConverter(cutoff=1.0)(
+    edges = AtomGridRadiusGraphConverter(cutoff=1.0)(
         atom_coord, grid_coord, atom_batch, grid_batch
     )
 
-    np.testing.assert_array_equal(edge_index.numpy(), [[0, 1], [0, 1]])
+    np.testing.assert_array_equal(edges.numpy(), [[0, 0], [1, 1]])
 
 
 def test_radius_converter_deterministically_keeps_nearest_32_neighbors():
@@ -493,7 +492,6 @@ def test_radius_converter_deterministically_keeps_nearest_32_neighbors():
     positions[:, 0] = np.arange(41, dtype=np.float32) * 0.01
     graph = RadiusGraphConverter(
         cutoff=1.0,
-        coordinate_unit="angstrom",
         inclusive_cutoff=True,
         atom_vocab={},
         include_distance=False,

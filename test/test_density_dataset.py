@@ -60,12 +60,11 @@ def _field_converter_cfg(
     }
 
 
-def _graph_converter_cfg(coordinate_unit, cutoff=3.0, num_cpus=1):
+def _graph_converter_cfg(cutoff=3.0, num_cpus=1):
     return {
         "__class_name__": "RadiusGraphConverter",
         "__init_params__": {
             "cutoff": cutoff,
-            "coordinate_unit": coordinate_unit,
             "inclusive_cutoff": True,
             "atom_vocab": {},
             "include_distance": False,
@@ -91,7 +90,7 @@ def _published_converter_kwargs(dataset_class):
         value_unit = "unknown"
     return {
         "vocab": _atom_vocab(),
-        "build_graph_cfg": _graph_converter_cfg(coordinate_unit),
+        "build_graph_cfg": _graph_converter_cfg(),
         "build_field_cfg": _field_converter_cfg(
             source_format,
             value_unit,
@@ -188,7 +187,7 @@ def _cube_dataset(root, vocab=None, **kwargs):
         path=root / "split.json",
         split="test",
         vocab=vocab or _atom_vocab(),
-        build_graph_cfg=_graph_converter_cfg("bohr"),
+        build_graph_cfg=_graph_converter_cfg(),
         build_field_cfg=_field_converter_cfg("cube", "unknown", "bohr"),
     )
     params.update(kwargs)
@@ -335,11 +334,12 @@ def test_density_dataset_uses_default_field_config(tmp_path):
 
     dataset = _cube_dataset(root, build_field_cfg=None)
 
-    assert dataset.build_field_cfg == _field_converter_cfg(
-        "cube",
-        "unknown",
-        "bohr",
-    )
+    assert dataset.build_field_cfg == {
+        "format": "cube",
+        "name": "density",
+        "value_unit": "unknown",
+        "num_cpus": 1,
+    }
 
 
 def test_density_dataset_accepts_configured_field_name(tmp_path):
@@ -1031,7 +1031,7 @@ def test_density_dataset_rebuilds_cache_when_graph_config_changes(tmp_path):
         root,
         cache_path=cache_path,
     )
-    changed_cfg = _graph_converter_cfg("bohr", cutoff=2.0)
+    changed_cfg = _graph_converter_cfg(cutoff=2.0)
 
     changed = _cube_dataset(
         root,
@@ -1152,7 +1152,7 @@ def _md17_density_dataset(root, split, **kwargs):
         n_grid=2,
         grid_size=4.0,
         vocab=_atom_vocab(),
-        build_graph_cfg=_graph_converter_cfg("bohr"),
+        build_graph_cfg=_graph_converter_cfg(),
     )
     params.update(kwargs)
     return MD17DensityDataset(**params)
@@ -1181,7 +1181,7 @@ def test_md17_density_download_uses_shared_download_utils(tmp_path, monkeypatch)
         n_grid=2,
         grid_size=4.0,
         vocab=_atom_vocab(),
-        build_graph_cfg=_graph_converter_cfg("bohr"),
+        build_graph_cfg=_graph_converter_cfg(),
     )
     validation = MD17DensityDataset(
         path=canonical_root / "ethane" / "ethane_test",
@@ -1189,7 +1189,7 @@ def test_md17_density_download_uses_shared_download_utils(tmp_path, monkeypatch)
         n_grid=2,
         grid_size=4.0,
         vocab=_atom_vocab(),
-        build_graph_cfg=_graph_converter_cfg("bohr"),
+        build_graph_cfg=_graph_converter_cfg(),
     )
 
     assert train.path == str(canonical_root / "ethane" / "ethane_train")
@@ -1207,7 +1207,6 @@ def test_md17_density_dataset_defaults_to_fft_field_config(tmp_path):
         "format": "fft",
         "name": "density",
         "value_unit": "unknown",
-        "coordinate_unit": "bohr",
         "num_cpus": 1,
     }
 
@@ -1259,22 +1258,6 @@ def test_md17_density_dataset_no_longer_accepts_density_unit(tmp_path):
         _md17_density_dataset(root, "train", density_unit="unknown")
 
 
-def test_md17_density_dataset_rejects_grid_unit_mismatch(tmp_path):
-    root = tmp_path / "small"
-    _write_md17_density_source(root)
-
-    with pytest.raises(ValueError, match="coordinate.unit"):
-        _md17_density_dataset(
-            root,
-            "train",
-            build_field_cfg=_field_converter_cfg(
-                "fft",
-                "unknown",
-                "angstrom",
-            ),
-        )
-
-
 def test_md17_density_dataset_routes_samples_through_field_builder(
     tmp_path,
     monkeypatch,
@@ -1282,7 +1265,6 @@ def test_md17_density_dataset_routes_samples_through_field_builder(
     root = tmp_path / "small"
     _write_md17_density_source(root, train_size=2)
     read_calls = []
-    grid_calls = []
     field_calls = []
     original_read_data = MD17DensityDataset.read_data
 
@@ -1291,10 +1273,6 @@ def test_md17_density_dataset_routes_samples_through_field_builder(
         return original_read_data(self)
 
     class TrackingBuildField(BuildField):
-        def build_grid(self, *args, **kwargs):
-            grid_calls.append((args, kwargs))
-            return super().build_grid(*args, **kwargs)
-
         def __call__(self, *args, **kwargs):
             field_calls.append((args, kwargs))
             return super().__call__(*args, **kwargs)
@@ -1306,7 +1284,6 @@ def test_md17_density_dataset_routes_samples_through_field_builder(
 
     assert len(dataset) == 2
     assert len(read_calls) == 1
-    assert len(grid_calls) == 1
     assert len(field_calls) == 2
 
 
@@ -1505,7 +1482,7 @@ def test_md17_density_dataset_rebuilds_cache_when_graph_config_changes(
         return original_build_cache(self, *args, **kwargs)
 
     monkeypatch.setattr(MD17DensityDataset, "_build_cache", tracking_build_cache)
-    changed_cfg = _graph_converter_cfg("bohr", cutoff=2.0)
+    changed_cfg = _graph_converter_cfg(cutoff=2.0)
 
     changed = _md17_density_dataset(
         root,
@@ -1640,7 +1617,7 @@ def _text_density_dataset(tmp_path, format, payload, **kwargs):
         "path": root / "split.json",
         "split": "test",
         "vocab": _atom_vocab(),
-        "build_graph_cfg": _graph_converter_cfg("angstrom"),
+        "build_graph_cfg": _graph_converter_cfg(),
         "build_field_cfg": _field_converter_cfg(
             format,
             "electron/angstrom^3",

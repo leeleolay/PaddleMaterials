@@ -56,98 +56,6 @@ MSD_NMR_MAX_WEIGHT = {
     "n<35": {False: 390, True: 1094},
 }
 
-# Released n<15 statistics keep packaged one-click sampling independent of the
-# full training dataset. Training runs still recompute these values from their
-# own train loader and cache the result beside the dataset.
-MSD_NMR_RELEASE_STATISTICS = {
-    ("n<15", False): {
-        "max_n_nodes": 29,
-        "n_nodes": [
-            0.0,
-            0.0,
-            0.0,
-            1.5287e-05,
-            3.0574e-05,
-            3.8217e-05,
-            9.1721e-05,
-            0.00015287,
-            0.00049682,
-            0.0013147,
-            0.0036918,
-            0.0080486,
-            0.016732,
-            0.03078,
-            0.051654,
-            0.078085,
-            0.10566,
-            0.1297,
-            0.13332,
-            0.1387,
-            0.094802,
-            0.10063,
-            0.033845,
-            0.048628,
-            0.0054421,
-            0.014698,
-            0.00045096,
-            0.0027211,
-            0.0,
-            0.00026752,
-        ],
-        "node_types": [0.5122, 0.3526, 0.0562, 0.0777, 0.0013],
-        "edge_types": [0.88162, 0.11062, 0.0059875, 0.0017758, 0.0],
-        "valency_distribution": [0.0, 0.5136, 0.0840, 0.0554, 0.3456, 0.0012],
-    },
-    ("n<15", True): {
-        "max_n_nodes": 15,
-        "n_nodes": [
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.000657983182463795,
-            0.0034172674641013145,
-            0.009784846566617489,
-            0.019774870947003365,
-            0.04433957487344742,
-            0.07253380119800568,
-            0.10895635187625885,
-            0.14755095541477203,
-            0.17605648934841156,
-            0.19964483380317688,
-            0.21728302538394928,
-        ],
-        "node_types": [
-            0.7162184715270996,
-            0.09598348289728165,
-            0.12478094547986984,
-            0.01828921213746071,
-            0.0004915347089990973,
-            0.014545895159244537,
-            0.01616295613348484,
-            0.011324135586619377,
-            0.002203370677307248,
-        ],
-        "edge_types": [
-            0.8293983340263367,
-            0.09064729511737823,
-            0.011958839371800423,
-            0.0011387828271836042,
-            0.0668567642569542,
-        ],
-        "valency_distribution": [
-            0.0,
-            0.18564589321613312,
-            0.2707855999469757,
-            0.30082041025161743,
-            0.23623158037662506,
-            0.0035443478263914585,
-            0.0029721662867814302,
-        ],
-    },
-}
-
 TRAIN_SMILES_REGISTRY = {
     ("n<15", True): {
         "name": "msd_nmr_nless15_train_smiles_no_h",
@@ -951,23 +859,10 @@ class MSDnmrinfos:
                     statistics = paddle.load(cache_path)
 
         if statistics is None:
-            released = MSD_NMR_RELEASE_STATISTICS.get((self.dataflag, self.remove_h))
-            if released is None:
-                raise FileNotFoundError(
-                    "MSD-NMR statistics require the training loader for "
-                    f"data_flag={self.dataflag!r}."
-                )
-            valencies = paddle.zeros([3 * released["max_n_nodes"] - 2], dtype="float32")
-            released_valencies = paddle.to_tensor(
-                released["valency_distribution"], dtype="float32"
+            raise FileNotFoundError(
+                "MSD-NMR statistics are not cached; provide the training loader "
+                "to compute them on first use."
             )
-            valencies[: len(released_valencies)] = released_valencies
-            statistics = {
-                "n_nodes": paddle.to_tensor(released["n_nodes"], dtype="float32"),
-                "node_types": paddle.to_tensor(released["node_types"], dtype="float32"),
-                "edge_types": paddle.to_tensor(released["edge_types"], dtype="float32"),
-                "valency_distribution": valencies,
-            }
 
         self.n_nodes = statistics["n_nodes"]
         self.node_types = statistics["node_types"]

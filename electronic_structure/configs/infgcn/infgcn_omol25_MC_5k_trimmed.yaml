@@ -13,7 +13,7 @@ Global:
   build_field_cfg:
     format: cube
     name: density
-    num_cpus: 1
+    num_cpus: 10
   cache_num_workers: 8
 
 Trainer:
@@ -87,6 +87,7 @@ Model:
     activation: norm
     residual: true
     periodic_mode: none
+    # Evaluation decoder memory limits: total points per batch and per-sample cap.
     inference_grid_point_budget: 65536
     max_inference_grid_chunk_size: 20000
 
@@ -108,6 +109,7 @@ Optimizer:
     weight_decay: 0.0
     beta1: 0.9
     beta2: 0.999
+  clip_norm_global: 100.0
 
 # remind: just subsets of Metal Complexes of OMol25
 Dataset:
@@ -123,10 +125,10 @@ Dataset:
         overwrite: false
         grid_sampler_cfg:
           n_samples: 2048
-          sampling_mode: uniform
-          uniform_random_offset: true
+          # Available modes: random; uniform (+ uniform_random_offset);
+          # importance (+ threshold/ratio parameters below).
+          sampling_mode: importance
           sampling_seed: 42
-          importance_sampling: true
           importance_threshold: 1.0e-05
           importance_ratio: 0.6
           extreme_threshold: 100.0
@@ -155,11 +157,9 @@ Dataset:
         overwrite: false
         grid_sampler_cfg:
           n_samples: 2048
-          sampling_mode: uniform
-          uniform_random_offset: true
+          sampling_mode: importance
           sampling_seed: 42
           resample_each_epoch: false
-          importance_sampling: true
           importance_threshold: 1.0e-05
           importance_ratio: 0.6
           extreme_threshold: 100.0
@@ -188,11 +188,9 @@ Dataset:
         overwrite: false
         grid_sampler_cfg:
           n_samples: 2048
-          sampling_mode: uniform
-          uniform_random_offset: true
+          sampling_mode: importance
           sampling_seed: 42
           resample_each_epoch: false
-          importance_sampling: true
           importance_threshold: 1.0e-05
           importance_ratio: 0.6
           extreme_threshold: 100.0

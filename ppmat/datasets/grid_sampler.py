@@ -22,25 +22,7 @@ import numpy as np
 
 
 class DensityGridSampler:
-    """Draw a fixed number of grid points from one density field.
-
-    The sampler runs inside ``Dataset.__getitem__``, so each field it returns
-    already carries ``n_samples`` points and collation no longer has to pad.
-    Reproducing a draw only needs the sample identity. Datasets pass a stable
-    ``(source_split, id, file_name)`` tuple so aliases share physical draws.
-
-    Density may carry trailing channel axes. Importance sampling then ranks a
-    grid point by the largest absolute value across its channels.
-
-    ``importance_ratio`` and ``extreme_ratio`` are quota lower bounds rather
-    than exact fractions: the quotas reserve a minimum number of above
-    threshold points, and any remaining budget is filled from all points that
-    were not selected yet. The realised above threshold fraction is therefore
-    usually higher than the requested ratio.
-
-    Drawing more points than a field contains repeats points, which weights
-    those points more heavily in the loss.
-    """
+    """Sample a fixed number of points from a density grid."""
 
     def __init__(
         self,
@@ -50,7 +32,6 @@ class DensityGridSampler:
         uniform_random_offset: bool = False,
         sampling_seed: int | None = None,
         resample_each_epoch: bool = True,
-        importance_sampling: bool = False,
         importance_threshold: float = 1e-5,
         importance_ratio: float = 0.8,
         extreme_threshold: float | None = None,
@@ -63,15 +44,14 @@ class DensityGridSampler:
         self.n_samples = int(n_samples)
 
         sampling_mode = sampling_mode.lower()
-        if sampling_mode not in {"uniform", "random"}:
+        if sampling_mode not in {"uniform", "random", "importance"}:
             raise ValueError(
                 f"Unsupported sampling_mode '{sampling_mode}'. "
-                "Use 'uniform' or 'random'."
+                "Use 'uniform', 'random', or 'importance'."
             )
         self.sampling_mode = sampling_mode
         self.uniform_random_offset = bool(uniform_random_offset)
 
-        self.importance_sampling = bool(importance_sampling)
         self.importance_threshold = importance_threshold
         self.importance_ratio = float(importance_ratio)
         self.extreme_threshold = extreme_threshold
@@ -91,7 +71,7 @@ class DensityGridSampler:
         self.sampling_seed = None if sampling_seed is None else int(sampling_seed)
         self.resample_each_epoch = resample_each_epoch
         self.uses_random_sampling = (
-            self.importance_sampling
+            self.sampling_mode == "importance"
             or self.sampling_mode == "random"
             or self.uniform_random_offset
         )
@@ -105,14 +85,7 @@ class DensityGridSampler:
             )
 
     def _rng_for_index(self, index):
-        """Build the RNG for a stable sample identity.
-
-        With ``resample_each_epoch`` the seed comes from NumPy's global RNG,
-        which the DataLoader reseeds per worker per epoch, so repeated passes
-        over the dataset see different points. Otherwise the identity alone fixes
-        the draw, which keeps evaluation splits comparable across runs and
-        worker counts.
-        """
+        """Build a per-sample random generator."""
 
         if not self.uses_random_sampling:
             return None
@@ -220,7 +193,7 @@ class DensityGridSampler:
         if total == 0:
             raise ValueError("Cannot sample from an empty density field.")
         rng = self._rng_for_index(index)
-        if self.importance_sampling:
+        if self.sampling_mode == "importance":
             indices = self._importance_indices(density, total, rng)
         elif self.sampling_mode == "uniform":
             indices = self._uniform_indices(total, rng)

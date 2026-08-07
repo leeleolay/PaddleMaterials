@@ -18,21 +18,11 @@ from ppmat.datasets.graph_utils.infgcn_graph_utils import radius
 
 
 class AtomGridRadiusGraphConverter:
-    """Build a runtime bipartite radius graph from atoms to grid points.
-
-    Unlike the static atom graph converter, this converter consumes the current
-    sampled or chunked grid tensor. Its edge contract follows PGL ordering:
-    ``edge_index[0]`` is the atom source and ``edge_index[1]`` is the grid
-    destination.
-    """
+    """Build PGL-style ``[atom, grid]`` edge rows for one grid chunk."""
 
     def __init__(self, cutoff: float, max_num_neighbors: int = 32) -> None:
-        if cutoff <= 0:
-            raise ValueError("cutoff must be positive.")
-        if max_num_neighbors <= 0:
-            raise ValueError("max_num_neighbors must be positive.")
-        self.cutoff = float(cutoff)
-        self.max_num_neighbors = int(max_num_neighbors)
+        self.cutoff = cutoff
+        self.max_num_neighbors = max_num_neighbors
 
     def __call__(
         self,
@@ -49,6 +39,4 @@ class AtomGridRadiusGraphConverter:
             grid_batch,
             self.max_num_neighbors,
         )
-        if atom_src.shape[0] == 0:
-            return paddle.zeros([2, 0], dtype="int64")
-        return paddle.stack([atom_src, grid_dst], axis=0)
+        return paddle.stack([atom_src, grid_dst], axis=1)

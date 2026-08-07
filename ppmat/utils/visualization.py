@@ -273,36 +273,23 @@ def safe_write_image(fig, path, show_plot=False):
 
 
 def maybe_downsample_volume(grid, values, shape, max_points=250_000):
-    """
-    Downsample a regular 3D grid for visualization to keep Plotly volume
-    traces responsive.
-    """
-    if shape is None or len(shape) != 3:
+    """Downsample a regular volume for responsive Plotly rendering."""
+    if shape is None:
         return grid, values, False, 1
 
-    try:
-        shape = [int(s) for s in shape]
-        total = shape[0] * shape[1] * shape[2]
-    except Exception:
+    shape = tuple(int(size) for size in shape)
+    if len(shape) != 3:
         return grid, values, False, 1
-
+    total = math.prod(shape)
     if total != grid.shape[0] or any(val.shape[0] != grid.shape[0] for val in values):
         return grid, values, False, 1
     if total <= max_points:
         return grid, values, False, 1
 
     stride = max(1, math.ceil((total / max_points) ** (1 / 3)))
-    try:
-        grid_view = grid.reshape(shape[0], shape[1], shape[2], 3)
-        grid_ds = grid_view[::stride, ::stride, ::stride, :].reshape(-1, 3)
-        values_ds = [
-            val.reshape(shape[0], shape[1], shape[2])[
-                ::stride, ::stride, ::stride
-            ].reshape(-1)
-            for val in values
-        ]
-    except Exception as e:
-        logger.warning(f"Failed to downsample grid for visualization: {e}")
-        return grid, values, False, 1
-
+    grid_ds = grid.reshape(*shape, 3)[::stride, ::stride, ::stride].reshape(-1, 3)
+    values_ds = [
+        value.reshape(shape)[::stride, ::stride, ::stride].reshape(-1)
+        for value in values
+    ]
     return grid_ds, values_ds, True, stride

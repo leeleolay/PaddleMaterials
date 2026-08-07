@@ -78,54 +78,15 @@ $$
 
 ## Dataset Description
 
-### Recommended data fields
-- `atomic_numbers`: length-$N$ atomic numbers
-- `pos`: $N \times 3$ Cartesian coordinates prepared consistently with the
-  dataset's grid and cutoff values
-- `density`: 3D array (voxel grid), for example $n \times n \times n$, in the
-  unit declared by `Global.build_field_cfg.value_unit`
-- `grid_meta` (optional): origin, spacing, and box vectors to define $x_i$
-- Optional tags: `mol_id`, `frame_id`, normalization/scaling factors
-
 ### Datasets
-- **QM9_EC**: Electron densities stored as `*.CHGCAR.lz4` under the configured `./data/data_qm9` path (train 123,835 / val 50 / test 10,000).
-- **MP_EC (cubic)**: Materials Project-style crystals serialized as `.json.xz` under the configured `./data/data_cubic` path (train 14,421 / val 1,000 / test 1,000).
-- **OMol25_EC**: Metal-complex cubes stored under `data/dataset_OMol25_MC_5k` (full release: train 3,943 / val 493 / test 493). The InfGCN config uses the filtered split (train 3,933 / val 491 / test 491).
-- **MD17_EC**: Small molecules (for example, ethanol, benzene, phenol, resorcinol) from the MD17 electron-density release under `./data/data_md`; each config points directly to its molecule/split directory. The default config trains on ethanol, and its validation split uses the published test samples.
-
-The training configs download their published dataset and metadata when the
-configured local path is absent. Existing local data is used directly. The
-archives are large (QM9 1.14 TB, MP 53.5 GB, OMol25 21.7 GB, and MD17
-11.3 GB), so confirm network and disk capacity before starting training in a
-fresh environment. The dataset cache keeps both the archive and extracted
-files under `~/.paddlemat/datasets`, so allow roughly twice the archive size.
-Before distributed training, extract the dataset with one process and set
-the dataset `path` to a location visible to every rank.
+- **QM9_ES**: Electron densities stored as `*.CHGCAR.lz4` under the configured `./data/data_qm9` path (train 123,835 / val 50 / test 10,000).
+- **MP_ES (cubic)**: Materials Project-style crystals serialized as `.json.xz` under the configured `./data/data_cubic` path (train 14,421 / val 1,000 / test 1,000).
+- **OMol25_ES**: Metal-complex cubes stored under `data/dataset_OMol25_MC_5k` (full release: train 3,943 / val 493 / test 493). The InfGCN config uses the filtered split (train 3,933 / val 491 / test 491).
+- **MD17_ES**: Small molecules (for example, ethanol, benzene, phenol, resorcinol) from the MD17 electron-density release under `./data/data_md`; each config points directly to its molecule/split directory. The default config trains on ethanol, and its validation split uses the published test samples.
 
 ---
 
 ## Results
-
-### Paper reproduction target
-
-The QM9, MP cubic, and MD17 configs now follow the optimization and evaluation
-protocol in the [original InfGCN implementation](https://github.com/ccr-cheng/InfGCN-pytorch):
-random grid sampling for training and validation, validation and
-`ReduceLROnPlateau` updates by optimizer step, global gradient clipping at 100,
-and full-grid test NMAE with 4096-point inference chunks. The model has 1,200,464
-parameters, matching the 1.20M InfGCN(s7) model reported in the paper.
-
-The paper targets are 0.93% NMAE on unrotated QM9, 4.73% on rotated QM9, and
-8.98% on the cubic crystal dataset. MD17 results reported in the paper range
-from 5.11% to 10.34% across the six molecules. These are reproduction targets,
-not claimed Paddle results; a fresh end-to-end training run is required before
-recording aligned Paddle metrics.
-
-### Published Paddle checkpoints
-
-The checkpoint measurements below were produced before the paper-protocol
-alignment above. They remain useful for compatibility checks, but should not be
-compared directly with the paper until the checkpoints are retrained.
 
 <table>
     <thead>
@@ -259,7 +220,7 @@ python electronic_structure/predict.py \
   --grid_batch_size 128 \
   --save_path output/infgcn_qm9/methane
 
-# 2) Dataset-sample inference with a custom config and checkpoint.
+# 2) Run inference over every sample in the dataset split configured by the YAML.
 python electronic_structure/predict.py \
   --config_path electronic_structure/configs/infgcn/infgcn_qm9.yaml \
   --checkpoint_path path/to/infgcn_qm9.pdparams
@@ -299,11 +260,9 @@ Notes:
 - `--save_path` is an output directory and always receives the predicted CUBE.
 - Optional MOL grid controls are `--grid_shape` (default `80,80,80`) and
   `--grid_padding` (default `6.0` Angstrom).
-- MOL input coordinates and `--grid_padding` are interpreted in Angstrom and
-  converted to the model's configured coordinate unit before inference.
-  Generated CUBE files mark that unit explicitly. A reference CUBE must declare
-  the same unit as the model; its atom order is validated before its grid and
-  atom coordinates are used.
+- MOL input coordinates and `--grid_padding` are interpreted directly in
+  Angstrom. Reference CUBE geometry is read from the unit encoded by the file;
+  its atom order is validated before its grid and atom coordinates are used.
 - If true/reference cube is not provided, only predicted outputs are available (`*_pred.cube`, `*_pred_density.html`).
 - If kaleido/Chrome is unavailable, the script writes interactive `.html` instead of `.png`.
 - If a dataset already exists elsewhere, override its configured dataset path.

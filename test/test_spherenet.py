@@ -88,7 +88,6 @@ def test_radius_graph_from_arrays_matches_rdkit_and_merges_node_features():
     array_graph = converter.from_arrays(
         atomic_numbers,
         positions,
-        coordinate_unit="angstrom",
         node_features={"x": np.array([1, 2, 3], dtype=np.int64)},
     )
 
@@ -118,7 +117,6 @@ def test_radius_graph_from_cvve_and_pymatgen_structures():
     )
     cvve_graph = RadiusGraphConverter(
         cutoff=1.0,
-        coordinate_unit="bohr",
         inclusive_cutoff=True,
     ).from_structure(
         cvve_structure,
@@ -136,7 +134,6 @@ def test_radius_graph_from_cvve_and_pymatgen_structures():
     )
     pymatgen_graph = RadiusGraphConverter(
         cutoff=1.1,
-        coordinate_unit="angstrom",
     ).from_structure(pymatgen_structure)
 
     np.testing.assert_array_equal(pymatgen_graph.edges, [[1, 0], [0, 1]])
@@ -241,7 +238,6 @@ def test_radius_graph_uses_dataset_atom_vocabulary():
 
     graph = RadiusGraphConverter(
         cutoff=1.0,
-        coordinate_unit="bohr",
         inclusive_cutoff=True,
         atom_vocab={},
         vocab=vocab,
@@ -266,7 +262,7 @@ def test_radius_graph_rejects_atom_missing_from_dataset_vocabulary():
         )
 
 
-def test_radius_graph_validates_units_features_and_cutoff_boundary():
+def test_radius_graph_cutoff_boundary():
     atomic_numbers = np.array([1, 1], dtype=np.int64)
     positions = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
 
@@ -284,20 +280,6 @@ def test_radius_graph_validates_units_features_and_cutoff_boundary():
 
     assert strict_graph.edges.shape == (0, 2)
     np.testing.assert_array_equal(inclusive_graph.edges, [[1, 0], [0, 1]])
-
-    with pytest.raises(ValueError, match="expects 'angstrom'"):
-        RadiusGraphConverter(
-            cutoff=1.0,
-            coordinate_unit="angstrom",
-        ).from_arrays(atomic_numbers, positions, coordinate_unit="bohr")
-    with pytest.raises(ValueError, match="leading dimension 2"):
-        RadiusGraphConverter(cutoff=1.0).from_arrays(
-            atomic_numbers,
-            positions,
-            node_features={"x": np.array([0], dtype=np.int64)},
-        )
-    with pytest.raises(ValueError, match="either 'angstrom' or 'bohr'"):
-        RadiusGraphConverter(cutoff=1.0, coordinate_unit="nanometer")
 
 
 def test_build_molecule_from_dict():
@@ -462,7 +444,9 @@ def test_radius_graph_uses_edges_as_endpoint_indices():
         "idx_kj": graph.edge_feat["ti_idx_kj"].astype("int64"),
         "idx_ji": graph.edge_feat["ti_idx_ji"].astype("int64"),
     }
-    result = compute_geometry(graph.node_feat["cart_coords"], edge_index, triplet_indices)
+    result = compute_geometry(
+        graph.node_feat["cart_coords"], edge_index, triplet_indices
+    )
     np.testing.assert_array_equal(result[3].numpy(), edge_index[1].numpy())
     np.testing.assert_array_equal(result[4].numpy(), edge_index[0].numpy())
 

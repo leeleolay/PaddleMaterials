@@ -119,7 +119,6 @@ class DensityDataset(paddle.io.Dataset):
                 "format": "cube",
                 "name": "density",
                 "value_unit": "unknown",
-                "coordinate_unit": "bohr",
                 "num_cpus": 1,
             }
             logger.message(
@@ -397,7 +396,6 @@ class DensityDataset(paddle.io.Dataset):
 
 
 MD17_DENSITY_CACHE_SCHEMA_VERSION = 10
-MD17_COORDINATE_UNIT = "bohr"  # Published MD17 FFT coordinates use bohr.
 _MD17_CACHE_BATCH_SIZE = 16
 
 MD17_ATOMIC_NUMBERS: Dict[str, np.ndarray] = {
@@ -481,7 +479,6 @@ class MD17DensityDataset(paddle.io.Dataset):
                 "format": "fft",
                 "name": "density",
                 "value_unit": "unknown",
-                "coordinate_unit": "bohr",
                 "num_cpus": 1,
             }
         elif not isinstance(build_field_cfg, dict):
@@ -545,17 +542,12 @@ class MD17DensityDataset(paddle.io.Dataset):
         self.n_grid = int(n_grid)
         self.grid_size = float(grid_size)
         build_field_cfg = dict(build_field_cfg)
-        build_field_cfg.setdefault("coordinate_unit", MD17_COORDINATE_UNIT)
+        build_field_cfg.pop("coordinate_unit", None)
         self.build_graph_cfg = dict(build_graph_cfg)
         self.field_converter = BuildField(**build_field_cfg)
         if self.field_converter.format != "fft":
             raise ValueError(
                 "MD17DensityDataset requires build_field_cfg.format to be 'fft'."
-            )
-        if self.field_converter.coordinate_unit != "bohr":
-            raise ValueError(
-                "MD17DensityDataset requires build_field_cfg.coordinate_unit "
-                "to be 'bohr'."
             )
         if self.field_converter.name != "density":
             raise ValueError(
@@ -565,7 +557,6 @@ class MD17DensityDataset(paddle.io.Dataset):
             "format": self.field_converter.format,
             "name": self.field_converter.name,
             "value_unit": self.field_converter.value_unit,
-            "coordinate_unit": self.field_converter.coordinate_unit,
             "num_cpus": self.field_converter.num_cpus,
         }
         self.transforms = transforms
@@ -581,12 +572,14 @@ class MD17DensityDataset(paddle.io.Dataset):
         self.cache_path = osp.abspath(osp.expanduser(os.fspath(cache_path)))
 
         grid_step = self.grid_size / self.n_grid
-        self.grid_data = self.field_converter.build_grid(
+        # Published MD17 FFT coordinates are interpreted directly in bohr.
+        self.grid_data = BuildField.build_grid_one(
             {
                 "shape": (self.n_grid, self.n_grid, self.n_grid),
                 "voxel_vectors": np.eye(3, dtype=np.float32) * grid_step,
                 "origin": np.full(3, grid_step, dtype=np.float32),
-            }
+            },
+            "bohr",
         )
         self.cell = np.asarray(self.grid_data.cell_vectors, dtype=np.float32)
         self.origin = np.asarray(self.grid_data.origin, dtype=np.float32)
@@ -836,7 +829,6 @@ class MD17DensityDataset(paddle.io.Dataset):
                 graph = graph_converter.from_arrays(
                     atomic_numbers,
                     structure_batch[batch_offset],
-                    coordinate_unit=self.field_converter.coordinate_unit,
                     node_features={"x": atom_type.copy()},
                 )
                 if graph is None:
@@ -944,7 +936,7 @@ class MD17DensityDataset(paddle.io.Dataset):
             "shape": sample["shape"],
             "origin": self.origin,
             "file_name": sample["file_name"],
-            "coordinate_unit": self.field_converter.coordinate_unit,
+            "coordinate_unit": self.grid_data.length_unit,
             "density_unit": self.field_converter.value_unit,
             "source_split": sample["source_split"],
         }
@@ -1019,7 +1011,6 @@ class QM9DensityDataset(DensityDataset):
                 "format": "chgcar",
                 "name": "density",
                 "value_unit": "electron/angstrom^3",
-                "coordinate_unit": "angstrom",
                 "num_cpus": 1,
             }
         super().__init__(
@@ -1079,7 +1070,6 @@ class MPCubicDensityDataset(DensityDataset):
                 "format": "json",
                 "name": "density",
                 "value_unit": "electron/angstrom^3",
-                "coordinate_unit": "angstrom",
                 "num_cpus": 1,
             }
         super().__init__(

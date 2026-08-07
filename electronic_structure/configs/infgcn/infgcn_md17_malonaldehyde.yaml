@@ -13,7 +13,7 @@ Global:
   build_field_cfg:
     format: fft
     name: density
-    num_cpus: 1
+    num_cpus: 10
 
 Trainer:
   # Max epochs to train
@@ -28,6 +28,8 @@ Trainer:
   save_freq: 2000
   # Logging frequency [step], for example, log_freq=10 means log every 10 steps
   log_freq: 10000
+  # Optional step-based cadence; used when one epoch is much larger than the
+  # desired validation/checkpoint interval. These are generic Trainer options.
   eval_freq_steps: 20
   save_freq_steps: 100
 
@@ -87,6 +89,7 @@ Model:
     gauss_end: 5.0
     residual: true
     periodic_mode: none
+    # Evaluation decoder memory limits: total points per batch and per-sample cap.
     inference_grid_point_budget: 65536
     max_inference_grid_chunk_size: 20000
 
@@ -94,7 +97,6 @@ Vocabulary: infgcn_md17
 
 Optimizer:
   __class_name__: Adam
-  clip_norm_global: 100.0
   __init_params__:
     lr:
       __class_name__: ReduceOnPlateau
@@ -109,6 +111,7 @@ Optimizer:
     weight_decay: 0.0
     beta1: 0.9
     beta2: 0.999
+  clip_norm_global: 100.0
 
 Dataset:
   train:
@@ -144,7 +147,7 @@ Dataset:
     sampler:
       __class_name__: BatchSampler
       __init_params__:
-        shuffle: False
+        shuffle: True
         drop_last: False
         batch_size: 64
     loader:
