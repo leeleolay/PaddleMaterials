@@ -18,11 +18,20 @@ from paddle.nn import Embedding
 from paddle.nn import Linear
 
 from ppmat.models.common import initializer
+from ppmat.models.common.runtime import RuntimeMixin
+from ppmat.models.common.runtime import runtime_boundary
 from ppmat.models.common.spherical_fourier_bessel import DistEmbedding
 from ppmat.models.common.spherical_fourier_bessel import SphericalFourierBesselEmbedding
 from ppmat.models.spherenet.geometry import compute_geometry
+from ppmat.models.spherenet.geometry import select_torsion_edges
 from ppmat.utils.scatter import scatter_sum
 from ppmat.utils.scatter import scatter_sum_first_order
+
+
+def _to_tensor(value, dtype: str) -> paddle.Tensor:
+    if isinstance(value, paddle.Tensor):
+        return value if value.dtype == getattr(paddle, dtype) else value.astype(dtype)
+    return paddle.to_tensor(value, dtype=dtype)
 
 
 def _swish(x):
@@ -282,7 +291,7 @@ class NodeUpdate(paddle.nn.Layer):
         return v
 
 
-class SphereNet(paddle.nn.Layer):
+class SphereNet(RuntimeMixin, paddle.nn.Layer):
     """Spherical Message Passing for 3D molecular graph tasks.
 
     This class follows the PaddleMaterials model protocol directly: ``forward``
@@ -318,8 +327,15 @@ class SphereNet(paddle.nn.Layer):
         data_mean=0.0,
         data_std=1.0,
         force_loss_weight=1.0,
+        execution_backend="eager",
+        runtime_options=None,
     ):
         super().__init__()
+        self._init_runtime(execution_backend, runtime_options)
+        if use_extra_node_feature and (
+            not isinstance(extra_node_feature_dim, int) or extra_node_feature_dim <= 0
+        ):
+            raise ValueError("extra_node_feature_dim must be a positive integer.")
 
         act_fn = _swish if act in ("swish", "silu") else act
         if not callable(act_fn):
@@ -327,6 +343,9 @@ class SphereNet(paddle.nn.Layer):
 
         self.energy_and_force = energy_and_force
         self.use_extra_node_feature = use_extra_node_feature
+        self.extra_node_feature_dim = (
+            extra_node_feature_dim if use_extra_node_feature else 1
+        )
         self.property_name = property_name
         self.force_key = force_key
         self.force_loss_weight = float(force_loss_weight)
@@ -403,29 +422,66 @@ class SphereNet(paddle.nn.Layer):
             layer.reset_parameters()
 
     def _forward(self, data):
+        normalized_pred, pos, _ = self._forward_with_forces(data)
+        return normalized_pred, pos
+
+    def _forward_with_forces(self, data):
         graph = data["graph"].tensor()
         z = graph.node_feat["atom_types"].astype("int64").reshape([-1])
         pos = graph.node_feat["cart_coords"].astype(paddle.get_default_dtype())
         if self.energy_and_force:
+            # Make coordinates a differentiable leaf before entering PIR. Creating
+            # the leaf inside the static graph emits share_data_, whose Paddle 3.3
+            # backward graph can miss repeated-input gradient accumulation.
             pos = pos.detach()
             pos.stop_gradient = False
-
-        node_batch = graph.graph_node_id.astype("int64")
-        edge_index = paddle.transpose(graph.edges.astype("int64"), [1, 0])
+        node_batch = _to_tensor(graph.graph_node_id, "int64")
+        edge_index = paddle.transpose(_to_tensor(graph.edges, "int64"), [1, 0])
         node_feature = graph.node_feat.get("node_feature")
-        triplet_indices = {
-            "idx_kj": graph.edge_feat["ti_idx_kj"].astype("int64"),
-            "idx_ji": graph.edge_feat["ti_idx_ji"].astype("int64"),
-        }
+        idx_kj = _to_tensor(graph.edge_feat["ti_idx_kj"], "int64")
+        idx_ji = _to_tensor(graph.edge_feat["ti_idx_ji"], "int64")
+        idx_qj = select_torsion_edges(
+            pos,
+            edge_index,
+            {"idx_kj": idx_kj, "idx_ji": idx_ji},
+        )
 
+        return self._runtime_forward(
+            z,
+            pos,
+            node_batch,
+            edge_index,
+            node_feature,
+            idx_kj,
+            idx_ji,
+            idx_qj,
+        )
+
+    @runtime_boundary("forward")
+    def _runtime_forward(
+        self,
+        z,
+        pos,
+        node_batch,
+        edge_index,
+        node_feature,
+        idx_kj,
+        idx_ji,
+        idx_qj,
+    ):
         if self.use_extra_node_feature and node_feature is not None:
-            extra_node_feature = self.extra_emb(node_feature)
+            extra_node_feature = self.extra_emb(
+                _to_tensor(node_feature, paddle.get_default_dtype())
+            )
         else:
             extra_node_feature = None
 
         num_nodes = z.shape[0]
         dist, angle, torsion, i, j, idx_kj, idx_ji = compute_geometry(
-            pos, edge_index, triplet_indices
+            pos,
+            edge_index,
+            {"idx_kj": idx_kj, "idx_ji": idx_ji},
+            idx_qj,
         )
 
         emb_out = self.emb_layer(dist, angle, torsion, idx_kj)
@@ -440,7 +496,15 @@ class SphereNet(paddle.nn.Layer):
             v = update_v(e, i, dim_size=num_nodes)
             u = u + _aggregate(v, node_batch, None, require_second_order)
 
-        return u, pos
+        forces = None
+        if self.energy_and_force:
+            forces = -paddle.grad(
+                self.unnormalize(u).sum(),
+                pos,
+                create_graph=self.training,
+            )[0]
+
+        return u, pos, forces
 
     def normalize(self, tensor):
         return (tensor - self.data_mean) / self.data_std
@@ -454,20 +518,8 @@ class SphereNet(paddle.nn.Layer):
             return_loss or return_prediction
         ), "At least one of return_loss or return_prediction must be True."
 
-        normalized_pred, pos = self._forward(data)
+        normalized_pred, _, forces_pred = self._forward_with_forces(data)
         pred = self.unnormalize(normalized_pred)
-
-        forces_pred = None
-        if self.energy_and_force:
-            # Force loss differentiates predicted forces again during backward.
-            grad = paddle.grad(
-                pred.sum(),
-                pos,
-                create_graph=self.training and return_loss,
-                allow_unused=True,
-            )
-            if grad is not None and grad[0] is not None:
-                forces_pred = -grad[0]
 
         loss_dict = {}
         if return_loss:
@@ -495,10 +547,7 @@ class SphereNet(paddle.nn.Layer):
         if return_prediction:
             prediction[self.property_name] = pred
             if self.energy_and_force:
-                if forces_pred is not None:
-                    prediction[self.force_key] = forces_pred.detach()
-                else:
-                    prediction[self.force_key] = paddle.zeros_like(pos)
+                prediction[self.force_key] = forces_pred.detach()
 
         return {"loss_dict": loss_dict, "pred_dict": prediction}
 
