@@ -44,8 +44,8 @@ Boundary names describe stable roles:
 ## Model support
 
 The table records the registered-checkpoint workflows qualified with Paddle
-3.3. See the [performance matrix](cinn_performance.md) for the test environment,
-timings, and numerical tolerances.
+3.3. See the [performance matrix](cinn_performance.md) for the test environment
+and timings.
 
 | Model | Boundary | Capture | Qualified workflow |
 | --- | --- | --- | --- |

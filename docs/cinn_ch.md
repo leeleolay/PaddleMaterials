@@ -41,8 +41,8 @@ CINN 要求 CUDA 设备以及启用 CINN 的 Paddle。当前运行时不支持 A
 
 ## 模型支持
 
-下表记录使用 Paddle 3.3 完成注册 checkpoint 验证的流程。测试环境、耗时和数值
-容差见[性能矩阵](cinn_performance.md)。
+下表记录使用 Paddle 3.3 完成注册 checkpoint 验证的流程。测试环境和耗时见
+[性能矩阵](cinn_performance_ch.md)。
 
 | 模型 | 边界 | 捕获方式 | 已验证流程 |
 | --- | --- | --- | --- |
