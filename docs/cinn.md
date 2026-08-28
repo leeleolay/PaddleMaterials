@@ -53,7 +53,9 @@ wrapper layer and eager and CINN keep identical parameter keys.
 Boundary cache names follow a small vocabulary:
 
 - `forward` for a model's standard numerical forward;
+- `decoder` for an independently compiled decoder used outside sampling;
 - `denoise_step` for one diffusion denoising step;
+- `guided_denoise_step` for classifier-free-guided diffusion prior sampling;
 - a stable component role, currently `graph_encoder` or `spectrum_encoder`,
   when a workflow compiles independent components.
 
@@ -85,10 +87,10 @@ Detailed measurements and dated qualification evidence live only in the
 | `CHGNet` | differentiable `_runtime_forward` | strict AST | energy/force/stress/magnetic-moment inference |
 | `DiffCSP` | `_runtime_decode` denoising step | SOT | structure sampling |
 | `MatterGen`, `MatterGenWithCondition` | `_runtime_denoise` step | SOT | unconditional and conditional sampling |
-| `MolecularGraphFormer` | `graph_encoder` and `denoise_step` | SOT | implemented; no standalone registered workflow |
+| `MolecularGraphFormer` | `graph_encoder`, `decoder`, and complete tensor `denoise_step` | SOT | implemented; no standalone registered workflow |
 | `NMRNetCLIP` | graph and spectrum encoders | SOT | implemented; no standalone registered workflow |
-| `DiffPrior` | prior denoising step | SOT | implemented; not exercised by the registered DiffNMR workflow |
-| `DiffNMR` | `spectrum_encoder`, `denoise_step`, and optional prior denoising | SOT | complete reverse diffusion |
+| `DiffPrior` | training and guided prior denoising steps | SOT | implemented; not exercised by the registered DiffNMR workflow |
+| `DiffNMR` | `decoder`, complete tensor `denoise_step`, and optional prior denoising | SOT | one eager spectrum encoding; schedule, features, decoder, softmax, and posterior share one sampling boundary |
 | `InfGCN` | none | eager only | CINN lowering did not finish within the qualification limit |
 
 InfGCN remains a supported eager model. It has no runtime boundary or CINN
@@ -97,9 +99,10 @@ lowering before the model is integrated again.
 
 ## Boundary placement
 
-Keep file parsing, PGL/Python-object unpacking, dynamic topology, schedulers,
-sampling loops, metrics, and visualization in eager execution. Pass tensors and
-integer topology into the compiled numerical core. Current examples include:
+Keep file parsing, PGL/Python-object unpacking, dynamic topology, scheduler
+control flow, sampling loops, metrics, and visualization in eager execution.
+Tensor-only scheduler math may remain inside a numerical boundary. Pass tensors
+and integer topology into the compiled numerical core. Current examples include:
 
 - DiffCSP builds variable-size fully connected edges before `_runtime_decode`.
 - MatterGen rebuilds its dynamic periodic neighbor graph before every compiled
@@ -108,6 +111,9 @@ integer topology into the compiled numerical core. Current examples include:
   geometry inside `_runtime_forward`.
 - CHGNet batches discrete graph indices eagerly and keeps geometry, message
   passing, energy, force, and stress in one strict boundary.
+- DiffNMR encodes its invariant spectrum once eagerly, compiles schedule math,
+  extra features, decoder, softmax, and posterior as one reverse-step boundary,
+  then performs discrete random sampling eagerly.
 
 This `eager topology -> tensor indices -> compiled numerics` split is part of
 the model contract, not a fallback adapter.
