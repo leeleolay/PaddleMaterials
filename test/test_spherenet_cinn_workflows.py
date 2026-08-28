@@ -100,11 +100,11 @@ def _make_loader():
     )
 
 
-def _make_model(execution_backend="cinn", energy_and_force=False):
+def _make_model(execution_backend="cinn", compute_forces=False):
     with paddle.utils.unique_name.guard():
         paddle.seed(2026)
         return SphereNet(
-            energy_and_force=energy_and_force,
+            derivative_properties=("force",) if compute_forces else (),
             num_layers=1,
             hidden_channels=8,
             out_channels=1,
@@ -120,12 +120,12 @@ def _make_model(execution_backend="cinn", energy_and_force=False):
             num_output_layers=1,
             property_name="mu",
             execution_backend=execution_backend,
-            runtime_options={"cinn": {"full_graph": energy_and_force}},
+            runtime_options={"cinn": {"full_graph": compute_forces}},
         )
 
 
 def test_force_coordinates_are_leaf_before_runtime_boundary(monkeypatch):
-    model = _make_model(execution_backend="eager", energy_and_force=True)
+    model = _make_model(execution_backend="eager", compute_forces=True)
     observed = {}
 
     def capture_coordinates(
@@ -147,7 +147,7 @@ def test_force_coordinates_are_leaf_before_runtime_boundary(monkeypatch):
         )
 
     monkeypatch.setattr(SphereNet, "_runtime_forward", capture_coordinates)
-    model._forward_with_forces({"graph": _make_graphs()[0]})
+    model._forward({"graph": _make_graphs()[0]})
 
     assert observed["stop_gradient"] is False
 
@@ -242,8 +242,8 @@ def test_gpu_cinn_force_matches_eager():
         pytest.skip("Paddle was not compiled with CINN.")
 
     paddle.set_device("gpu:0")
-    eager_model = _make_model(execution_backend="eager", energy_and_force=True)
-    cinn_model = _make_model(execution_backend="cinn", energy_and_force=True)
+    eager_model = _make_model(execution_backend="eager", compute_forces=True)
+    cinn_model = _make_model(execution_backend="cinn", compute_forces=True)
     cinn_model.set_state_dict(eager_model.state_dict())
     eager_model.eval()
     cinn_model.eval()
