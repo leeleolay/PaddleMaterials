@@ -31,7 +31,6 @@ from ppmat.models.common.runtime import runtime_boundary
 from ppmat.predictor import BasePredictor
 from ppmat.trainer.base_trainer import BaseTrainer
 from ppmat.utils.execution import configure_execution_backend
-from ppmat.utils.execution import validate_execution_backend
 
 RUNTIME_BOUNDARY_NAMES = {
     "forward",
@@ -51,6 +50,7 @@ class _HookedModel(paddle.nn.Layer):
         self.forward_calls = 0
         self.predict_calls = []
         self.runtime_options = {}
+        self.validation_calls = []
 
     def set_execution_backend(self, backend):
         if backend not in {"eager", "cinn"}:
@@ -61,9 +61,9 @@ class _HookedModel(paddle.nn.Layer):
         self.runtime_options = runtime_options
 
     def validate_execution_backend(self, *, use_amp=False, world_size=1):
-        del use_amp, world_size
         if self.execution_backend != "cinn":
             raise AssertionError("validation should only be used for CINN")
+        self.validation_calls.append((use_amp, world_size))
 
     def forward(self, batch, return_loss=True, return_prediction=True):
         self.forward_calls += 1
@@ -209,6 +209,7 @@ def test_execution_backend_protocol_is_generic_for_trainer_and_predictor(tmp_pat
 
     assert model.execution_backend == "cinn"
     assert model.runtime_options == {"cinn": {"full_graph": False}}
+    assert model.validation_calls == [(False, 1)]
     assert model.forward_calls > 0
 
     predictor = BasePredictor()
@@ -231,7 +232,6 @@ def test_eager_override_is_compatible_with_legacy_models():
 
     model = LegacyModel()
     assert configure_execution_backend(model, "eager", owner="Trainer") == "eager"
-    validate_execution_backend(model, "eager", owner="Trainer")
 
     class FixedCompiledModel:
         execution_backend = "cinn"
@@ -252,6 +252,22 @@ def test_eager_override_ignores_compiled_runtime_options():
 
     assert active == "eager"
     assert model.runtime_options == {}
+    assert model.validation_calls == []
+
+
+def test_configure_execution_backend_forwards_workflow_context():
+    model = _HookedModel()
+
+    active = configure_execution_backend(
+        model,
+        "cinn",
+        use_amp=True,
+        world_size=4,
+        owner="Trainer",
+    )
+
+    assert active == "cinn"
+    assert model.validation_calls == [(True, 4)]
 
 
 def test_backend_setter_must_honor_requested_backend():
@@ -267,10 +283,20 @@ def test_backend_setter_must_honor_requested_backend():
 
 def test_compiled_backend_requires_model_hooks():
     with pytest.raises(ValueError, match="does not implement"):
-        configure_execution_backend(object(), "cinn", owner="Predict")
+        configure_execution_backend(object(), "cinn", owner="Predictor")
+
+    class UnvalidatedCompiledModel:
+        execution_backend = "eager"
+
+        def set_execution_backend(self, backend):
+            self.execution_backend = backend
 
     with pytest.raises(ValueError, match="validated execution runtime"):
-        validate_execution_backend(object(), "cinn", owner="Predictor")
+        configure_execution_backend(
+            UnvalidatedCompiledModel(),
+            "cinn",
+            owner="Predictor",
+        )
 
 
 def test_runtime_is_validated_and_compiled_once_per_mode(monkeypatch):

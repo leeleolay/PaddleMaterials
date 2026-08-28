@@ -38,9 +38,11 @@ def configure_execution_backend(
     backend: Optional[str],
     *,
     init_params: Mapping[str, Any] | None = None,
+    use_amp: bool = False,
+    world_size: int = 1,
     owner: str,
 ) -> str:
-    """Apply a workflow-level backend override and return the active backend.
+    """Configure and validate a workflow-level execution backend.
 
     ``eager`` is a valid no-op for legacy models.  Any compiled (or otherwise
     non-eager) backend must be implemented by the model so that the model,
@@ -87,34 +89,22 @@ def configure_execution_backend(
             f"{owner} requested execution backend {backend!r}, but the model "
             f"selected {active!r}."
         )
-    return active
 
-
-def validate_execution_backend(
-    model: Any,
-    backend: str,
-    *,
-    use_amp: bool = False,
-    world_size: int = 1,
-    owner: str,
-) -> None:
-    """Validate a model/runtime combination before entering a workflow."""
-
-    if backend == DEFAULT_EXECUTION_BACKEND:
-        return
+    if active == DEFAULT_EXECUTION_BACKEND:
+        return active
 
     validator = getattr(model, "validate_execution_backend", None)
     if validator is None:
         raise ValueError(
-            f"{owner} requested execution backend {backend!r}, which requires a "
+            f"{owner} requested execution backend {active!r}, which requires a "
             "model with a validated execution runtime (missing "
             "validate_execution_backend())."
         )
     validator(use_amp=use_amp, world_size=world_size)
+    return active
 
 
 __all__ = [
     "DEFAULT_EXECUTION_BACKEND",
     "configure_execution_backend",
-    "validate_execution_backend",
 ]

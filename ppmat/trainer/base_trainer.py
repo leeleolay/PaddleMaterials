@@ -43,7 +43,6 @@ from ppmat.utils import logger
 from ppmat.utils import misc
 from ppmat.utils import save_load
 from ppmat.utils.execution import configure_execution_backend
-from ppmat.utils.execution import validate_execution_backend
 
 
 class BaseTrainer:
@@ -93,16 +92,6 @@ class BaseTrainer:
         self.config = config
         execution_config = execution_config or {}
 
-        # Keep the model as the sole checkpoint/optimizer owner.  A runtime
-        # backend may be selected from the Execution config block, but it must be
-        # exposed by the model itself so train and prediction share one contract.
-        self.execution_backend = configure_execution_backend(
-            self.model,
-            execution_config.get("backend"),
-            init_params=execution_config.get("__init_params__"),
-            owner="Trainer",
-        )
-
         if optimizer is None:
             self.use_amp = False
             logger.info("Optimizer is None, AMP is disabled.")
@@ -146,6 +135,19 @@ class BaseTrainer:
         # environment
         self.rank = dist.get_rank()
         self.world_size = dist.get_world_size()
+
+        # Keep the model as the sole checkpoint/optimizer owner. A runtime
+        # backend selected by the Trainer must be exposed and validated by the
+        # model before weights, AMP, or distributed wrappers mutate it.
+        self.execution_backend = configure_execution_backend(
+            self.model,
+            execution_config.get("backend"),
+            init_params=execution_config.get("__init_params__"),
+            use_amp=self.use_amp,
+            world_size=self.world_size,
+            owner="Trainer",
+        )
+
         # initialize distributed environment
         if self.world_size > 1:
             fleet.init(is_collective=True)
@@ -155,8 +157,6 @@ class BaseTrainer:
                 "'iters_per_epoch' according to the 'world_size' both linearly if you "
                 "are training model."
             )
-
-        self._validate_execution_backend()
 
         # 4. load pretrained model, usually used for transfer learning
         if self.pretrained_model_path is not None:
@@ -258,16 +258,6 @@ class BaseTrainer:
         self.out_dict_cfg = self.config.get(
             "out_dict", log_cfg.get("out_dict", None)
         )  # None → print all
-
-    def _validate_execution_backend(self):
-        """Validate backend/runtime combinations before model mutation."""
-        validate_execution_backend(
-            self.model,
-            self.execution_backend,
-            use_amp=self.use_amp,
-            world_size=self.world_size,
-            owner="Trainer",
-        )
 
     def get_num_trainable_parameters(self):
         """

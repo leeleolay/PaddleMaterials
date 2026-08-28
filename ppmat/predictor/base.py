@@ -32,7 +32,6 @@ from ppmat.utils import logger
 from ppmat.utils import save_load
 from ppmat.utils.download import is_url
 from ppmat.utils.execution import configure_execution_backend
-from ppmat.utils.execution import validate_execution_backend
 from ppmat.vocab import build_vocab
 
 PathLike = Union[str, os.PathLike]
@@ -189,11 +188,6 @@ class BasePredictor:
             self.model,
             execution_config.get("backend"),
             init_params=execution_config.get("__init_params__"),
-            owner="Predict",
-        )
-        validate_execution_backend(
-            self.model,
-            self.execution_backend,
             world_size=paddle.distributed.get_world_size(),
             owner="Predictor",
         )
