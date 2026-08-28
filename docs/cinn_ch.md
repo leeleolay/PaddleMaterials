@@ -47,9 +47,7 @@ checkpoint 不会增加包装层，eager 与 CINN 的参数键完全相同。
 边界缓存名使用一套固定语义：
 
 - 标准数值前向统一为 `forward`；
-- 独立于采样流程编译的解码器统一为 `decoder`；
 - 单次扩散去噪统一为 `denoise_step`；
-- 带 classifier-free guidance 的 prior 采样统一为 `guided_denoise_step`；
 - 独立组件使用稳定的角色名，当前为 `graph_encoder` 和 `spectrum_encoder`。
 
 `full_graph=False` 使用 SOT 捕获，可以在不支持的 Python 区域断图；
@@ -77,10 +75,10 @@ checkpoint 不会增加包装层，eager 与 CINN 的参数键完全相同。
 | `CHGNet` | 可微 `_runtime_forward` | 严格 AST | 能量/力/应力/磁矩推理 |
 | `DiffCSP` | `_runtime_decode` 去噪步骤 | SOT | 结构采样 |
 | `MatterGen`、`MatterGenWithCondition` | `_runtime_denoise` 步骤 | SOT | 无条件和条件采样 |
-| `MolecularGraphFormer` | `graph_encoder`、`decoder` 和完整 Tensor `denoise_step` | SOT | 已实现，无独立注册流程 |
+| `MolecularGraphFormer` | `graph_encoder` 和 `denoise_step` | SOT | 已实现，无独立注册流程 |
 | `NMRNetCLIP` | 图编码器和谱编码器 | SOT | 已实现，无独立注册流程 |
-| `DiffPrior` | 训练和引导采样的 prior 去噪步骤 | SOT | 已实现，注册 DiffNMR 流程未使用 |
-| `DiffNMR` | `decoder`、完整 Tensor `denoise_step` 和可选 prior 去噪 | SOT | 谱条件只做一次 eager 编码；schedule、特征、decoder、softmax 和 posterior 共用一个采样边界 |
+| `DiffPrior` | prior 去噪步骤 | SOT | 已实现，注册 DiffNMR 流程未使用 |
+| `DiffNMR` | `spectrum_encoder`、`denoise_step` 和可选 prior 去噪 | SOT | 完整反向扩散 |
 | `InfGCN` | 无 | 仅 eager | CINN lowering 未在验证时限内完成 |
 
 InfGCN 仍是正常支持的 eager 模型。它不暴露 runtime 边界或 CINN 构造参数；只有
@@ -88,18 +86,14 @@ InfGCN 仍是正常支持的 eager 模型。它不暴露 runtime 边界或 CINN 
 
 ## 边界放置原则
 
-文件解析、PGL/Python 对象解包、动态拓扑、scheduler 控制流、采样循环、指标和
-可视化应保留在 eager；纯 Tensor scheduler 数学可以进入数值边界。编译数值核心
-只接收 Tensor 和整数拓扑。当前模型的处理方式包括：
+文件解析、PGL/Python 对象解包、动态拓扑、scheduler、采样循环、指标和可视化应
+保留在 eager。编译数值核心只接收 Tensor 和整数拓扑。当前模型的处理方式包括：
 
 - DiffCSP 在 `_runtime_decode` 前构造可变长度的全连接边；
 - MatterGen 在每次编译去噪前重建动态周期邻接图；
 - SphereNet 在 eager 中选择离散扭转边，再在 `_runtime_forward` 中计算连续几何；
 - CHGNet 在 eager 中批处理离散图索引，把几何、消息传递、能量、力和应力保留在
   同一个严格边界中。
-- DiffNMR 只在 eager 中编码一次不变的谱条件，把 schedule 数学、额外特征、
-  decoder、softmax 和 posterior 合并为一个反向步骤边界，再在 eager 中完成离散
-  随机采样。
 
 这套 `eager 拓扑 -> Tensor 索引 -> 编译数值计算` 是模型协议的一部分，不是额外
 的 fallback adapter。

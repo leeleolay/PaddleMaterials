@@ -30,7 +30,6 @@ from ppmat.metrics.diffnmr_metric import SumExceptBatchKL
 from ppmat.metrics.diffnmr_metric import SumExceptBatchMetric
 from ppmat.models.common import initializer
 from ppmat.models.common.runtime import RuntimeMixin
-from ppmat.models.common.runtime import runtime_boundary
 from ppmat.models.diffnmr.diffusion_prior import DiffPriorNetwork
 from ppmat.models.diffnmr.extra_features_graph import DummyExtraFeatures
 from ppmat.models.diffnmr.extra_features_graph import ExtraFeatures
@@ -77,48 +76,6 @@ def _build_graph_features(dataset_infos, diffmodel_cfg):
 
 
 class _DiffNMRSamplingMixin:
-    def run_reverse_probabilities(
-        self,
-        s,
-        t,
-        X_t,
-        E_t,
-        y_t,
-        node_mask,
-        condition,
-    ):
-        return self._runtime_reverse_probabilities(
-            s,
-            t,
-            X_t,
-            E_t,
-            y_t,
-            node_mask,
-            condition,
-        )
-
-    @runtime_boundary("denoise_step")
-    def _runtime_reverse_probabilities(
-        self,
-        s,
-        t,
-        X_t,
-        E_t,
-        y_t,
-        node_mask,
-        condition,
-    ):
-        return scheduling_diffnmr.reverse_probabilities(
-            self,
-            s,
-            t,
-            X_t,
-            E_t,
-            y_t,
-            node_mask,
-            condition,
-        )
-
     @paddle.no_grad()
     def sample(
         self,
@@ -245,15 +202,6 @@ class _DiffNMRSamplingMixin:
                     :written_nodes, :written_nodes
                 ]
 
-        sampling_condition = scheduling_diffnmr.prepare_sampling_condition(
-            self,
-            batch_condition,
-            batch_X,
-            batch_E,
-            batch_y,
-            node_mask,
-        )
-
         for step_index in tqdm(
             range(self.T - 1, -1, -1),
             desc=f"Batch {batch_id} RepeatIter {iter_idx} sampling {self.T}→0",
@@ -268,7 +216,10 @@ class _DiffNMRSamplingMixin:
                 E_t=E_t,
                 y_t=y_t,
                 node_mask=node_mask,
-                condition=sampling_condition,
+                conditionVec=batch_condition,
+                batch_X=batch_X,
+                batch_E=batch_E,
+                batch_y=batch_y,
             )
             X_t, E_t, y_t = sampled_s.X, sampled_s.E, sampled_s.y
             if flag_useformula:
@@ -446,19 +397,11 @@ class MolecularGraphFormer(_DiffNMRSamplingMixin, RuntimeMixin, nn.Layer):
         # set use formula for training and sample or not
         self.flag_use_formula = diffmodel_cfg.get("flag_use_formula", False)
 
-    def run_encoder(self, X, E, y, node_mask):
-        return self._runtime_graph_encoder(X, E, y, node_mask)
+    def run_encoder(self, *args):
+        return self._run_runtime("graph_encoder", self.encoder, *args)
 
-    def run_decoder(self, X, E, y, node_mask):
-        return self._runtime_decoder(X, E, y, node_mask)
-
-    @runtime_boundary("graph_encoder")
-    def _runtime_graph_encoder(self, X, E, y, node_mask):
-        return self.encoder(X, E, y, node_mask)
-
-    @runtime_boundary("decoder")
-    def _runtime_decoder(self, X, E, y, node_mask):
-        return self.decoder(X, E, y, node_mask)
+    def run_decoder(self, *args):
+        return self._run_runtime("denoise_step", self.decoder, *args)
 
     def forward(self, batch):
         batch_graph = batch["graph"]
@@ -568,12 +511,13 @@ class NMRNetCLIP(RuntimeMixin, nn.Layer):
         vocab,
         dataset_infos=None,
         diffmodel_cfg=None,
-        execution_backend="eager",
-        runtime_options=None,
         **kwargs,
     ):
         super().__init__()
-        self._init_runtime(execution_backend, runtime_options)
+        self._init_runtime(
+            kwargs.pop("execution_backend", "eager"),
+            kwargs.pop("runtime_options", None),
+        )
         self.name = kwargs.get("__name__")
         self.vocab = vocab
         peakwidthemb_num = vocab["peakwidth"]["num_embeddings"]
@@ -675,14 +619,6 @@ class NMRNetCLIP(RuntimeMixin, nn.Layer):
         elif isinstance(m, nn.Embedding):
             initializer.normal_(m.weight)
 
-    @runtime_boundary("spectrum_encoder")
-    def _runtime_spectrum_encoder(self, condition):
-        return self.spectrum_encoder(condition)
-
-    @runtime_boundary("graph_encoder")
-    def _runtime_graph_encoder(self, X, E, y, node_mask):
-        return self.graph_encoder(X, E, y, node_mask)
-
     def forward(self, batch):
         batch_graph = batch["graph"]
         batch_property = batch["property"]
@@ -715,10 +651,14 @@ class NMRNetCLIP(RuntimeMixin, nn.Layer):
         num_C_peak = paddle.to_tensor(batch_spectrum["num_C_peak"])
         conditionAll = [condition_H1nmr, num_H_peak, condition_C13nmr, num_C_peak]
         if self.flag_onlyH is True:
-            global_H, _ = self._runtime_spectrum_encoder(conditionAll)
+            global_H, _ = self._run_runtime(
+                "spectrum_encoder", self.spectrum_encoder, conditionAll
+            )
             condition_nmr = global_H
         else:
-            condition_nmr = self._runtime_spectrum_encoder(conditionAll)
+            condition_nmr = self._run_runtime(
+                "spectrum_encoder", self.spectrum_encoder, conditionAll
+            )
 
         # get graph embedded vector
         # prepare the extra feature for encoder input without noisy
@@ -741,7 +681,9 @@ class NMRNetCLIP(RuntimeMixin, nn.Layer):
             x=(z_t.y.astype("float32"), extra_data_pure.y)
         ).astype(dtype="float32")
         # obtain the condition vector from output of encoder
-        condition_graph = self._runtime_graph_encoder(
+        condition_graph = self._run_runtime(
+            "graph_encoder",
+            self.graph_encoder,
             input_X_pure,
             input_E_pure,
             input_y_pure,
@@ -958,29 +900,11 @@ class DiffNMR(_DiffNMRSamplingMixin, RuntimeMixin, nn.Layer):
         # set use formula for training and sample or not
         self.flag_use_formula = diffmodel_cfg.get("flag_use_formula", False)
 
-    def _runtime_children(self):
-        connector = getattr(self, "connector", None)
-        return (connector,) if isinstance(connector, RuntimeMixin) else ()
+    def run_encoder(self, *args):
+        return self._run_runtime("spectrum_encoder", self.encoder, *args)
 
-    def set_execution_backend(self, backend):
-        super().set_execution_backend(backend)
-        for child in self._runtime_children():
-            child.set_execution_backend(backend)
-
-    def set_runtime_options(self, runtime_options):
-        super().set_runtime_options(runtime_options)
-        for child in self._runtime_children():
-            child.set_runtime_options(runtime_options)
-
-    def run_encoder(self, condition):
-        return self.encoder(condition)
-
-    def run_decoder(self, X, E, y, node_mask):
-        return self._runtime_decoder(X, E, y, node_mask)
-
-    @runtime_boundary("decoder")
-    def _runtime_decoder(self, X, E, y, node_mask):
-        return self.decoder(X, E, y, node_mask)
+    def run_decoder(self, *args):
+        return self._run_runtime("denoise_step", self.decoder, *args)
 
     def make_src_mask(self, src):
         src_mask = (src != 0).unsqueeze(1).unsqueeze(2)
@@ -1168,45 +1092,8 @@ class DiffPrior(RuntimeMixin, nn.Layer):
             name="_dummy", tensor=paddle.to_tensor(data=[True]), persistable=False
         )
 
-    @runtime_boundary("denoise_step")
-    def _runtime_denoise(
-        self,
-        graph_embed,
-        diffusion_timesteps,
-        spectrum_embed,
-        spectrum_encodings=None,
-        self_cond=None,
-        spectrum_cond_drop_prob=0.0,
-        graph_cond_drop_prob=0.0,
-    ):
-        return self.net(
-            graph_embed,
-            diffusion_timesteps,
-            spectrum_embed=spectrum_embed,
-            spectrum_encodings=spectrum_encodings,
-            self_cond=self_cond,
-            spectrum_cond_drop_prob=spectrum_cond_drop_prob,
-            graph_cond_drop_prob=graph_cond_drop_prob,
-        )
-
-    @runtime_boundary("guided_denoise_step")
-    def _runtime_guided_denoise(
-        self,
-        graph_embed,
-        diffusion_timesteps,
-        spectrum_embed,
-        spectrum_encodings=None,
-        self_cond=None,
-        cond_scale=1.0,
-    ):
-        return self.net.forward_with_cond_scale(
-            graph_embed,
-            diffusion_timesteps,
-            spectrum_embed=spectrum_embed,
-            spectrum_encodings=spectrum_encodings,
-            self_cond=self_cond,
-            cond_scale=cond_scale,
-        )
+    def _run_prior(self, *args, **kwargs):
+        return self._run_runtime("denoise_step", self.net, *args, **kwargs)
 
     def forward(self, batch):
 
@@ -1357,21 +1244,17 @@ class DiffPrior(RuntimeMixin, nn.Layer):
         self_cond = None
         if self.net.self_cond and random.random() < 0.5:
             with paddle.no_grad():
-                self_cond = self._runtime_denoise(
-                    moleculargraph_embed_noisy,
-                    times,
-                    spectrum_embed=spectrum_cond["spectrum_embed"],
-                    spectrum_encodings=spectrum_cond.get("spectrum_encodings"),
+                self_cond = self._run_prior(
+                    moleculargraph_embed_noisy, times, **spectrum_cond
                 ).detach()
 
-        pred = self._runtime_denoise(
+        pred = self._run_prior(
             moleculargraph_embed_noisy,
             times,
             self_cond=self_cond,
-            spectrum_embed=spectrum_cond["spectrum_embed"],
-            spectrum_encodings=spectrum_cond.get("spectrum_encodings"),
             spectrum_cond_drop_prob=self.spectrum_cond_drop_prob,
             graph_cond_drop_prob=self.graph_cond_drop_prob,
+            **spectrum_cond,
         )
 
         if self.predict_x_start and self.training_clamp_l2norm:
@@ -1525,13 +1408,12 @@ class DiffPrior(RuntimeMixin, nn.Layer):
             alpha = alphas[time]
             time_cond = paddle.full(shape=(batch,), fill_value=time, dtype="int64")
             self_cond = x_start if self.net.self_cond else None
-            pred = self._runtime_guided_denoise(
+            pred = self.net.forward_with_cond_scale(
                 graph_embed,
                 time_cond,
                 self_cond=self_cond,
                 cond_scale=cond_scale,
-                spectrum_embed=spectrum_cond["spectrum_embed"],
-                spectrum_encodings=spectrum_cond.get("spectrum_encodings"),
+                **spectrum_cond,
             )
             if self.predict_v:
                 x_start = self.noise_scheduler.predict_start_from_v(
@@ -1604,13 +1486,8 @@ class DiffPrior(RuntimeMixin, nn.Layer):
             cond_scale != 1.0 and not self.can_classifier_guidance
         ), "the model was not trained with conditional dropout, and thus one cannot \
             use classifier free guidance (cond_scale anything other than 1)"
-        pred = self._runtime_guided_denoise(
-            x,
-            t,
-            cond_scale=cond_scale,
-            self_cond=self_cond,
-            spectrum_embed=spectrum_cond["spectrum_embed"],
-            spectrum_encodings=spectrum_cond.get("spectrum_encodings"),
+        pred = self.net.forward_with_cond_scale(
+            x, t, cond_scale=cond_scale, self_cond=self_cond, **spectrum_cond
         )
         if self.predict_v:
             x_start = self.noise_scheduler.predict_start_from_v(x, t=t, v=pred)

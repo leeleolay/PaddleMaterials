@@ -25,8 +25,6 @@ import pytest
 import ppmat.models as models
 import ppmat.models.common.cinn as cinn_module
 import ppmat.models.common.runtime as runtime_module
-import ppmat.models.diffnmr.diffnmr as diffnmr_module
-import ppmat.schedulers.scheduling_diffnmr as scheduling_diffnmr
 from ppmat.models.common.runtime import RuntimeMixin
 from ppmat.models.common.runtime import register_runtime_backend
 from ppmat.models.common.runtime import runtime_boundary
@@ -36,10 +34,8 @@ from ppmat.utils.execution import configure_execution_backend
 from ppmat.utils.execution import validate_execution_backend
 
 RUNTIME_BOUNDARY_NAMES = {
-    "decoder",
     "forward",
     "denoise_step",
-    "guided_denoise_step",
     "graph_encoder",
     "spectrum_encoder",
 }
@@ -184,15 +180,6 @@ def test_models_accepting_a_backend_implement_the_protocol():
         ("DiffCSP", "_runtime_decode"),
         ("MatterGen", "_runtime_denoise"),
         ("MatterGenWithCondition", "_runtime_denoise"),
-        ("MolecularGraphFormer", "_runtime_graph_encoder"),
-        ("MolecularGraphFormer", "_runtime_decoder"),
-        ("MolecularGraphFormer", "_runtime_reverse_probabilities"),
-        ("NMRNetCLIP", "_runtime_graph_encoder"),
-        ("NMRNetCLIP", "_runtime_spectrum_encoder"),
-        ("DiffNMR", "_runtime_decoder"),
-        ("DiffNMR", "_runtime_reverse_probabilities"),
-        ("DiffPrior", "_runtime_denoise"),
-        ("DiffPrior", "_runtime_guided_denoise"),
     ],
 )
 def test_split_runtime_boundaries_use_standard_private_names(model_name, method_name):
@@ -372,223 +359,6 @@ def test_runtime_boundary_reuses_the_eager_model_method(monkeypatch):
     np.testing.assert_allclose(model({"x": value}).numpy(), [6.0])
     assert len(compiled_functions) == 1
     assert list(model._runtime_cache) == [("cinn", "train", "forward")]
-
-
-def test_diffnmr_propagates_runtime_to_connector():
-    class RuntimeChild(RuntimeMixin, paddle.nn.Layer):
-        def __init__(self):
-            super().__init__()
-            self._init_runtime()
-
-    class TinyDiffNMR(models.DiffNMR):
-        def __init__(self):
-            paddle.nn.Layer.__init__(self)
-            self._init_runtime()
-            self.connector = RuntimeChild()
-
-    model = TinyDiffNMR()
-    configure_execution_backend(
-        model,
-        "cinn",
-        init_params={"full_graph": True},
-        owner="test",
-    )
-
-    assert model.execution_backend == "cinn"
-    assert model.connector.execution_backend == "cinn"
-    assert model.get_runtime_options("cinn") == {"full_graph": True}
-    assert model.connector.get_runtime_options("cinn") == {"full_graph": True}
-
-
-def test_diffnmr_spectrum_encoder_stays_eager(monkeypatch):
-    class CountingEncoder(paddle.nn.Layer):
-        def __init__(self):
-            super().__init__()
-            self.calls = 0
-
-        def forward(self, condition):
-            self.calls += 1
-            return condition
-
-    class TinyDiffNMR(models.DiffNMR):
-        def __init__(self):
-            paddle.nn.Layer.__init__(self)
-            self.encoder = CountingEncoder()
-            self._init_runtime("cinn")
-
-    compiled = []
-
-    def fake_compile(function, **kwargs):
-        del kwargs
-        compiled.append(function.__name__)
-        return function
-
-    monkeypatch.setattr(cinn_module, "compile_cinn", fake_compile)
-    model = TinyDiffNMR()
-    condition = paddle.ones([2, 3])
-
-    assert model.run_encoder(condition) is condition
-    assert model.run_encoder(condition) is condition
-    assert model.encoder.calls == 2
-    assert compiled == []
-    assert model._runtime_cache == {}
-
-
-def test_diffnmr_sampling_uses_complete_tensor_step_boundary():
-    sample_source = inspect.getsource(diffnmr_module._DiffNMRSamplingMixin.sample)
-    step_source = inspect.getsource(scheduling_diffnmr.step)
-    reverse_source = inspect.getsource(scheduling_diffnmr.reverse_probabilities)
-
-    assert sample_source.index("prepare_sampling_condition(") < sample_source.index(
-        "for step_index"
-    )
-    assert "encode_spectrum_condition(" not in step_source
-    assert "model.connector.sample(" in step_source
-    assert "model.run_reverse_probabilities(" in step_source
-    assert "model.run_decoder(" not in step_source
-    assert "model.decoder(" in reverse_source
-    assert "compute_extra_data(" in reverse_source
-    assert "compute_batched_over0_posterior_distribution(" in reverse_source
-    assert "sample_discrete_features(" not in reverse_source
-
-
-def test_diffnmr_reverse_step_compiles_once_as_one_boundary(monkeypatch):
-    class TinyDiffNMR(models.DiffNMR):
-        def __init__(self):
-            paddle.nn.Layer.__init__(self)
-            self._init_runtime("cinn")
-
-        def validate_execution_backend(self, **kwargs):
-            del kwargs
-
-    def fake_reverse_probabilities(
-        model,
-        s,
-        t,
-        X_t,
-        E_t,
-        y_t,
-        node_mask,
-        condition,
-    ):
-        del model, s, t, y_t, node_mask, condition
-        return X_t, E_t
-
-    compiled = []
-
-    def fake_compile(function, **kwargs):
-        del kwargs
-        compiled.append(function.__name__)
-        return function
-
-    monkeypatch.setattr(
-        scheduling_diffnmr,
-        "reverse_probabilities",
-        fake_reverse_probabilities,
-    )
-    monkeypatch.setattr(cinn_module, "compile_cinn", fake_compile)
-
-    model = TinyDiffNMR()
-    s = paddle.zeros([1, 1])
-    t = paddle.ones([1, 1])
-    X_t = paddle.ones([1, 2, 3])
-    E_t = paddle.ones([1, 2, 2, 4])
-    y_t = paddle.zeros([1, 0])
-    node_mask = paddle.ones([1, 2], dtype="bool")
-    condition = paddle.ones([1, 5])
-
-    for _ in range(2):
-        actual_X, actual_E = model.run_reverse_probabilities(
-            s,
-            t,
-            X_t,
-            E_t,
-            y_t,
-            node_mask,
-            condition,
-        )
-        np.testing.assert_allclose(actual_X.numpy(), X_t.numpy())
-        np.testing.assert_allclose(actual_E.numpy(), E_t.numpy())
-
-    assert compiled == ["_runtime_reverse_probabilities"]
-    assert list(model._runtime_cache) == [("cinn", "train", "denoise_step")]
-
-
-def test_diffprior_runtime_covers_training_and_guided_sampling(monkeypatch):
-    class TinyPriorNetwork(paddle.nn.Layer):
-        self_cond = False
-
-        def forward(
-            self,
-            graph_embed,
-            diffusion_timesteps,
-            *,
-            spectrum_embed,
-            **kwargs,
-        ):
-            del diffusion_timesteps, kwargs
-            return graph_embed + spectrum_embed
-
-        def forward_with_cond_scale(
-            self,
-            graph_embed,
-            diffusion_timesteps,
-            *,
-            spectrum_embed,
-            cond_scale=1.0,
-            **kwargs,
-        ):
-            del diffusion_timesteps, kwargs
-            return graph_embed + spectrum_embed * cond_scale
-
-    class TinyDiffPrior(models.DiffPrior):
-        def __init__(self):
-            paddle.nn.Layer.__init__(self)
-            self.net = TinyPriorNetwork()
-            self._init_runtime("cinn")
-
-        def validate_execution_backend(self, **kwargs):
-            del kwargs
-
-    compiled = []
-
-    def fake_compile(function, **kwargs):
-        del kwargs
-        compiled.append(function.__name__)
-        return function
-
-    monkeypatch.setattr(cinn_module, "compile_cinn", fake_compile)
-    model = TinyDiffPrior()
-    graph_embed = paddle.ones([2, 3])
-    spectrum_embed = paddle.full([2, 3], 2.0)
-    times = paddle.zeros([2], dtype="int64")
-
-    denoised = model._runtime_denoise(
-        graph_embed,
-        times,
-        spectrum_embed=spectrum_embed,
-    )
-    guided = model._runtime_guided_denoise(
-        graph_embed,
-        times,
-        spectrum_embed=spectrum_embed,
-        cond_scale=2.0,
-    )
-
-    np.testing.assert_allclose(denoised.numpy(), np.full([2, 3], 3.0))
-    np.testing.assert_allclose(guided.numpy(), np.full([2, 3], 5.0))
-    assert compiled == ["_runtime_denoise", "_runtime_guided_denoise"]
-    assert set(model._runtime_cache) == {
-        ("cinn", "train", "denoise_step"),
-        ("cinn", "train", "guided_denoise_step"),
-    }
-
-
-@pytest.mark.parametrize("method_name", ["p_mean_variance", "p_sample_loop_ddim"])
-def test_diffprior_sampling_routes_through_runtime_boundary(method_name):
-    source = inspect.getsource(getattr(models.DiffPrior, method_name))
-    assert "self._runtime_guided_denoise(" in source
-    assert "self.net.forward_with_cond_scale(" not in source
 
 
 def test_registered_backend_runs_without_model_changes(monkeypatch):

@@ -519,7 +519,7 @@ def sample_discrete_feature_noise(limit_dist, node_mask):
     return ph.mask(node_mask)
 
 
-def encode_spectrum_condition(model, condition):
+def _encode_spectrum_condition(model, condition):
     """Encode the four-branch NMR condition through the declared interface."""
 
     if model.flag_onlyH:
@@ -530,49 +530,13 @@ def encode_spectrum_condition(model, condition):
     return embedding, token_encoding
 
 
-def prepare_sampling_condition(
-    model,
-    condition,
-    batch_X,
-    batch_E,
-    batch_y,
-    node_mask,
+@paddle.no_grad()
+def step(
+    model, s, t, X_t, E_t, y_t, node_mask, conditionVec, batch_X, batch_E, batch_y
 ):
-    """Build the invariant condition used by every reverse-diffusion step."""
-
-    if getattr(model, "conditioning_mode", None) == "spectrum":
-        return encode_spectrum_condition(model, condition)
-
-    batch_values = (
-        diffgraphformer_utils.PlaceHolder(X=batch_X, E=batch_E, y=batch_y)
-        .type_as(batch_X)
-        .mask(node_mask)
-    )
-    extra_data = compute_extra_data(
-        model,
-        {
-            "X_t": batch_values.X,
-            "E_t": batch_values.E,
-            "y_t": batch_values.y,
-            "node_mask": node_mask,
-        },
-        isPure=True,
-    )
-    input_X = paddle.concat(
-        [batch_values.X.astype("float32"), extra_data.X], axis=2
-    ).astype("float32")
-    input_E = paddle.concat(
-        [batch_values.E.astype("float32"), extra_data.E], axis=3
-    ).astype("float32")
-    input_y = paddle.hstack([batch_values.y.astype("float32"), extra_data.y]).astype(
-        "float32"
-    )
-    return model.run_encoder(input_X, input_E, input_y, node_mask)
-
-
-def reverse_probabilities(model, s, t, X_t, E_t, y_t, node_mask, condition):
-    """Compute one deterministic reverse-diffusion step using only tensors."""
-
+    """
+    sample from p(z_s | z_t) : take one step of reverse diffusion
+    """
     beta_t = model.noise_schedule(t_normalized=t)
     alpha_s_bar = model.noise_schedule.get_alpha_bar(t_normalized=s)
     alpha_t_bar = model.noise_schedule.get_alpha_bar(t_normalized=t)
@@ -609,8 +573,65 @@ def reverse_probabilities(model, s, t, X_t, E_t, y_t, node_mask, condition):
         [noisy_data["y_t"].astype("float32"), extra_data.y.astype(dtype="float32")]
     )
 
-    input_y = paddle.concat([input_y, condition], axis=1).astype("float32")
-    pred = model.decoder(input_X, input_E, input_y, node_mask)
+    if getattr(model, "conditioning_mode", None) == "spectrum":
+        embeddings_spectrum, spectrum_encoding = _encode_spectrum_condition(
+            model, conditionVec
+        )
+        if model.connector_flag is True:
+            # DiffPrior treats a missing token sequence as an empty optional
+            # conditioning branch, which is the declared behavior for H-only
+            # encoders.  Keep the connector batch aligned with the graph batch:
+            # its public default generates multiple candidates, while a
+            # reverse-diffusion step needs exactly one embedding per spectrum.
+            embeddings_spectrum = model.connector.sample(
+                embeddings_spectrum,
+                spectrum_encodings=spectrum_encoding,
+                num_samples_per_batch=1,
+            )
+        input_y = paddle.concat([input_y, embeddings_spectrum], axis=1).astype(
+            "float32"
+        )
+
+        # 4. Decoder forward
+        # Convention: pred.X and pred.E are logits with shapes [B, n, Cx] and
+        # [B, n, n, Ce]
+        pred = model.run_decoder(input_X, input_E, input_y, node_mask)
+    else:
+        # prepare the extra feature for encoder input without noisy
+        batch_values = (
+            diffgraphformer_utils.PlaceHolder(X=batch_X, E=batch_E, y=batch_y)
+            .type_as(batch_X)
+            .mask(node_mask)
+        )
+        extra_data_pure = compute_extra_data(
+            model,
+            {
+                "X_t": batch_values.X,
+                "E_t": batch_values.E,
+                "y_t": batch_values.y,
+                "node_mask": node_mask,
+            },
+            isPure=True,
+        )
+        # prepare the input data for encoder combining extra features
+        input_X_pure = paddle.concat(
+            [batch_values.X.astype("float32"), extra_data_pure.X], axis=2
+        ).astype(dtype="float32")
+        input_E_pure = paddle.concat(
+            [batch_values.E.astype("float32"), extra_data_pure.E], axis=3
+        ).astype(dtype="float32")
+        input_y_pure = paddle.hstack(
+            x=(batch_values.y.astype("float32"), extra_data_pure.y)
+        ).astype(dtype="float32")
+        # obtain the condition vector from output of encoder
+        conditionVec = model.run_encoder(
+            input_X_pure, input_E_pure, input_y_pure, node_mask
+        )
+        # complete input_y for decoder
+        input_y = paddle.hstack(x=(input_y, conditionVec)).astype(dtype="float32")
+
+        # forward of decoder with encoder output as condition vector of input of decoder
+        pred = model.run_decoder(input_X, input_E, input_y, node_mask)
 
     pred_X = F.softmax(pred.X, axis=-1)
     pred_E = F.softmax(pred.E, axis=-1)
@@ -648,33 +669,6 @@ def reverse_probabilities(model, s, t, X_t, E_t, y_t, node_mask, condition):
         unnormalized_prob_E, axis=-1, keepdim=True
     )
     prob_E = prob_E.reshape([X_t.shape[0], X_t.shape[1], X_t.shape[1], -1])
-
-    return prob_X, prob_E
-
-
-@paddle.no_grad()
-def step(model, s, t, X_t, E_t, y_t, node_mask, condition):
-    """Sample from p(z_s | z_t) for one reverse-diffusion step."""
-
-    if getattr(model, "conditioning_mode", None) == "spectrum":
-        embeddings_spectrum, spectrum_encoding = condition
-        if model.connector_flag is True:
-            embeddings_spectrum = model.connector.sample(
-                embeddings_spectrum,
-                spectrum_encodings=spectrum_encoding,
-                num_samples_per_batch=1,
-            )
-        condition = embeddings_spectrum
-
-    prob_X, prob_E = model.run_reverse_probabilities(
-        s,
-        t,
-        X_t,
-        E_t,
-        y_t,
-        node_mask,
-        condition,
-    )
 
     assert ((prob_X.sum(axis=-1) - 1).abs().max() < 1e-4).all()
     assert ((prob_E.sum(axis=-1) - 1).abs() < 1e-4).all()
@@ -1027,7 +1021,7 @@ def reconstruction_logp(model, t, X, E, node_mask, condition_Spectrum):
 
     ###########################################################
     if getattr(model, "conditioning_mode", None) == "spectrum":
-        embeddings_spectrum, _ = encode_spectrum_condition(model, condition_Spectrum)
+        embeddings_spectrum, _ = _encode_spectrum_condition(model, condition_Spectrum)
         input_y = paddle.concat([input_y, embeddings_spectrum], axis=1).astype(
             "float32"
         )
