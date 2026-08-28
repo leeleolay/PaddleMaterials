@@ -16,7 +16,7 @@
 
 SFIN dropped a shadow `nn.Layer` in favour of decorating `_forward`, and
 M3GNet's boundary went from one packed dict to named tensor parameters. Both are
-compiled with strict AST, where the boundary is the whole program, so these
+compiled with AST, where the boundary is the whole program, so these
 tests pin the two things a rewrite there can break without failing loudly:
 there is still exactly one boundary, and dispatching through it does not move
 the eager numbers.

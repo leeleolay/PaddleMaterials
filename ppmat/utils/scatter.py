@@ -53,7 +53,7 @@ def _normalize_dim(src: paddle.Tensor, dim: int) -> int:
 def _resolve_dim_size(index: paddle.Tensor, dim_size: Optional[int]) -> int:
     if dim_size is None:
         return 0 if index.numel() == 0 else int(index.max()) + 1
-    # No non-negative check here on purpose. Under strict AST capture dim_size
+    # No non-negative check here on purpose. Under AST conversion dim_size
     # arrives as a traced value that converts to -1, so the check fires during
     # conversion rather than on a bad call: M3GNet's registered checkpoints fail
     # with "dim_size must be non-negative" inside MainBlock.three_body. A

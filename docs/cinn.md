@@ -19,8 +19,8 @@ The same values can be supplied as command-line overrides, for example
 `Execution.backend=cinn`.
 
 - `full_graph: false` uses SOT capture and allows graph breaks.
-- `full_graph: true` requires the whole boundary to become one static program.
-  Use it only for models marked **strict** in the table below.
+- `full_graph: true` uses AST conversion and requires the whole boundary to
+  become one static program. Use it only for models marked **AST** below.
 
 CINN requires a CUDA device and a Paddle build with CINN enabled. AMP and
 distributed execution are not supported by this runtime.
@@ -52,10 +52,10 @@ timings, and numerical tolerances.
 | `MEGNetPlus` | `forward` | SOT | prediction and training |
 | `iComformer` | `forward` | SOT | prediction |
 | `DimeNetPlusPlus` | `forward` | SOT | prediction and training |
-| `SphereNet` | `forward` | SOT for properties; strict for potentials | property and energy/force inference |
-| `SFIN` | `forward` | strict | image inference |
-| `M3GNet` | `forward` | strict | energy/force inference |
-| `CHGNet` | `forward` | strict | energy/force/stress/magnetic-moment inference |
+| `SphereNet` | `forward` | SOT for properties; AST for potentials | property and energy/force inference |
+| `SFIN` | `forward` | AST | image inference |
+| `M3GNet` | `forward` | AST | energy/force inference |
+| `CHGNet` | `forward` | AST | energy/force/stress/magnetic-moment inference |
 | `DiffCSP` | `denoise_step` | SOT | structure sampling |
 | `MatterGen`, `MatterGenWithCondition` | `denoise_step` | SOT | unconditional and conditional sampling |
 | `MolecularGraphFormer` | `graph_encoder`, `denoise_step` | SOT | no standalone registered workflow |

@@ -18,8 +18,8 @@ Execution:
 使用相同配置，例如 `Execution.backend=cinn`。
 
 - `full_graph: false` 使用 SOT 捕获，允许断图；
-- `full_graph: true` 要求整个边界转换为一个静态程序，只适用于下表标记为
-  **严格** 的模型。
+- `full_graph: true` 使用 AST 转换，要求整个边界成为一个静态程序，只适用于
+  下表标记为 **AST** 的模型。
 
 CINN 要求 CUDA 设备以及启用 CINN 的 Paddle。当前运行时不支持 AMP 和分布式
 执行。
@@ -49,10 +49,10 @@ CINN 要求 CUDA 设备以及启用 CINN 的 Paddle。当前运行时不支持 A
 | `MEGNetPlus` | `forward` | SOT | 预测和训练 |
 | `iComformer` | `forward` | SOT | 预测 |
 | `DimeNetPlusPlus` | `forward` | SOT | 预测和训练 |
-| `SphereNet` | `forward` | 属性 SOT；势模型严格 | 属性和能量/力推理 |
-| `SFIN` | `forward` | 严格 | 图像推理 |
-| `M3GNet` | `forward` | 严格 | 能量/力推理 |
-| `CHGNet` | `forward` | 严格 | 能量/力/应力/磁矩推理 |
+| `SphereNet` | `forward` | 属性 SOT；势模型 AST | 属性和能量/力推理 |
+| `SFIN` | `forward` | AST | 图像推理 |
+| `M3GNet` | `forward` | AST | 能量/力推理 |
+| `CHGNet` | `forward` | AST | 能量/力/应力/磁矩推理 |
 | `DiffCSP` | `denoise_step` | SOT | 结构采样 |
 | `MatterGen`、`MatterGenWithCondition` | `denoise_step` | SOT | 无条件和条件采样 |
 | `MolecularGraphFormer` | `graph_encoder`、`denoise_step` | SOT | 无独立注册流程 |

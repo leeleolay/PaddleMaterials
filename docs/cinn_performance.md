@@ -1,58 +1,60 @@
-# CINN full performance matrix
+# CINN performance matrix
 
-This page records the complete registered-weight performance run for commit
-`622438a` on 2026-08-21. It complements the execution-boundary and compatibility
-information in [CINN execution backend](cinn.md) and its
-[Chinese version](cinn_ch.md).
+This is a historical benchmark snapshot for commit `622438a`, measured on
+2026-08-21. Results apply to the recorded code, hardware, inputs, and
+concurrency; they are not guarantees for other workloads or later commits. See
+[CINN execution backend](cinn.md) or the [Chinese guide](cinn_ch.md) for usage.
+
+## Summary
+
+- 74 registered weights were tested. Of the 65 with an available CINN path, all
+  completed in eager and CINN modes; the nine InfGCN weights had no completed
+  CINN result.
+- CINN warm execution was faster for 33 weights and slower for 32.
+- The median per-weight speedup was 1.11x, ranging from 0.51x to 4.36x.
+- Compilation cost was substantial, so deployment benefit depends on repeated
+  calls with representative shapes and batches.
+
+Family values are medians; brackets show the speedup range across registered
+weights in the family.
+
+| Family | Weights | Faster | First CINN median (s) | Eager warm (ms) | CINN warm (ms) | Median speedup [range] |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| CHGNet | 1 | 1 | 143.703 | 39.511 | 19.048 | 2.07x [2.07x, 2.07x] |
+| ComFormer | 8 | 0 | 54.159 | 8.832 | 10.408 | 0.83x [0.63x, 0.94x] |
+| DiffCSP | 1 | 1 | 22.063 | 42.967 | 32.509 | 1.32x [1.32x, 1.32x] |
+| DiffNMR | 1 | 1 | 132.210 | 19,624.969 | 17,736.939 | 1.11x [1.11x, 1.11x] |
+| DimeNet++ | 4 | 4 | 181.085 | 22.395 | 12.052 | 1.87x [1.59x, 2.01x] |
+| MatterGen | 16 | 0 | 266.045 | 368.771 | 512.713 | 0.71x [0.65x, 0.89x] |
+| MatterSim | 2 | 2 | 163.861 | 39.482 | 14.154 | 2.85x [2.53x, 3.16x] |
+| MEGNet | 8 | 0 | 49.942 | 12.442 | 20.326 | 0.63x [0.51x, 0.75x] |
+| SFIN | 4 | 4 | 23.689 | 38.419 | 17.536 | 2.23x [1.76x, 2.66x] |
+| SphereNet MD17 | 8 | 8 | 241.368 | 56.755 | 17.303 | 3.24x [2.24x, 4.36x] |
+| SphereNet QM9 | 12 | 12 | 135.946 | 21.272 | 14.755 | 1.47x [1.29x, 1.67x] |
 
 ## Method
 
 - Environment: Paddle 3.3.1, NVIDIA A100-SXM4-40GB GPUs, and an Intel Xeon Gold
   6148 host.
-- Scope: all 74 registered pretrained weights. The 65 weights whose CINN path is
-  available were timed in eager and CINN modes. The nine guarded InfGCN weights
-  are reported separately.
-- Isolation: each weight ran in its own process. Seven processes used GPUs
-  `0,1,3,4,5,6,7` concurrently to complete the matrix.
-- Inputs: the repository examples used by registered prediction and sampling
-  workflows. Structure generators sampled eight atoms for two denoising steps;
-  DiffNMR ran a complete reverse-diffusion call.
-- Timing: model/checkpoint loading and input conversion occurred before timing.
-  GPU synchronization brackets every call. The first CINN call includes lazy
-  compilation and one execution. Eager warm and CINN warm values are the median
-  of the next ten identically seeded calls.
-- Speedup: `eager warm / CINN warm`. A value below 1 means CINN is slower.
-- Compile estimate: `first CINN call - CINN warm`.
-- Break-even: `ceil(compile estimate / (eager warm - CINN warm))`; it is `never`
-  when CINN warm execution is not faster.
+- Workloads: repository prediction and sampling examples. Structure generators
+  sampled eight atoms for two denoising steps; DiffNMR ran complete reverse
+  diffusion.
+- Timing: model loading, checkpoint loading, and input conversion were excluded.
+  GPU synchronization bracketed each call. Warm results are the median of ten
+  identically seeded calls; the first CINN call is reported separately.
+- Isolation: each weight ran in a separate process. Seven processes used GPUs
+  `0,1,3,4,5,6,7` concurrently.
 
-The seven concurrent compiler processes compete for host CPU and memory
-bandwidth. First-call values therefore characterize this full-matrix throughput
-environment rather than isolated single-process compilation latency. Warm
-medians and break-even estimates can also contain scheduler contention and
-should be remeasured with production shapes, batches, and concurrency before a
-deployment decision.
+| Metric | Definition |
+| --- | --- |
+| First CINN | Lazy compilation plus the first execution |
+| Warm | Median execution time after compilation |
+| Speedup | `eager warm / CINN warm`; values above 1 are faster |
+| Compile estimate | `first CINN - CINN warm` |
+| Break-even | `ceil(compile estimate / (eager warm - CINN warm))`; `never` when warm CINN is not faster |
 
-## Family summary
-
-All 65 available weights completed both backends. CINN warm execution was faster
-for 33 weights and slower for 32. The median per-weight speedup was 1.11x, with a
-range of 0.51x to 4.36x. Family rows report medians; brackets show the range over
-registered weights in that family.
-
-| Family | Weights | Faster weights | First CINN s, median [range] | Eager warm ms, median | CINN warm ms, median | Speedup, median [range] |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| CHGNet | 1 | 1 | 143.703 [143.703, 143.703] | 39.511 | 19.048 | 2.07x [2.07x, 2.07x] |
-| ComFormer | 8 | 0 | 54.159 [52.843, 55.211] | 8.832 | 10.408 | 0.83x [0.63x, 0.94x] |
-| DiffCSP | 1 | 1 | 22.063 [22.063, 22.063] | 42.967 | 32.509 | 1.32x [1.32x, 1.32x] |
-| DiffNMR | 1 | 1 | 132.210 [132.210, 132.210] | 19,624.969 | 17,736.939 | 1.11x [1.11x, 1.11x] |
-| DimeNet++ | 4 | 4 | 181.085 [171.299, 182.780] | 22.395 | 12.052 | 1.87x [1.59x, 2.01x] |
-| MatterGen | 16 | 0 | 266.045 [252.039, 296.511] | 368.771 | 512.713 | 0.71x [0.65x, 0.89x] |
-| MatterSim | 2 | 2 | 163.861 [154.510, 173.213] | 39.482 | 14.154 | 2.85x [2.53x, 3.16x] |
-| MEGNet | 8 | 0 | 49.942 [48.735, 52.215] | 12.442 | 20.326 | 0.63x [0.51x, 0.75x] |
-| SFIN | 4 | 4 | 23.689 [22.830, 23.862] | 38.419 | 17.536 | 2.23x [1.76x, 2.66x] |
-| SphereNet MD17 | 8 | 8 | 241.368 [237.127, 261.710] | 56.755 | 17.303 | 3.24x [2.24x, 4.36x] |
-| SphereNet QM9 | 12 | 12 | 135.946 [88.877, 140.015] | 21.272 | 14.755 | 1.47x [1.29x, 1.67x] |
+Concurrent compilation competes for host CPU and memory bandwidth. Remeasure
+production shapes, batches, and concurrency before making deployment decisions.
 
 ## Per-weight results
 
@@ -124,14 +126,12 @@ registered weights in that family.
 | `spherenet_qm9_r2` | 88.877 | 88.863 | 19.404 | 13.825 | 1.40x | 15,929 |
 | `spherenet_qm9_zpve` | 134.760 | 134.745 | 21.098 | 14.799 | 1.43x | 21,391 |
 
-## Unavailable registered weights
+## InfGCN
 
-Eager execution completed for all nine InfGCN weights. During this dated run,
-the qualification harness bypassed the then-current guard and every model
-entered CINN lowering, but all exceeded the 650-second isolation limit and
-exited with code 124 after 656.6-657.8 seconds. No warm CINN execution was
-reached, so reporting a speedup would be invalid. The runtime wiring was later
-removed; InfGCN now exposes eager execution only.
+All nine InfGCN weights passed eager execution. CINN lowering exceeded the
+650-second isolation limit for every weight (exit code 124 after 656.6-657.8
+seconds), so no warm CINN result or speedup is reported. InfGCN currently uses
+eager execution only.
 
 | Registered weight | Eager | CINN performance |
 | --- | --- | --- |
@@ -145,27 +145,17 @@ removed; InfGCN now exposes eager execution only.
 | `infgcn_omol25_mc_5k_trimmed` | passed | unavailable: lowering timeout |
 | `infgcn_qm9` | passed | unavailable: lowering timeout |
 
-## Interpretation
+## Notes
 
-SphereNet MD17, MatterSim, SFIN, CHGNet, DimeNet++, SphereNet QM9, DiffCSP,
-and DiffNMR were faster after compilation for every registered weight in their
-families. Compilation cost is substantial: excluding DiffNMR's long workflow,
-the estimated break-even for faster weights ranges from 824 to 29,867 repeated
-calls with the same specialized shapes. CINN is therefore most useful in
-long-lived services or sustained batch workloads.
-
-MEGNet, ComFormer, and MatterGen were slower for every registered weight under
-this single-sample or two-step workload. Small property networks are dominated
-by compiled-dispatch overhead. MatterGen retains dynamic periodic topology and
-the sampling loop in eager execution, while compiled denoising dispatch and
-shape specialization cost more than the optimized tensor subgraphs save at this
-workload size.
-
-The performance run also compared deterministic outputs. It passed 48 of 49
-strict comparisons; 16 MatterGen workflows are stochastic and not compared
-elementwise. CHGNet was the one strict-tolerance miss: energy, force, and
-magnetic moment passed, while stress had maximum absolute error `2.44e-5`. The
-separate isolated release qualification remains 49 of 49 and observed CHGNet
-stress maximum absolute error `1.26e-5`. This small run-to-run numerical
-variation does not affect timing status, but applications needing stress near
-zero should set a domain-appropriate absolute tolerance.
+- SphereNet MD17, MatterSim, SFIN, CHGNet, DimeNet++, SphereNet QM9, DiffCSP,
+  and DiffNMR were faster for every registered weight in their families. Apart
+  from DiffNMR's long workflow, faster weights required an estimated 824 to
+  29,867 repeated calls to recover compilation cost.
+- MEGNet, ComFormer, and MatterGen were slower for every registered weight under
+  the tested single-sample or two-step workloads. This result describes these
+  workloads, not larger batches or different shapes.
+- Deterministic output checks passed 48 of 49 strict comparisons; 16 stochastic
+  MatterGen workflows were excluded from elementwise comparison. CHGNet stress
+  differed by at most `2.44e-5`; isolated release qualification passed 49 of 49
+  with a maximum stress difference of `1.26e-5`. Use a domain-appropriate
+  absolute tolerance for stress values near zero.
