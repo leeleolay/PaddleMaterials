@@ -22,13 +22,33 @@ from typing import Any
 
 import paddle
 
+# SOT capture (``full_graph=False``) is the default because it is the mode that the
+# graph-network property predictors and the diffusion samplers can actually compile:
+# their boundaries contain host-side control flow that AST capture rejects outright.
+# Measured on A100 with Paddle 3.3.1, switching this default to True fixes the three
+# derivative models below but breaks DimeNet++, iComFormer, MEGNet, MatterGen and
+# DiffNMR, for a net loss.
+#
+# The two modes are therefore not ordered -- each fixes what the other breaks -- so
+# the correct mode is a per-model property and each model requests it. A boundary
+# containing ``paddle.grad`` must set ``full_graph=True``: under SOT the grad call can
+# land in a resumed fragment while its differentiable leaf stays in an earlier one, and
+# autograd then reports that the input does not appear in the backward graph. CHGNet,
+# M3GNet and SphereNet do this in their constructors whenever a derivative property is
+# requested; ``test/test_spherenet_cinn_workflows.py`` pins the requirement.
+DEFAULT_FULL_GRAPH = False
+
 
 def compile_cinn(
     function: Callable[..., Any] | paddle.nn.Layer,
     *,
-    full_graph: bool = False,
+    full_graph: bool = DEFAULT_FULL_GRAPH,
 ) -> Callable[..., Any] | paddle.nn.Layer:
-    """Compile one numerical callable with the CINN backend."""
+    """Compile one numerical callable with the CINN backend.
+
+    See ``DEFAULT_FULL_GRAPH`` for why the default is SOT capture and why a boundary
+    that differentiates its own inputs must ask for ``full_graph=True``.
+    """
 
     return paddle.jit.to_static(function, backend="CINN", full_graph=full_graph)
 
@@ -47,7 +67,7 @@ class CinnBackend:
         if unknown:
             raise ValueError(f"Unsupported CINN runtime options: {sorted(unknown)}.")
 
-        full_graph = normalized.get("full_graph", False)
+        full_graph = normalized.get("full_graph", DEFAULT_FULL_GRAPH)
         if not isinstance(full_graph, bool):
             raise TypeError("CINN runtime option 'full_graph' must be a bool.")
         return {"full_graph": full_graph}
@@ -98,4 +118,4 @@ class CinnBackend:
 
 CINN_BACKEND = CinnBackend()
 
-__all__ = ["CINN_BACKEND", "CinnBackend", "compile_cinn"]
+__all__ = ["CINN_BACKEND", "DEFAULT_FULL_GRAPH", "CinnBackend", "compile_cinn"]
