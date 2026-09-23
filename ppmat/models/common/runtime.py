@@ -116,6 +116,25 @@ def runtime_boundary(name: str):
     return decorate
 
 
+def runtime_options_with_defaults(
+    runtime_options: Mapping[str, Mapping[str, Any]] | None,
+    defaults: Mapping[str, Mapping[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Fill in runtime options a model requires but the caller did not specify.
+
+    A model knows things about its own boundary that no global default can capture --
+    most importantly whether the boundary differentiates its own inputs, which forces
+    AST capture. It declares those requirements as defaults here, and an explicit
+    caller value always wins so that a configuration can still override the model.
+    """
+    merged = {name: dict(options) for name, options in (runtime_options or {}).items()}
+    for backend_name, backend_defaults in defaults.items():
+        target = merged.setdefault(backend_name, {})
+        for key, value in backend_defaults.items():
+            target.setdefault(key, value)
+    return merged
+
+
 class RuntimeMixin:
     """Own backend selection, compilation and runtime caching."""
 
@@ -211,4 +230,5 @@ __all__ = [
     "get_runtime_backend",
     "register_runtime_backend",
     "runtime_boundary",
+    "runtime_options_with_defaults",
 ]
