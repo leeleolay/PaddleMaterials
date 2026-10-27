@@ -15,6 +15,8 @@ from ppmat.utils.scatter import scatter
 """This module is adapted from https://github.com/Open-Catalyst-Project/ocp/tree/master/ocpmodels/models
 """
 
+TRIPLET_CONVENTIONS = ("legacy", "ocp")
+
 
 class Envelope(paddle.nn.Layer):
     def __init__(self, exponent: int):
@@ -320,6 +322,17 @@ class DimeNetPlusPlus(RuntimeMixin, paddle.nn.Layer):
         loss_type (str, optional): Loss type, can be 'mse_loss' or 'l1_loss'.
             Defaults to "l1_loss".
         act (str, optional): The activation function. Defaults to swish.
+        triplet_convention (str, optional): Edge and triplet convention.
+            ``"ocp"`` follows the OCP/PyG DimeNet++ reference: the message of
+            edge j->i is summed on its target atom i, and a triplet k->j->i is
+            removed only when k is the same periodic image of atom i, so the
+            per-atom prediction does not depend on the choice of (super)cell.
+            ``"legacy"`` keeps the convention that the released
+            ``dimenetpp_mp2018_train_60k_*`` checkpoints were trained with:
+            messages are summed on the source atom j and every triplet with
+            k = i is removed, including triplets through other periodic images
+            of atom i. Defaults to ``"legacy"`` so that existing configs and
+            checkpoints reproduce their results; use ``"ocp"`` for new models.
         execution_backend (str, optional): Numerical execution backend. Use
             ``"eager"`` or ``"cinn"``. Defaults to ``"eager"``.
         runtime_options (dict, optional): Per-backend runtime options.
@@ -349,11 +362,18 @@ class DimeNetPlusPlus(RuntimeMixin, paddle.nn.Layer):
         data_std: float = 1.0,
         loss_type: str = "l1_loss",
         act: str = "swish",
+        triplet_convention: str = "legacy",
         execution_backend: str = "eager",
         runtime_options: dict | None = None,
     ):
         super().__init__()
         self._init_runtime(execution_backend, runtime_options)
+        if triplet_convention not in TRIPLET_CONVENTIONS:
+            raise ValueError(
+                f"triplet_convention must be one of {TRIPLET_CONVENTIONS}, "
+                f"got {triplet_convention!r}."
+            )
+        self.triplet_convention = triplet_convention
         # store hyperparams
         self.out_channels = out_channels
         self.cutoff = cutoff
@@ -418,7 +438,23 @@ class DimeNetPlusPlus(RuntimeMixin, paddle.nn.Layer):
         else:
             raise ValueError(f"Unknown loss type {loss_type}.")
 
-    def triplets(self, edge_index, num_nodes):
+    def triplets(self, edge_index, num_nodes, cell_offsets=None):
+        """Build the triplets k->j->i of a directed graph.
+
+        Args:
+            edge_index (paddle.Tensor): ``[2, num_edges]`` tensor holding the
+                source atom j and the target atom i of every edge j->i.
+            num_nodes (int): Number of atoms.
+            cell_offsets (paddle.Tensor, optional): ``[num_edges, 3]`` lattice
+                image offsets of the edges. If given, a triplet with k = i is
+                kept when k lies in another periodic image of atom i. If None,
+                every triplet with k = i is removed. Defaults to None.
+
+        Returns:
+            tuple: ``(col, row, idx_i, idx_j, idx_k, idx_kj, idx_ji)``, i.e. the
+            target and source atom of every edge, the three atoms of every
+            triplet and the indices of its edges k->j and j->i.
+        """
         row, col = edge_index
         value = paddle.arange(1, row.shape[0] + 1, dtype="int64")
         # build matrix of edge ids per target
@@ -438,7 +474,15 @@ class DimeNetPlusPlus(RuntimeMixin, paddle.nn.Layer):
         idx_k = paddle.index_select(row, idx_kj, axis=0)
         idx_j = paddle.index_select(row, idx_ji, axis=0)
         idx_i = paddle.index_select(col, idx_ji, axis=0)
+        # Remove back-tracking triplets i->j->i. With periodic images, a triplet
+        # with k = i only goes back to the same image of atom i when the image
+        # offsets of k->j and j->i cancel; otherwise k is another image of i.
         mask2 = idx_i != idx_k
+        if cell_offsets is not None:
+            cell_offset_kji = paddle.index_select(
+                cell_offsets, idx_kj, axis=0
+            ) + paddle.index_select(cell_offsets, idx_ji, axis=0)
+            mask2 = mask2 | paddle.any(cell_offset_kji != 0, axis=-1)
         return (
             col,
             row,
@@ -484,9 +528,18 @@ class DimeNetPlusPlus(RuntimeMixin, paddle.nn.Layer):
         edge_index = out["edge_index"]
         dist = out["distances"]
         offsets = out["offsets"]
-        j, i, idx_i, idx_j, idx_k, idx_kj, idx_ji = self.triplets(
-            edge_index, num_nodes=atom_types.shape[0]
-        )
+        if self.triplet_convention == "ocp":
+            # Edge j->i: i = col is the target atom and j = row the source atom.
+            i, j, idx_i, idx_j, idx_k, idx_kj, idx_ji = self.triplets(
+                edge_index, num_nodes=atom_types.shape[0], cell_offsets=to_jimages
+            )
+        else:
+            # Convention of the released checkpoints: the edge roles are swapped
+            # (messages are summed on the source atom) and every k = i triplet
+            # is removed, including those through other periodic images.
+            j, i, idx_i, idx_j, idx_k, idx_kj, idx_ji = self.triplets(
+                edge_index, num_nodes=atom_types.shape[0]
+            )
         # compute angles
         pos_i = pos[idx_i]
         pos_j = pos[idx_j]
