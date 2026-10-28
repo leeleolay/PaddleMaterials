@@ -88,18 +88,15 @@ def _cap_edges_per_destination(src, dst, distances, max_num_neighbors):
 def _cap_nearest_per_row(mask, distances, max_num_neighbors):
     """Keep the ``max_num_neighbors`` nearest ``True`` entries in each row of ``mask``.
 
-    Rows are destinations and columns are sources. Same rule as
-    ``_cap_edges_per_destination``: shorter distance first, ties broken by the
-    smaller source index.
+    Rows are destinations and columns are sources, so the stable sort applies the
+    rule of ``_cap_edges_per_destination``: shorter distance first, ties broken by
+    the smaller source index.
     """
     if int(mask.sum(axis=1).max()) <= max_num_neighbors:
         return mask
-    inf = paddle.full_like(distances, float("inf"))
-    order = paddle.argsort(paddle.where(mask, distances, inf), axis=1, stable=True)
-    valid = paddle.take_along_axis(mask.astype("int64"), order, axis=1)
-    keep = valid * (paddle.cumsum(valid, axis=1) <= max_num_neighbors).astype("int64")
-    keep = paddle.put_along_axis(paddle.zeros_like(keep), order, keep, axis=1)
-    return keep.astype("bool")
+    key = paddle.where(mask, distances, paddle.full_like(distances, float("inf")))
+    rank = paddle.argsort(paddle.argsort(key, axis=1, stable=True), axis=1)
+    return mask & (rank < max_num_neighbors)
 
 
 def radius_graph(
@@ -134,6 +131,7 @@ def radius_graph(
     )
 
 
+@paddle.no_grad()
 def radius(
     x: paddle.Tensor,
     y: paddle.Tensor,
@@ -168,35 +166,34 @@ def radius(
     if max_num_neighbors is not None and max_num_neighbors < 1000000:
         cap = int(max_num_neighbors)
     chunk = max(1, _RADIUS_CHUNK_PAIRS // num_x)
+    r2 = paddle.to_tensor(r * r, dtype=x.dtype, place=x.place)
+    use_batch = batch_x is not None or batch_y is not None
+    if use_batch:
+        if batch_x is None:
+            batch_x = paddle.zeros_like(x[:, 0], dtype="int64")
+        if batch_y is None:
+            batch_y = paddle.zeros_like(y[:, 0], dtype="int64")
+        batch_x = _as_tensor(batch_x, x.place).astype("int64").unsqueeze(0)
+        batch_y = _as_tensor(batch_y, x.place).astype("int64").unsqueeze(1)
+    x_columns = [x[:, k].unsqueeze(0) for k in range(x.shape[1])]
     dst_list, src_list = [], []
-    with paddle.no_grad():
-        r2 = paddle.to_tensor(r * r, dtype=x.dtype, place=x.place)
-        use_batch = batch_x is not None or batch_y is not None
+    for start in range(0, num_y, chunk):
+        y_chunk = y[start : start + chunk]
+        # Add the squared coordinate differences left to right, as the NumPy sum
+        # in the helpers below does (paddle.sum may round differently), so that
+        # pairs at the cutoff and distance ties resolve the same way.
+        dist = None
+        for k, x_column in enumerate(x_columns):
+            diff = y_chunk[:, k : k + 1] - x_column
+            dist = diff * diff if dist is None else dist + diff * diff
+        mask = dist <= r2
         if use_batch:
-            if batch_x is None:
-                batch_x = paddle.zeros_like(x[:, 0], dtype="int64")
-            if batch_y is None:
-                batch_y = paddle.zeros_like(y[:, 0], dtype="int64")
-            batch_x = _as_tensor(batch_x, x.place).astype("int64").unsqueeze(0)
-            batch_y = _as_tensor(batch_y, x.place).astype("int64").unsqueeze(1)
-        x_columns = [x[:, k].unsqueeze(0) for k in range(x.shape[1])]
-        for start in range(0, num_y, chunk):
-            y_chunk = y[start : start + chunk]
-            # Accumulate the squared differences coordinate by coordinate, as the
-            # NumPy helpers below do, so that pairs at the cutoff and distance
-            # ties resolve the same way on every device.
-            dist = None
-            for k, x_column in enumerate(x_columns):
-                diff = y_chunk[:, k : k + 1] - x_column
-                dist = diff * diff if dist is None else dist + diff * diff
-            mask = dist <= r2
-            if use_batch:
-                mask = mask & (batch_y[start : start + chunk] == batch_x)
-            if cap is not None and cap < num_x:
-                mask = _cap_nearest_per_row(mask, dist, cap)
-            edges = paddle.nonzero(mask)
-            dst_list.append(edges[:, 0] + start)
-            src_list.append(edges[:, 1])
+            mask = mask & (batch_y[start : start + chunk] == batch_x)
+        if cap is not None and cap < num_x:
+            mask = _cap_nearest_per_row(mask, dist, cap)
+        edges = paddle.nonzero(mask)
+        dst_list.append(edges[:, 0] + start)
+        src_list.append(edges[:, 1])
     return paddle.concat(dst_list), paddle.concat(src_list)
 
 

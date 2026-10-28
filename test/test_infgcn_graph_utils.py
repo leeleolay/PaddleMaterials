@@ -77,6 +77,29 @@ def test_radius_matches_numpy_search(
 
 
 @pytest.mark.parametrize("place", PLACES)
+def test_radius_matches_numpy_search_within_rounding_of_the_cutoff(place):
+    # Each destination sits a few float32 ulps from the cutoff sphere of one
+    # source, so the result depends on how the squared distance is rounded.
+    rng = np.random.default_rng(0)
+    x = rng.uniform(-3.0, 3.0, size=(20, 3)).astype("float32")
+    direction = rng.normal(size=(2000, 3))
+    direction /= np.linalg.norm(direction, axis=1, keepdims=True)
+    offset = 1.5 * (1.0 + 6e-8 * rng.integers(-8, 9, size=(2000, 1))) * direction
+    y = (x[rng.integers(0, 20, size=2000)] + offset).astype("float32")
+    zeros_x, zeros_y = np.zeros(20, dtype="int64"), np.zeros(2000, dtype="int64")
+    expected = numpy_radius_edges(x, y, 1.5, zeros_x, zeros_y, None)
+
+    dst, src = graph_utils.radius(
+        paddle.to_tensor(x, place=place),
+        paddle.to_tensor(y, place=place),
+        1.5,
+        max_num_neighbors=None,
+    )
+
+    assert edge_list(dst, src) == sorted(expected)
+
+
+@pytest.mark.parametrize("place", PLACES)
 def test_radius_cutoff_is_inclusive_and_cap_prefers_near_then_low_index(place):
     # Sources 0-3 lie exactly at r = 1 from the destination, 4 just beyond it
     # and 5 closer.
