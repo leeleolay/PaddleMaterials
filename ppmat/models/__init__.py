@@ -167,6 +167,7 @@ MODEL_REGISTRY = {
 # a different md5 is downloaded again; archives without an entry are not checked.
 MODEL_MD5: Dict[str, str] = {
     "dimenetpp_mp2018_train_60k_K": "0741584a0cb02f6c42b82d3f11e22770",
+    "dimenetpp_mp2018_train_60k_G": "16be640a64a7de31b1133b30b5734876",
 }
 
 

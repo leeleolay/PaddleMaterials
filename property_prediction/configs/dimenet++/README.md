@@ -186,9 +186,9 @@ Through its architectural improvements, DimeNet++ achieves up to an **8× speedu
             <td  nowrap="nowrap">dimenetpp_mp2018_train_60k_G</td>
             <td  nowrap="nowrap">mp2018_train_60k</td>
             <td  nowrap="nowrap">Shear modulus(GPa)</td>
-            <td  nowrap="nowrap">8.083622 / 7.122238</td>
+            <td  nowrap="nowrap">7.223798 / 5.725558</td>
             <td  nowrap="nowrap">4</td>
-            <td  nowrap="nowrap">~1 hour 38 min</td>
+            <td  nowrap="nowrap">1 hour 53 min</td>
             <td  nowrap="nowrap"><a href="dimenet++_mp2018_train_60k_G.yaml">dimenet++_mp2018_train_60k_G</a></td>
             <td  nowrap="nowrap"><a href="https://paddle-org.bj.bcebos.com/paddlematerials/checkpoints/property_prediction/dimenet++/dimenetpp_mp2018_train_60k_G.zip">checkpoint | log</a></td>
         </tr>
