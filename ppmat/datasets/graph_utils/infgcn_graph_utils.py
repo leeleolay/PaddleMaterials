@@ -15,12 +15,23 @@
 import numpy as np
 import paddle
 
+# Upper bound on the (destination, source) pairs that ``radius`` holds in memory
+# at once; destinations are processed in chunks of this size divided by len(x).
+_RADIUS_CHUNK_PAIRS = 1 << 22
+
 
 def _to_np(array):
     """Return a numpy view of a paddle tensor or pass through an ndarray."""
     if hasattr(array, "numpy"):
         return array.numpy()
     return np.asarray(array)
+
+
+def _as_tensor(array, place=None):
+    """Return ``array`` unchanged if it is a paddle tensor, else convert it."""
+    if isinstance(array, paddle.Tensor):
+        return array
+    return paddle.to_tensor(np.asarray(array), place=place)
 
 
 def _concat_edges(src_list, dst_list, dist_list):
@@ -74,6 +85,23 @@ def _cap_edges_per_destination(src, dst, distances, max_num_neighbors):
     return keep
 
 
+def _cap_nearest_per_row(mask, distances, max_num_neighbors):
+    """Keep the ``max_num_neighbors`` nearest ``True`` entries in each row of ``mask``.
+
+    Rows are destinations and columns are sources. Same rule as
+    ``_cap_edges_per_destination``: shorter distance first, ties broken by the
+    smaller source index.
+    """
+    if int(mask.sum(axis=1).max()) <= max_num_neighbors:
+        return mask
+    inf = paddle.full_like(distances, float("inf"))
+    order = paddle.argsort(paddle.where(mask, distances, inf), axis=1, stable=True)
+    valid = paddle.take_along_axis(mask.astype("int64"), order, axis=1)
+    keep = valid * (paddle.cumsum(valid, axis=1) <= max_num_neighbors).astype("int64")
+    keep = paddle.put_along_axis(paddle.zeros_like(keep), order, keep, axis=1)
+    return keep.astype("bool")
+
+
 def radius_graph(
     x: paddle.Tensor,
     r: float,
@@ -118,28 +146,58 @@ def radius(
 
     Returns ``(dst, src)`` aligned with the historical convention: the first tensor
     indexes ``y`` (e.g. grid points) and the second indexes ``x`` (e.g. atoms).
-    Each destination keeps at most ``max_num_neighbors`` nearest sources.
+    Each destination keeps at most ``max_num_neighbors`` nearest sources; ties go
+    to the smaller source index, and ``None`` or a value >= 1_000_000 disables
+    the cap.
+
+    A pair is connected when both points belong to the same graph and their
+    squared distance is ``<= r * r``. The search runs with paddle ops on the
+    device of ``x``, one chunk of destinations at a time, and the edges are
+    sorted by destination, then source.
     """
-    x_np = _to_np(x)
-    y_np = _to_np(y)
-    if batch_x is None:
-        batch_x = paddle.zeros((x_np.shape[0],), dtype="int64")
-    if batch_y is None:
-        batch_y = paddle.zeros((y_np.shape[0],), dtype="int64")
-    bx_np = _to_np(batch_x)
-    by_np = _to_np(batch_y)
+    x = _as_tensor(x)
+    y = _as_tensor(y, x.place)
+    if x.dtype != y.dtype:
+        x, y = x.astype("float64"), y.astype("float64")
+    num_x, num_y = x.shape[0], y.shape[0]
+    if num_x == 0 or num_y == 0:
+        empty = paddle.zeros_like(x[:0, 0], dtype="int64")
+        return empty, empty.clone()
 
-    atoms_grids_scenario = x_np.shape[0] < 1000 and y_np.shape[0] > 1000
-    if atoms_grids_scenario:
-        src, dst, dist = radius_atoms_to_grids(x_np, y_np, r, bx_np, by_np)
-    elif x_np.shape[0] > 1000 or y_np.shape[0] > 1000:
-        src, dst, dist = radius_grid(x_np, y_np, r, bx_np, by_np)
-    else:
-        src, dst, dist = radius_simple(x_np, y_np, r, bx_np, by_np)
-
-    keep = _cap_edges_per_destination(src, dst, dist, max_num_neighbors)
-    src, dst = src[keep], dst[keep]
-    return paddle.to_tensor(dst, dtype="int64"), paddle.to_tensor(src, dtype="int64")
+    cap = None
+    if max_num_neighbors is not None and max_num_neighbors < 1000000:
+        cap = int(max_num_neighbors)
+    chunk = max(1, _RADIUS_CHUNK_PAIRS // num_x)
+    dst_list, src_list = [], []
+    with paddle.no_grad():
+        r2 = paddle.to_tensor(r * r, dtype=x.dtype, place=x.place)
+        use_batch = batch_x is not None or batch_y is not None
+        if use_batch:
+            if batch_x is None:
+                batch_x = paddle.zeros_like(x[:, 0], dtype="int64")
+            if batch_y is None:
+                batch_y = paddle.zeros_like(y[:, 0], dtype="int64")
+            batch_x = _as_tensor(batch_x, x.place).astype("int64").unsqueeze(0)
+            batch_y = _as_tensor(batch_y, x.place).astype("int64").unsqueeze(1)
+        x_columns = [x[:, k].unsqueeze(0) for k in range(x.shape[1])]
+        for start in range(0, num_y, chunk):
+            y_chunk = y[start : start + chunk]
+            # Accumulate the squared differences coordinate by coordinate, as the
+            # NumPy helpers below do, so that pairs at the cutoff and distance
+            # ties resolve the same way on every device.
+            dist = None
+            for k, x_column in enumerate(x_columns):
+                diff = y_chunk[:, k : k + 1] - x_column
+                dist = diff * diff if dist is None else dist + diff * diff
+            mask = dist <= r2
+            if use_batch:
+                mask = mask & (batch_y[start : start + chunk] == batch_x)
+            if cap is not None and cap < num_x:
+                mask = _cap_nearest_per_row(mask, dist, cap)
+            edges = paddle.nonzero(mask)
+            dst_list.append(edges[:, 0] + start)
+            src_list.append(edges[:, 1])
+    return paddle.concat(dst_list), paddle.concat(src_list)
 
 
 def radius_graph_simple(
@@ -251,7 +309,11 @@ def radius_atoms_to_grids(
                         for dz in (-1, 0, 1):
                             nearby.extend(
                                 atom_grid.get(
-                                    (cell_idx[0] + dx, cell_idx[1] + dy, cell_idx[2] + dz),
+                                    (
+                                        cell_idx[0] + dx,
+                                        cell_idx[1] + dy,
+                                        cell_idx[2] + dz,
+                                    ),
                                     [],
                                 )
                             )
