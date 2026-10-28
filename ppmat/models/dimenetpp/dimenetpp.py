@@ -1,3 +1,4 @@
+import math
 from typing import Callable
 from typing import Optional
 
@@ -41,25 +42,13 @@ class BesselBasisLayer(paddle.nn.Layer):
         super().__init__()
         self.cutoff = cutoff
         self.envelope = Envelope(envelope_exponent)
+        # Initial frequencies n * pi for n = 1, ..., num_radial, as in PyG and OCP.
         self.freq = paddle.create_parameter(
-            shape=paddle.empty(
-                shape=[
-                    num_radial,
-                ]
-            ).shape,
-            dtype=paddle.empty(
-                shape=[
-                    num_radial,
-                ]
-            )
-            .numpy()
-            .dtype,
+            shape=[num_radial],
+            dtype=paddle.get_default_dtype(),
             default_initializer=paddle.nn.initializer.Assign(
-                paddle.empty(
-                    shape=[
-                        num_radial,
-                    ]
-                )
+                paddle.arange(1, num_radial + 1, dtype=paddle.get_default_dtype())
+                * math.pi
             ),
         )
         self.freq.stop_gradient = False
@@ -320,11 +309,6 @@ class DimeNetPlusPlus(RuntimeMixin, paddle.nn.Layer):
         loss_type (str, optional): Loss type, can be 'mse_loss' or 'l1_loss'.
             Defaults to "l1_loss".
         act (str, optional): The activation function. Defaults to swish.
-        triplet_convention (str, optional): "ocp" sums the message of edge j->i
-            on its target atom i and keeps the triplets k->j->i in which k is
-            another periodic image of atom i, as in OCP. "legacy" keeps the
-            previous behaviour, which the released checkpoints were trained with.
-            Defaults to "legacy".
         execution_backend (str, optional): Numerical execution backend. Use
             ``"eager"`` or ``"cinn"``. Defaults to ``"eager"``.
         runtime_options (dict, optional): Per-backend runtime options.
@@ -354,7 +338,6 @@ class DimeNetPlusPlus(RuntimeMixin, paddle.nn.Layer):
         data_std: float = 1.0,
         loss_type: str = "l1_loss",
         act: str = "swish",
-        triplet_convention: str = "legacy",
         execution_backend: str = "eager",
         runtime_options: dict | None = None,
     ):
@@ -366,9 +349,6 @@ class DimeNetPlusPlus(RuntimeMixin, paddle.nn.Layer):
         self.max_num_neighbors = max_num_neighbors
         self.otf_graph = otf_graph
         self.readout = readout
-        if triplet_convention not in ("legacy", "ocp"):
-            raise ValueError(f"Unknown triplet convention {triplet_convention}.")
-        self.triplet_convention = triplet_convention
         if isinstance(property_names, list):
             self.property_names = property_names[0]
         else:
@@ -427,8 +407,8 @@ class DimeNetPlusPlus(RuntimeMixin, paddle.nn.Layer):
         else:
             raise ValueError(f"Unknown loss type {loss_type}.")
 
-    def triplets(self, edge_index, num_nodes, cell_offsets=None):
-        row, col = edge_index
+    def triplets(self, edge_index, cell_offsets, num_nodes):
+        row, col = edge_index  # j->i
         value = paddle.arange(1, row.shape[0] + 1, dtype="int64")
         # build matrix of edge ids per target
         n = col.shape[0]
@@ -447,12 +427,11 @@ class DimeNetPlusPlus(RuntimeMixin, paddle.nn.Layer):
         idx_k = paddle.index_select(row, idx_kj, axis=0)
         idx_j = paddle.index_select(row, idx_ji, axis=0)
         idx_i = paddle.index_select(col, idx_ji, axis=0)
-        mask2 = idx_i != idx_k
-        if cell_offsets is not None:
-            # Keep k = i if k is another periodic image of atom i, i.e. if the
-            # image offsets of k->j and j->i do not cancel (as in OCP).
-            cell_offset_kji = cell_offsets[idx_kj] + cell_offsets[idx_ji]
-            mask2 = mask2 | paddle.any(cell_offset_kji != 0, axis=-1)
+        # Drop the back-tracking triplets i->j->i. As in OCP, a triplet with k = i is
+        # kept if the image offsets of k->j and j->i do not cancel, i.e. if k is
+        # another periodic image of atom i.
+        cell_offset_kji = cell_offsets[idx_kj] + cell_offsets[idx_ji]
+        mask2 = (idx_i != idx_k) | paddle.any(cell_offset_kji != 0, axis=-1)
         return (
             col,
             row,
@@ -498,16 +477,10 @@ class DimeNetPlusPlus(RuntimeMixin, paddle.nn.Layer):
         edge_index = out["edge_index"]
         dist = out["distances"]
         offsets = out["offsets"]
-        # triplets() returns the target atom i and the source atom j of each edge
-        # j->i. "legacy" swaps them and drops every triplet k->j->i with k = i.
-        if self.triplet_convention == "ocp":
-            i, j, idx_i, idx_j, idx_k, idx_kj, idx_ji = self.triplets(
-                edge_index, num_nodes=atom_types.shape[0], cell_offsets=to_jimages
-            )
-        else:
-            j, i, idx_i, idx_j, idx_k, idx_kj, idx_ji = self.triplets(
-                edge_index, num_nodes=atom_types.shape[0]
-            )
+        # i is the target and j the source atom of each edge j->i.
+        i, j, idx_i, idx_j, idx_k, idx_kj, idx_ji = self.triplets(
+            edge_index, to_jimages, num_nodes=atom_types.shape[0]
+        )
         # compute angles
         pos_i = pos[idx_i]
         pos_j = pos[idx_j]

@@ -19,6 +19,7 @@ import paddle
 import pytest
 from pymatgen.core import Structure
 
+from ppmat.datasets.collate_fn import DefaultCollator
 from ppmat.models.common.graph_converter import CrystalNN
 from ppmat.models.dimenetpp.dimenetpp import DimeNetPlusPlus
 
@@ -26,22 +27,15 @@ CIF_PATH = (
     Path(__file__).resolve().parents[1]
     / "property_prediction/example_data/cifs/mp-18767-LiMnO2.cif"
 )
+PROPERTY = "formation_energy_per_atom"
+# Predictions of _model() for the 8-atom LiMnO2 cell (mp-18767) and its 2x2x2
+# supercell, computed with OCP v0.1.0 DimeNetPlusPlusWrap (use_pbc=True,
+# otf_graph=False) from the same weights and graphs and divided by the number of
+# atoms, because OCP sums over atoms.
+OCP_PREDICTIONS = [0.5291295647621155, 0.5291295051574707]
 
 
-# Per-atom predictions of a small model with fixed weights for the 8-atom LiMnO2
-# cell (mp-18767) and its 2x2x2 supercell.
-@pytest.mark.parametrize(
-    "kwargs, expected",
-    [
-        # Default ("legacy"): recorded on develop before triplet_convention existed.
-        ({}, [0.6343210935592651, 0.5156241655349731]),
-        # OCP v0.1.0 DimeNetPlusPlusWrap with the same weights and graphs, which
-        # gives the same value for both cells.
-        ({"triplet_convention": "ocp"}, [0.5291295647621155, 0.5291295051574707]),
-    ],
-    ids=["default", "ocp"],
-)
-def test_triplet_convention(kwargs, expected):
+def _model():
     model = DimeNetPlusPlus(
         out_channels=1,
         hidden_channels=16,
@@ -54,20 +48,44 @@ def test_triplet_convention(kwargs, expected):
         cutoff=7.0,
         num_after_skip=1,
         num_output_layers=2,
-        **kwargs,
+        property_names=PROPERTY,
     )
-    # Weights large enough that swapping the edge roles changes the prediction.
+    # Fixed random weights, large enough that swapping the edge roles changes the
+    # prediction. rbf.freq keeps its initial values n * pi, which OCP used too; its
+    # draw is discarded so that the other weights stay those of the OCP run.
     rng = np.random.default_rng(2026)
-    for param in model.parameters():
+    for name, param in model.named_parameters():
         bound = 1.4 / np.sqrt(param.shape[0]) if len(param.shape) == 2 else 0.5
-        param.set_value(rng.uniform(-bound, bound, param.shape).astype("float32"))
-    model.rbf.freq.set_value(paddle.arange(1, 5, dtype="float32") * np.pi)
+        value = rng.uniform(-bound, bound, param.shape).astype("float32")
+        if name != "rbf.freq":
+            param.set_value(value)
     model.eval()
+    return model
 
-    predictions = []
+
+@pytest.fixture(scope="module")
+def graphs():
+    result = []
     for scale in (1, 2):
         structure = Structure.from_file(CIF_PATH)
         structure.make_supercell(scale)
-        prediction = model.predict(CrystalNN()(structure))
-        predictions.append(float(prediction["formation_energy_per_atom"]))
-    np.testing.assert_allclose(predictions, expected, rtol=1e-5)
+        result.append(CrystalNN()(structure))
+    return result
+
+
+def test_supercell_gives_the_same_prediction(graphs):
+    batch = DefaultCollator()(graphs)
+    with paddle.no_grad():
+        output = _model()({"graph": batch}, return_loss=False)
+    primitive, supercell = output["pred_dict"][PROPERTY].numpy().reshape(-1)
+
+    np.testing.assert_allclose(supercell, primitive, rtol=1e-5)
+
+
+def test_matches_ocp_dimenetpp(graphs):
+    model = _model()
+    predictions = [
+        float(model.predict(graph.tensor(inplace=False))[PROPERTY]) for graph in graphs
+    ]
+
+    np.testing.assert_allclose(predictions, OCP_PREDICTIONS, rtol=1e-5)
