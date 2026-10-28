@@ -163,12 +163,6 @@ MODEL_REGISTRY = {
     "diffnmr_msdnmr_nless15": "https://paddle-org.bj.bcebos.com/paddlematerials/checkpoints/spectrum_elucidation/diffnmr/diffnmr_msdnmr_nless15.zip",
 }
 
-# md5 of replaced archives; a cached archive with another md5 is downloaded again.
-MODEL_MD5: Dict[str, str] = {
-    "dimenetpp_mp2018_train_60k_K": "0741584a0cb02f6c42b82d3f11e22770",
-    "dimenetpp_mp2018_train_60k_G": "16be640a64a7de31b1133b30b5734876",
-}
-
 
 def build_graph_converter(cfg: Dict, vocab=None):
     """Build graph converter.
@@ -263,9 +257,7 @@ def build_model_from_name(
     weights_name: Optional[str] = None,
     model_config_modifier: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
 ):
-    extracted_path = download.get_weights_path_from_url(
-        MODEL_REGISTRY[model_name], MODEL_MD5.get(model_name)
-    )
+    extracted_path = download.get_weights_path_from_url(MODEL_REGISTRY[model_name])
     path = resolve_model_package_dir(model_name, extracted_path)
     logger.info(f"Save model and configuration files in path: {path}")
     config_path = get_model_config_path(model_name, path)
