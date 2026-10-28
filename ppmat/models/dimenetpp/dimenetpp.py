@@ -42,10 +42,19 @@ class BesselBasisLayer(paddle.nn.Layer):
         super().__init__()
         self.cutoff = cutoff
         self.envelope = Envelope(envelope_exponent)
-        # Initial frequencies n * pi for n = 1, ..., num_radial, as in PyG and OCP.
         self.freq = paddle.create_parameter(
-            shape=[num_radial],
-            dtype=paddle.get_default_dtype(),
+            shape=paddle.empty(
+                shape=[
+                    num_radial,
+                ]
+            ).shape,
+            dtype=paddle.empty(
+                shape=[
+                    num_radial,
+                ]
+            )
+            .numpy()
+            .dtype,
             default_initializer=paddle.nn.initializer.Assign(
                 paddle.arange(1, num_radial + 1, dtype=paddle.get_default_dtype())
                 * math.pi
@@ -408,7 +417,7 @@ class DimeNetPlusPlus(RuntimeMixin, paddle.nn.Layer):
             raise ValueError(f"Unknown loss type {loss_type}.")
 
     def triplets(self, edge_index, cell_offsets, num_nodes):
-        row, col = edge_index  # j->i
+        row, col = edge_index
         value = paddle.arange(1, row.shape[0] + 1, dtype="int64")
         # build matrix of edge ids per target
         n = col.shape[0]
@@ -427,9 +436,7 @@ class DimeNetPlusPlus(RuntimeMixin, paddle.nn.Layer):
         idx_k = paddle.index_select(row, idx_kj, axis=0)
         idx_j = paddle.index_select(row, idx_ji, axis=0)
         idx_i = paddle.index_select(col, idx_ji, axis=0)
-        # Drop the back-tracking triplets i->j->i. As in OCP, a triplet with k = i is
-        # kept if the image offsets of k->j and j->i do not cancel, i.e. if k is
-        # another periodic image of atom i.
+        # Remove i == k triplets with the same cell offset.
         cell_offset_kji = cell_offsets[idx_kj] + cell_offsets[idx_ji]
         mask2 = (idx_i != idx_k) | paddle.any(cell_offset_kji != 0, axis=-1)
         return (
@@ -477,7 +484,6 @@ class DimeNetPlusPlus(RuntimeMixin, paddle.nn.Layer):
         edge_index = out["edge_index"]
         dist = out["distances"]
         offsets = out["offsets"]
-        # i is the target and j the source atom of each edge j->i.
         i, j, idx_i, idx_j, idx_k, idx_kj, idx_ji = self.triplets(
             edge_index, to_jimages, num_nodes=atom_types.shape[0]
         )
