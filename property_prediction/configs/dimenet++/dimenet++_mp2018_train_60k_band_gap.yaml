@@ -94,9 +94,6 @@ Model:
     data_std: 1.6214
     # loss
     loss_type: 'l1_loss'
-    # edge/triplet convention: the released checkpoint was trained with
-    # "legacy"; set "ocp" to train a new model with the corrected convention
-    triplet_convention: legacy
 
 Metric:
   band_gap:

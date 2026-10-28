@@ -195,12 +195,6 @@ Through its architectural improvements, DimeNet++ achieves up to an **8× speedu
     </body>
 </table>
 
-### Edge and triplet convention
-
-`DimeNetPlusPlus` takes a `triplet_convention` option. The checkpoints above were trained with `triplet_convention: legacy`, which their configs set explicitly and which is also the default. In this mode the message of edge j → i is summed on atom j instead of atom i, and every triplet k → j → i with k = i is dropped, including triplets that reach another periodic image of atom i. Because of the second point, predictions for small cells depend on the choice of cell: the formation energy checkpoint gives -2.1553 eV/atom for the 8-atom LiMnO2 cell (mp-18767) and -2.1594 eV/atom for its 2x2x2 or 4x4x4 supercell.
-
-`triplet_convention: ocp` follows the equations above and the OCP DimeNet++ implementation, and gives the same per-atom prediction for every supercell of a crystal. Use it to train new models, for example by appending `Model.__init_params__.triplet_convention=ocp` to the training commands below. Keep `legacy` for the released checkpoints.
-
 ### Training
 ```bash
 # formation energy per atom
