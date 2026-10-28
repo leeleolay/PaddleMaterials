@@ -85,20 +85,6 @@ def _cap_edges_per_destination(src, dst, distances, max_num_neighbors):
     return keep
 
 
-def _cap_nearest_per_row(mask, distances, max_num_neighbors):
-    """Keep the ``max_num_neighbors`` nearest ``True`` entries in each row of ``mask``.
-
-    Rows are destinations and columns are sources, so the stable sort applies the
-    rule of ``_cap_edges_per_destination``: shorter distance first, ties broken by
-    the smaller source index.
-    """
-    if int(mask.sum(axis=1).max()) <= max_num_neighbors:
-        return mask
-    key = paddle.where(mask, distances, paddle.full_like(distances, float("inf")))
-    rank = paddle.argsort(paddle.argsort(key, axis=1, stable=True), axis=1)
-    return mask & (rank < max_num_neighbors)
-
-
 def radius_graph(
     x: paddle.Tensor,
     r: float,
@@ -144,13 +130,12 @@ def radius(
 
     Returns ``(dst, src)`` aligned with the historical convention: the first tensor
     indexes ``y`` (e.g. grid points) and the second indexes ``x`` (e.g. atoms).
-    Each destination keeps at most ``max_num_neighbors`` nearest sources; ties go
-    to the smaller source index, and ``None`` or a value >= 1_000_000 disables
-    the cap.
+    Each destination keeps at most ``max_num_neighbors`` nearest sources.
 
-    A pair is connected when both points belong to the same graph and their
-    squared distance is ``<= r * r``. The search runs with paddle ops on the
-    device of ``x``, one chunk of destinations at a time, and the edges are
+    Points of the same graph are connected when their squared distance is
+    ``<= r * r``; ties under the cap go to the smaller source index, and ``None``
+    or a value >= 1_000_000 disables the cap. The search runs with paddle ops on
+    the device of ``x``, a chunk of destinations at a time, and returns the edges
     sorted by destination, then source.
     """
     x = _as_tensor(x)
@@ -167,30 +152,30 @@ def radius(
         cap = int(max_num_neighbors)
     chunk = max(1, _RADIUS_CHUNK_PAIRS // num_x)
     r2 = paddle.to_tensor(r * r, dtype=x.dtype, place=x.place)
-    use_batch = batch_x is not None or batch_y is not None
-    if use_batch:
-        if batch_x is None:
-            batch_x = paddle.zeros_like(x[:, 0], dtype="int64")
-        if batch_y is None:
-            batch_y = paddle.zeros_like(y[:, 0], dtype="int64")
-        batch_x = _as_tensor(batch_x, x.place).astype("int64").unsqueeze(0)
-        batch_y = _as_tensor(batch_y, x.place).astype("int64").unsqueeze(1)
+    if batch_x is None:
+        batch_x = paddle.zeros_like(x[:, 0], dtype="int64")
+    if batch_y is None:
+        batch_y = paddle.zeros_like(y[:, 0], dtype="int64")
+    batch_x = _as_tensor(batch_x, x.place).astype("int64").unsqueeze(0)
+    batch_y = _as_tensor(batch_y, x.place).astype("int64").unsqueeze(1)
     x_columns = [x[:, k].unsqueeze(0) for k in range(x.shape[1])]
     dst_list, src_list = [], []
     for start in range(0, num_y, chunk):
         y_chunk = y[start : start + chunk]
-        # Add the squared coordinate differences left to right, as the NumPy sum
-        # in the helpers below does (paddle.sum may round differently), so that
-        # pairs at the cutoff and distance ties resolve the same way.
+        # Sum the squared coordinate differences left to right, as NumPy did:
+        # paddle.sum rounds differently (and differently on CPU and GPU), which
+        # would change which pairs at the cutoff are kept.
         dist = None
         for k, x_column in enumerate(x_columns):
             diff = y_chunk[:, k : k + 1] - x_column
             dist = diff * diff if dist is None else dist + diff * diff
-        mask = dist <= r2
-        if use_batch:
-            mask = mask & (batch_y[start : start + chunk] == batch_x)
-        if cap is not None and cap < num_x:
-            mask = _cap_nearest_per_row(mask, dist, cap)
+        mask = (dist <= r2) & (batch_y[start : start + chunk] == batch_x)
+        if cap is not None and cap < num_x and int(mask.sum(axis=1).max()) > cap:
+            # Rank each destination's candidates by distance; the stable sort
+            # breaks ties by the column, i.e. the smaller source index.
+            key = paddle.where(mask, dist, paddle.full_like(dist, float("inf")))
+            rank = paddle.argsort(paddle.argsort(key, axis=1, stable=True), axis=1)
+            mask = mask & (rank < cap)
         edges = paddle.nonzero(mask)
         dst_list.append(edges[:, 0] + start)
         src_list.append(edges[:, 1])
@@ -225,109 +210,6 @@ def radius_graph_simple(
             src_list.append(idx[row])
             dst_list.append(idx[col])
             dist_list.append(d2[row, col])
-    return _concat_edges(src_list, dst_list, dist_list)
-
-
-def radius_simple(
-    x_np: np.ndarray,
-    y_np: np.ndarray,
-    r: float,
-    batch_x_np: np.ndarray,
-    batch_y_np: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Dense bipartite radius graph for small node counts.
-
-    ``x`` are sources, ``y`` are destinations. Returns ``(src, dst, dist)`` global
-    edge arrays for every within-cutoff pair.
-    """
-    batch_size = max(int(batch_x_np.max()), int(batch_y_np.max())) + 1
-    r2 = r * r
-    src_list, dst_list, dist_list = [], [], []
-    for b in range(batch_size):
-        mx = batch_x_np == b
-        my = batch_y_np == b
-        ix = np.where(mx)[0]
-        iy = np.where(my)[0]
-        if ix.size == 0 or iy.size == 0:
-            continue
-        sx = x_np[mx]
-        sy = y_np[my]
-        d2 = ((sx[:, None, :] - sy[None, :, :]) ** 2).sum(-1)
-        row, col = np.where(d2 <= r2)
-        if row.size:
-            src_list.append(ix[row])
-            dst_list.append(iy[col])
-            dist_list.append(d2[row, col])
-    return _concat_edges(src_list, dst_list, dist_list)
-
-
-def radius_atoms_to_grids(
-    x_np: np.ndarray,
-    y_np: np.ndarray,
-    r: float,
-    batch_x_np: np.ndarray,
-    batch_y_np: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Spatially-hashed bipartite radius graph for many destinations.
-
-    ``x`` are atoms (few), ``y`` are grid points (many). Returns ``(src, dst, dist)``
-    global edge arrays for every within-cutoff pair; no truncation.
-    """
-    batch_size = max(int(batch_x_np.max()), int(batch_y_np.max())) + 1
-    r2 = r * r
-    src_list, dst_list, dist_list = [], [], []
-    grid_chunk_size = 10000
-    for b in range(batch_size):
-        atom_mask = batch_x_np == b
-        grid_mask = batch_y_np == b
-        if not atom_mask.any() or not grid_mask.any():
-            continue
-        atoms = x_np[atom_mask]
-        atom_indices = np.where(atom_mask)[0]
-        grid_indices = np.where(grid_mask)[0]
-        grids = y_np[grid_mask]
-
-        min_coords = atoms.min(axis=0) - r
-        cell_size = r
-        atom_grid: dict[tuple[int, int, int], list[int]] = {}
-        for i, atom_pos in enumerate(atoms):
-            cell_idx = tuple(np.floor((atom_pos - min_coords) / cell_size).astype(int))
-            atom_grid.setdefault(cell_idx, []).append(i)
-
-        for start in range(0, grids.shape[0], grid_chunk_size):
-            end = min(start + grid_chunk_size, grids.shape[0])
-            for gi, grid_pos in enumerate(grids[start:end]):
-                cell_idx = tuple(
-                    np.floor((grid_pos - min_coords) / cell_size).astype(int)
-                )
-                nearby: list[int] = []
-                for dx in (-1, 0, 1):
-                    for dy in (-1, 0, 1):
-                        for dz in (-1, 0, 1):
-                            nearby.extend(
-                                atom_grid.get(
-                                    (
-                                        cell_idx[0] + dx,
-                                        cell_idx[1] + dy,
-                                        cell_idx[2] + dz,
-                                    ),
-                                    [],
-                                )
-                            )
-                if not nearby:
-                    continue
-                nearby_arr = np.asarray(nearby)
-                dists = ((atoms[nearby_arr] - grid_pos) ** 2).sum(axis=1)
-                valid = dists <= r2
-                if valid.any():
-                    valid_atoms = nearby_arr[valid]
-                    src_list.append(atom_indices[valid_atoms])
-                    dst_list.append(
-                        np.full(
-                            valid_atoms.shape, grid_indices[start + gi], dtype=np.int64
-                        )
-                    )
-                    dist_list.append(dists[valid])
     return _concat_edges(src_list, dst_list, dist_list)
 
 
@@ -383,64 +265,5 @@ def radius_graph_grid(
                 valid_j = nearby_arr[valid]
                 src_list.append(np.full(valid_j.shape, idx[i], dtype=np.int64))
                 dst_list.append(idx[valid_j])
-                dist_list.append(dists[valid])
-    return _concat_edges(src_list, dst_list, dist_list)
-
-
-def radius_grid(
-    x_np: np.ndarray,
-    y_np: np.ndarray,
-    r: float,
-    batch_x_np: np.ndarray,
-    batch_y_np: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Spatially-hashed bipartite radius graph for large inputs.
-
-    ``x`` are sources, ``y`` are destinations. Returns ``(src, dst, dist)`` global
-    edge arrays for every within-cutoff pair; no truncation.
-    """
-    batch_size = max(int(batch_x_np.max()), int(batch_y_np.max())) + 1
-    r2 = r * r
-    src_list, dst_list, dist_list = [], [], []
-    for b in range(batch_size):
-        mx = batch_x_np == b
-        my = batch_y_np == b
-        if not mx.any() or not my.any():
-            continue
-        sx = x_np[mx]
-        sy = y_np[my]
-        ix = np.where(mx)[0]
-        iy = np.where(my)[0]
-        nx, ny = sx.shape[0], sy.shape[0]
-
-        min_coords = np.vstack([sx.min(axis=0), sy.min(axis=0)]).min(axis=0) - r
-        cell_size = r
-        cell_of: dict[tuple[int, int, int], list[int]] = {}
-        for j in range(ny):
-            cell_idx = tuple(np.floor((sy[j] - min_coords) / cell_size).astype(int))
-            cell_of.setdefault(cell_idx, []).append(j)
-
-        for i in range(nx):
-            point = sx[i]
-            cell_idx = tuple(np.floor((point - min_coords) / cell_size).astype(int))
-            nearby: list[int] = []
-            for dx in (-1, 0, 1):
-                for dy in (-1, 0, 1):
-                    for dz in (-1, 0, 1):
-                        nearby.extend(
-                            cell_of.get(
-                                (cell_idx[0] + dx, cell_idx[1] + dy, cell_idx[2] + dz),
-                                [],
-                            )
-                        )
-            if not nearby:
-                continue
-            nearby_arr = np.asarray(nearby)
-            dists = ((sy[nearby_arr] - point) ** 2).sum(axis=1)
-            valid = dists <= r2
-            if valid.any():
-                valid_j = nearby_arr[valid]
-                src_list.append(np.full(valid_j.shape, ix[i], dtype=np.int64))
-                dst_list.append(iy[valid_j])
                 dist_list.append(dists[valid])
     return _concat_edges(src_list, dst_list, dist_list)

@@ -18,29 +18,19 @@ import pytest
 
 from ppmat.datasets.graph_utils import infgcn_graph_utils as graph_utils
 
-PLACES = ["cpu"]
-if paddle.is_compiled_with_cuda() and paddle.device.cuda.device_count() > 0:
-    PLACES.append("gpu:0")
+NO_GPU = not paddle.is_compiled_with_cuda() or paddle.device.cuda.device_count() == 0
+PLACES = ["cpu", pytest.param("gpu:0", marks=pytest.mark.skipif(NO_GPU, reason="GPU"))]
 
 
-def numpy_radius_edges(x, y, r, batch_x, batch_y, max_num_neighbors):
-    """Edge set of the NumPy search that ``radius`` used before it ran on device."""
-    if x.shape[0] < 1000 and y.shape[0] > 1000:
-        search = graph_utils.radius_atoms_to_grids
-    elif x.shape[0] > 1000 or y.shape[0] > 1000:
-        search = graph_utils.radius_grid
-    else:
-        search = graph_utils.radius_simple
-    src, dst, dist = search(x, y, r, batch_x, batch_y)
-    keep = graph_utils._cap_edges_per_destination(src, dst, dist, max_num_neighbors)
-    return set(zip(dst[keep].tolist(), src[keep].tolist()))
-
-
-def lattice_points(rng, num_points, num_graphs):
-    """Points on a 0.25 lattice, so that many distances tie or equal the cutoff."""
-    coords = rng.integers(0, 24, size=(num_points, 3)) * 0.25
-    batch = rng.integers(0, num_graphs, size=num_points)
-    return coords.astype("float32"), batch.astype("int64")
+def brute_force_edges(x, y, r, batch_x, batch_y, max_num_neighbors):
+    """Same-graph pairs within ``r``, nearest first with ties to the lower index."""
+    dist = ((y[:, None] - x[None]) ** 2).sum(-1)
+    edges = []
+    for dst in range(len(y)):
+        src = np.flatnonzero((dist[dst] <= r * r) & (batch_x == batch_y[dst]))
+        src = src[np.argsort(dist[dst, src], kind="stable")][:max_num_neighbors]
+        edges += [(dst, s) for s in sorted(src.tolist())]
+    return edges
 
 
 def edge_list(dst, src):
@@ -49,58 +39,34 @@ def edge_list(dst, src):
 
 
 @pytest.mark.parametrize("place", PLACES)
-@pytest.mark.parametrize("chunk_pairs", [1 << 22, 997])
-@pytest.mark.parametrize(
-    "num_x, num_y, max_num_neighbors",
-    [(40, 300, 32), (40, 300, 3), (60, 3000, 4), (60, 3000, None), (1200, 200, 6)],
-)
-def test_radius_matches_numpy_search(
-    monkeypatch, place, chunk_pairs, num_x, num_y, max_num_neighbors
-):
+@pytest.mark.parametrize("chunk_pairs, max_num_neighbors", [(1 << 22, None), (997, 4)])
+def test_radius_matches_brute_force(monkeypatch, place, chunk_pairs, max_num_neighbors):
     monkeypatch.setattr(graph_utils, "_RADIUS_CHUNK_PAIRS", chunk_pairs)
-    rng = np.random.default_rng(num_x + num_y)
-    # Unsorted graph ids; graph 3 has destinations but no sources.
-    x, batch_x = lattice_points(rng, num_x, 3)
-    y, batch_y = lattice_points(rng, num_y, 4)
-    expected = numpy_radius_edges(x, y, 1.5, batch_x, batch_y, max_num_neighbors)
-
-    dst, src = graph_utils.radius(
-        paddle.to_tensor(x, place=place),
-        paddle.to_tensor(y, place=place),
-        1.5,
-        paddle.to_tensor(batch_x, place=place),
-        paddle.to_tensor(batch_y, place=place),
-        max_num_neighbors,
-    )
-
-    assert edge_list(dst, src) == sorted(expected)
-
-
-@pytest.mark.parametrize("place", PLACES)
-def test_radius_matches_numpy_search_within_rounding_of_the_cutoff(place):
-    # Each destination sits a few float32 ulps from the cutoff sphere of one
-    # source, so the result depends on how the squared distance is rounded.
     rng = np.random.default_rng(0)
-    x = rng.uniform(-3.0, 3.0, size=(20, 3)).astype("float32")
-    direction = rng.normal(size=(2000, 3))
+    # Sources and 500 destinations on a 0.25 lattice give exact distance ties and
+    # pairs exactly at the cutoff; 1000 more destinations lie within a few float32
+    # ulps of the cutoff sphere of one source of their graph.
+    x = rng.integers(0, 24, size=(200, 3)) * 0.25
+    batch_x = rng.integers(0, 3, size=200)
+    owner = rng.integers(0, 200, size=1000)
+    direction = rng.normal(size=(1000, 3))
     direction /= np.linalg.norm(direction, axis=1, keepdims=True)
-    offset = 1.5 * (1.0 + 6e-8 * rng.integers(-8, 9, size=(2000, 1))) * direction
-    y = (x[rng.integers(0, 20, size=2000)] + offset).astype("float32")
-    zeros_x, zeros_y = np.zeros(20, dtype="int64"), np.zeros(2000, dtype="int64")
-    expected = numpy_radius_edges(x, y, 1.5, zeros_x, zeros_y, None)
+    scale = 1.5 * (1 + 6e-8 * rng.integers(-8, 9, size=(1000, 1)))
+    lattice = rng.integers(0, 24, size=(500, 3)) * 0.25
+    y = np.concatenate([lattice, x[owner] + scale * direction])
+    # Unsorted graph ids; graph 3 has destinations but no sources.
+    batch_y = np.concatenate([rng.integers(0, 4, size=500), batch_x[owner]])
+    x, y = x.astype("float32"), y.astype("float32")
+    tensors = [paddle.to_tensor(a, place=place) for a in (x, y, batch_x, batch_y)]
 
-    dst, src = graph_utils.radius(
-        paddle.to_tensor(x, place=place),
-        paddle.to_tensor(y, place=place),
-        1.5,
-        max_num_neighbors=None,
-    )
+    dst, src = graph_utils.radius(*tensors[:2], 1.5, *tensors[2:], max_num_neighbors)
 
-    assert edge_list(dst, src) == sorted(expected)
+    expected = brute_force_edges(x, y, 1.5, batch_x, batch_y, max_num_neighbors)
+    assert edge_list(dst, src) == expected
 
 
 @pytest.mark.parametrize("place", PLACES)
-def test_radius_cutoff_is_inclusive_and_cap_prefers_near_then_low_index(place):
+def test_radius_cap_keeps_nearest_then_lowest_index(place):
     # Sources 0-3 lie exactly at r = 1 from the destination, 4 just beyond it
     # and 5 closer.
     x = [[0, 0, 0], [2, 0, 0], [1, 1, 0], [1, 0, 1], [1, -1.001, 0], [1, 0, 0.5]]
@@ -112,4 +78,12 @@ def test_radius_cutoff_is_inclusive_and_cap_prefers_near_then_low_index(place):
 
     assert edge_list(*all_edges) == [(0, 0), (0, 1), (0, 2), (0, 3), (0, 5)]
     assert edge_list(*capped) == [(0, 0), (0, 5)]
-    assert edge_list(*graph_utils.radius(x, y + 10, 1.0)) == []
+
+
+@pytest.mark.parametrize("place", PLACES)
+def test_radius_with_empty_input_returns_no_edges(place):
+    points = paddle.to_tensor([[0.0, 0.0, 0.0]], place=place)
+    empty = paddle.to_tensor(np.zeros((0, 3), dtype="float32"), place=place)
+
+    assert edge_list(*graph_utils.radius(empty, points, 1.0)) == []
+    assert edge_list(*graph_utils.radius(points, empty, 1.0)) == []
