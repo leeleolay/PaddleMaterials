@@ -160,8 +160,8 @@ Through its architectural improvements, DimeNet++ achieves up to an **8× speedu
             <td  nowrap="nowrap">4</td>
             <td  nowrap="nowrap">19 hours 54 min</td>
             <td  nowrap="nowrap"><a href="dimenet++_mp2018_train_60k_e_form.yaml">dimenet++_mp2018_train_60k_e_form</a></td>
-            <td  nowrap="nowrap"><a href="https://paddle-org.bj.bcebos.com/paddlematerial/checkpoints/property_prediction/dimenet%2B%2B/dimenetpp_mp2018_train_60k_e_form.zip">checkpoint | log</a></td>
-        </tr>  
+            <td  nowrap="nowrap"><a href="https://paddle-org.bj.bcebos.com/paddlematerials/checkpoints/property_prediction/dimenet++/dimenetpp_mp2018_train_60k_e_form.zip">checkpoint | log</a></td>
+        </tr>
         <tr>
             <td  nowrap="nowrap">dimenetpp_mp2018_train_60k_band_gap</td>
             <td  nowrap="nowrap">mp2018_train_60k</td>
@@ -170,17 +170,17 @@ Through its architectural improvements, DimeNet++ achieves up to an **8× speedu
             <td  nowrap="nowrap">4</td>
             <td  nowrap="nowrap">23 hours</td>
             <td  nowrap="nowrap"><a href="dimenet++_mp2018_train_60k_band_gap.yaml">dimenet++_mp2018_train_60k_band_gap</a></td>
-            <td  nowrap="nowrap"><a href="https://paddle-org.bj.bcebos.com/paddlematerial/checkpoints/property_prediction/dimenet%2B%2B/dimenetpp_mp2018_train_60k_band_gap.zip">checkpoint | log</a></td>
-        </tr>  
+            <td  nowrap="nowrap"><a href="https://paddle-org.bj.bcebos.com/paddlematerials/checkpoints/property_prediction/dimenet++/dimenetpp_mp2018_train_60k_band_gap.zip">checkpoint | log</a></td>
+        </tr>
         <tr>
             <td  nowrap="nowrap">dimenetpp_mp2018_train_60k_K</td>
             <td  nowrap="nowrap">mp2018_train_60k</td>
             <td  nowrap="nowrap">Bulk modulus(GPa)</td>
-            <td  nowrap="nowrap">8.068773 / 7.031967</td>
+            <td  nowrap="nowrap">6.259347 / 5.580545</td>
             <td  nowrap="nowrap">4</td>
-            <td  nowrap="nowrap">~1 hour 38 min</td>
+            <td  nowrap="nowrap">1 hour 56 min</td>
             <td  nowrap="nowrap"><a href="dimenet++_mp2018_train_60k_K.yaml">dimenet++_mp2018_train_60k_k</a></td>
-            <td  nowrap="nowrap"><a href="https://paddle-org.bj.bcebos.com/paddlematerial/checkpoints/property_prediction/dimenet%2B%2B/dimenetpp_mp2018_train_60k_K.zip">checkpoint | log</a></td>
+            <td  nowrap="nowrap"><a href="https://paddle-org.bj.bcebos.com/paddlematerials/checkpoints/property_prediction/dimenet++/dimenetpp_mp2018_train_60k_K.zip">checkpoint | log</a></td>
         </tr>
         <tr>
             <td  nowrap="nowrap">dimenetpp_mp2018_train_60k_G</td>
@@ -190,7 +190,7 @@ Through its architectural improvements, DimeNet++ achieves up to an **8× speedu
             <td  nowrap="nowrap">4</td>
             <td  nowrap="nowrap">~1 hour 38 min</td>
             <td  nowrap="nowrap"><a href="dimenet++_mp2018_train_60k_G.yaml">dimenet++_mp2018_train_60k_G</a></td>
-            <td  nowrap="nowrap"><a href="https://paddle-org.bj.bcebos.com/paddlematerial/checkpoints/property_prediction/dimenet%2B%2B/dimenetpp_mp2018_train_60k_G.zip">checkpoint | log</a></td>
+            <td  nowrap="nowrap"><a href="https://paddle-org.bj.bcebos.com/paddlematerials/checkpoints/property_prediction/dimenet++/dimenetpp_mp2018_train_60k_G.zip">checkpoint | log</a></td>
         </tr>
     </body>
 </table>

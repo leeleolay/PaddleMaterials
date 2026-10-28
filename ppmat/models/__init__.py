@@ -165,7 +165,9 @@ MODEL_REGISTRY = {
 
 # md5 of registered archives that were replaced on the server. A cached archive with
 # a different md5 is downloaded again; archives without an entry are not checked.
-MODEL_MD5: Dict[str, str] = {}
+MODEL_MD5: Dict[str, str] = {
+    "dimenetpp_mp2018_train_60k_K": "0741584a0cb02f6c42b82d3f11e22770",
+}
 
 
 def build_graph_converter(cfg: Dict, vocab=None):
