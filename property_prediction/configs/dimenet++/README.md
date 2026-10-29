@@ -156,9 +156,9 @@ Through its architectural improvements, DimeNet++ achieves up to an **8× speedu
             <td  nowrap="nowrap">dimenetpp_mp2018_train_60k_e_form</td>
             <td  nowrap="nowrap">mp2018_train_60k</td>
             <td  nowrap="nowrap">Form. Energy(eV/atom)</td>
-            <td  nowrap="nowrap">0.030738 / 0.032307</td>
+            <td  nowrap="nowrap">0.023471 / 0.023361</td>
             <td  nowrap="nowrap">4</td>
-            <td  nowrap="nowrap">19 hours 54 min</td>
+            <td  nowrap="nowrap">20 hours 0 min</td>
             <td  nowrap="nowrap"><a href="dimenet++_mp2018_train_60k_e_form.yaml">dimenet++_mp2018_train_60k_e_form</a></td>
             <td  nowrap="nowrap"><a href="https://paddle-org.bj.bcebos.com/paddlematerials/checkpoints/property_prediction/dimenet++/dimenetpp_mp2018_train_60k_e_form.zip">checkpoint | log</a></td>
         </tr>  
