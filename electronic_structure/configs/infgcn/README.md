@@ -158,19 +158,19 @@ $$
         <tr>
             <td nowrap="nowrap">infgcn_qm9</td>
             <td nowrap="nowrap">QM9_EC</td>
-            <td nowrap="nowrap">1.7542%</td>
+            <td nowrap="nowrap">0.9315%</td>
             <td nowrap="nowrap">1</td>
             <td nowrap="nowrap">75hour41min</td>
             <td nowrap="nowrap"><a href="../../../electronic_structure/configs/infgcn/infgcn_qm9.yaml">infgcn_qm9</a></td>
             <td nowrap="nowrap"><a href="https://paddle-org.bj.bcebos.com/paddlematerials/checkpoints/electronic_structure/infgcn/infgcn_qm9.zip">checkpoint</td>
         </tr>
         <tr>
-            <td nowrap="nowrap">infgcn_cubic</td>
+            <td nowrap="nowrap">infgcn_mp</td>
             <td nowrap="nowrap">MP_EC (cubic)</td>
-            <td nowrap="nowrap">47.3829%</td>
+            <td nowrap="nowrap">7.7784%</td>
             <td nowrap="nowrap">1</td>
-            <td nowrap="nowrap">12hour6min</td>
-            <td nowrap="nowrap"><a href="../../../electronic_structure/configs/infgcn/infgcn_mp.yaml">infgcn_cubic</a></td>
+            <td nowrap="nowrap">61hour26min</td>
+            <td nowrap="nowrap"><a href="../../../electronic_structure/configs/infgcn/infgcn_mp.yaml">infgcn_mp</a></td>
             <td nowrap="nowrap"><a href="https://paddle-org.bj.bcebos.com/paddlematerials/checkpoints/electronic_structure/infgcn/infgcn_mp.zip">checkpoint</td>
         </tr>
         <tr>
@@ -184,6 +184,8 @@ $$
         </tr>
     </tbody>
 </table>
+
+QM9_EC is evaluated on the last 1,600 test molecules without rotation and MP_EC (cubic) on all 1,000 test structures; both use every grid point with a positive reference density and average the NMAE per sample.
 
 ---
 
