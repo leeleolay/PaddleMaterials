@@ -166,9 +166,9 @@ Through its architectural improvements, DimeNet++ achieves up to an **8× speedu
             <td  nowrap="nowrap">dimenetpp_mp2018_train_60k_band_gap</td>
             <td  nowrap="nowrap">mp2018_train_60k</td>
             <td  nowrap="nowrap">Band Gap(eV)</td>
-            <td  nowrap="nowrap">0.270737 / 0.282961</td>
-            <td  nowrap="nowrap">4</td>
-            <td  nowrap="nowrap">23 hours</td>
+            <td  nowrap="nowrap">0.241686 / 0.245299</td>
+            <td  nowrap="nowrap">1 (batch 128 = 4 × 32)</td>
+            <td  nowrap="nowrap">29 hours 51 min</td>
             <td  nowrap="nowrap"><a href="dimenet++_mp2018_train_60k_band_gap.yaml">dimenet++_mp2018_train_60k_band_gap</a></td>
             <td  nowrap="nowrap"><a href="https://paddle-org.bj.bcebos.com/paddlematerials/checkpoints/property_prediction/dimenet++/dimenetpp_mp2018_train_60k_band_gap.zip">checkpoint | log</a></td>
         </tr>  
