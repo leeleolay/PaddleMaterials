@@ -113,9 +113,9 @@ $$
         <tr>
             <td nowrap="nowrap">infgcn_md17_ethane</td>
             <td nowrap="nowrap">MD17_EC_Ethane</td>
-            <td nowrap="nowrap">7.6323%</td>
+            <td nowrap="nowrap">4.0910%</td>
             <td nowrap="nowrap">1</td>
-            <td nowrap="nowrap">1hour17min</td>
+            <td nowrap="nowrap">27min</td>
             <td nowrap="nowrap"><a href="../../../electronic_structure/configs/infgcn/infgcn_md17_ethane.yaml">infgcn_md17_ethane</a></td>
             <td nowrap="nowrap"><a href="https://paddle-org.bj.bcebos.com/paddlematerials/checkpoints/electronic_structure/infgcn/infgcn_md17_ethane.zip">checkpoint</td>
         </tr>
